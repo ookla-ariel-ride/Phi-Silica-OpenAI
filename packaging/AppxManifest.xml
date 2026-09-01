@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Sparse package ("package with external location") that grants NpuBridge.exe package identity so the
+  Phi Silica LanguageModel API will load. The exe stays a loose file in its build folder; this MSIX only
+  carries the manifest and logos. Built, signed and registered by scripts/identity.ps1.
+
+  Why this exists: Microsoft.Windows.AI.Text.LanguageModel fails without package identity and the
+  systemAIModels capability (see docs/PLAN.md F1). Aion and the fake backend do not need it.
+
+  The Package Family Name (PFN) that the Phi Silica LAF token is bound to derives from Identity/@Name and
+  the signing certificate subject (Identity/@Publisher). Changing either changes the PFN and invalidates
+  an issued token, so treat both as frozen.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:systemai="http://schemas.microsoft.com/appx/manifest/systemai/windows10"
+  IgnorableNamespaces="uap uap10 rescap systemai">
+
+  <Identity Name="NpuBridge" Publisher="CN=npu-bridge-dev" Version="0.1.0.0" ProcessorArchitecture="arm64" />
+
+  <Properties>
+    <DisplayName>npu-bridge</DisplayName>
+    <PublisherDisplayName>npu-bridge</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <!-- The package's content lives outside the MSIX, in the folder passed to Add-AppxPackage -ExternalLocation. -->
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+  </Properties>
+
+  <Dependencies>
+    <!-- 26100 (24H2) is the floor for the systemAIModels capability; lower and Windows silently ignores it. -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.26100.0" MaxVersionTested="10.0.26300.0" />
+    <!--
+      Windows App Runtime framework packages. The Phi Silica adapter is built against Windows App SDK 2.x
+      (runtime family Microsoft.WindowsAppRuntime.2) and the WinML stack the on-device model runs on ships
+      with 1.8, mirroring the Aion sample's manifest. Publisher must match the runtime packages' signer.
+      If registration fails with 0x80073D19 ("no matching framework packages"), the missing runtime is named
+      in the error; install it with winget (Microsoft.WindowsAppRuntime.2.0 / .1.8).
+    -->
+    <PackageDependency Name="Microsoft.WindowsAppRuntime.2" MinVersion="2.0.1.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
+    <PackageDependency Name="Microsoft.WindowsAppRuntime.1.8" MinVersion="8000.625.330.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-US" />
+  </Resources>
+
+  <Applications>
+    <!-- Executable is relative to the external location; TrustLevel/RuntimeBehavior mark a classic Win32 process. -->
+    <Application Id="NpuBridge" Executable="NpuBridge.exe" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements
+        DisplayName="npu-bridge"
+        Description="OpenAI-compatible HTTP endpoint for the on-device NPU language model"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        AppListEntry="none" />
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <systemai:Capability Name="systemAIModels" />
+  </Capabilities>
+</Package>

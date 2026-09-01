@@ -35,14 +35,18 @@ Requires the .NET 10 SDK (`winget install --id Microsoft.DotNet.SDK.10`); check 
 Default listener is `http://127.0.0.1:5273`.
 
 ```powershell
-dotnet build                                   # whole solution (exe cross-compiles to win-arm64)
-dotnet test                                    # all tests (x64-safe: Core + FakeBackend + TestServer)
-dotnet test --filter "FullyQualifiedName~ToolCallParser"    # one test class
-dotnet test --filter "DisplayName~streams_DONE"             # one test by name fragment
-dotnet run --project src/NpuBridge -- --backend fake --verbose   # laptop only (ARM64 exe)
-.\scripts\smoke.ps1 -Backend phi-silica        # laptop only: health + prompt + streaming + tool probe
-.\scripts\identity.ps1 -Install                # laptop only: sparse package for Phi Silica identity
+dotnet build                                   # whole solution (npu-bridge.slnx); exe builds win-arm64
+dotnet test                                    # all tests (Core + FakeBackend + TestServer; no NPU needed)
+dotnet test --filter "FullyQualifiedName~HealthzTests"      # one test class
+dotnet test --filter "DisplayName~Loading_backend"          # one test by name fragment
+dotnet run --project src/NpuBridge -- --backend fake --verbose   # run the exe (bin\Debug\...\win-arm64\NpuBridge.exe)
+.\scripts\identity.ps1 -Install                # sparse package identity for Phi Silica; prints the PFN
+.\scripts\identity.ps1 -Status                 # is the package registered, which PFN
+.\scripts\smoke.ps1 -Backend phi-silica        # (chunk 2) health + prompt + streaming + tool probe
 ```
+
+Windows service verbs need an elevated prompt: `NpuBridge.exe service install --backend aion` bakes the
+options into the service command line; `service start|stop|uninstall` do what they say.
 
 Aion's SDK NuGet is not on nuget.org. It comes from the sample repo's GitHub release
 (`AionInstructPreview.Text.Framework.1.0.0.nupkg`) and lives in `nuget-local/`, wired by `nuget.config`.

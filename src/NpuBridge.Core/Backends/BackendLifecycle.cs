@@ -1,0 +1,137 @@
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+
+namespace NpuBridge.Backends;
+
+public enum BackendStateKind
+{
+    NotStarted,
+    Loading,
+    Ready,
+    Failed,
+}
+
+/// <summary>Immutable view of the backend's lifecycle at one instant.</summary>
+public sealed record BackendSnapshot(
+    BackendStateKind Kind,
+    DateTimeOffset? LoadStartedAt,
+    DateTimeOffset? LoadFinishedAt,
+    string? Error)
+{
+    /// <summary>Time spent loading so far (or in total once finished).</summary>
+    public TimeSpan? LoadingElapsed(DateTimeOffset now) => LoadStartedAt is null
+        ? null
+        : (LoadFinishedAt ?? now) - LoadStartedAt.Value;
+}
+
+/// <summary>
+/// Starts <see cref="ILanguageModelBackend.InitializeAsync"/> in the background at host start and tracks
+/// its outcome, so requests arriving during a multi-minute first-run compile get a 503 with a reason
+/// instead of blocking or crashing. Does not dispose the backend; the DI container owns it.
+/// </summary>
+public sealed class BackendLifecycle : IHostedService, IDisposable
+{
+    /// <summary>Loading longer than this is almost certainly the one-time NPU model compile.</summary>
+    public static readonly TimeSpan FirstRunCompileThreshold = TimeSpan.FromSeconds(60);
+
+    private readonly ILanguageModelBackend _backend;
+    private readonly TimeProvider _time;
+    private readonly ILogger<BackendLifecycle> _logger;
+    private readonly CancellationTokenSource _shutdown = new();
+    private readonly object _gate = new();
+
+    private BackendSnapshot _snapshot = new(BackendStateKind.NotStarted, null, null, null);
+    private Task _initialization = Task.CompletedTask;
+
+    public BackendLifecycle(ILanguageModelBackend backend, TimeProvider time, ILogger<BackendLifecycle> logger)
+    {
+        _backend = backend;
+        _time = time;
+        _logger = logger;
+    }
+
+    public ILanguageModelBackend Backend => _backend;
+
+    public BackendSnapshot Snapshot
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _snapshot;
+            }
+        }
+    }
+
+    public bool IsReady => Snapshot.Kind == BackendStateKind.Ready;
+
+    /// <summary>Completes when initialization has finished, successfully or not. Never faults.</summary>
+    public Task Initialization => _initialization;
+
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            if (_snapshot.Kind != BackendStateKind.NotStarted)
+            {
+                return Task.CompletedTask;
+            }
+
+            _snapshot = new BackendSnapshot(BackendStateKind.Loading, _time.GetUtcNow(), null, null);
+            _initialization = Task.Run(RunInitializationAsync, CancellationToken.None);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public async Task StopAsync(CancellationToken cancellationToken)
+    {
+        await _shutdown.CancelAsync().ConfigureAwait(false);
+
+        // Give an in-flight initialization a moment to observe cancellation; never block shutdown on it.
+        var finished = await Task.WhenAny(_initialization, Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken))
+            .ConfigureAwait(false);
+        if (finished != _initialization)
+        {
+            _logger.LogWarning("Backend {Backend} was still initializing at shutdown; abandoning it.", _backend.DisplayName);
+        }
+    }
+
+    private async Task RunInitializationAsync()
+    {
+        _logger.LogInformation("Loading {Backend} (model id {ModelId}). First run on this machine may take several minutes.",
+            _backend.DisplayName, _backend.ModelId);
+        try
+        {
+            await _backend.InitializeAsync(_shutdown.Token).ConfigureAwait(false);
+            var now = _time.GetUtcNow();
+            BackendSnapshot ready;
+            lock (_gate)
+            {
+                ready = _snapshot = _snapshot with { Kind = BackendStateKind.Ready, LoadFinishedAt = now };
+            }
+
+            _logger.LogInformation("{Backend} ready after {Seconds:F1}s.", _backend.DisplayName,
+                ready.LoadingElapsed(now)?.TotalSeconds ?? 0);
+        }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        {
+            SetFailed("Initialization cancelled by shutdown.");
+        }
+        catch (Exception ex)
+        {
+            SetFailed(ex.Message);
+            _logger.LogError(ex, "{Backend} failed to initialize.", _backend.DisplayName);
+        }
+    }
+
+    public void Dispose() => _shutdown.Dispose();
+
+    private void SetFailed(string error)
+    {
+        lock (_gate)
+        {
+            _snapshot = _snapshot with { Kind = BackendStateKind.Failed, LoadFinishedAt = _time.GetUtcNow(), Error = error };
+        }
+    }
+}

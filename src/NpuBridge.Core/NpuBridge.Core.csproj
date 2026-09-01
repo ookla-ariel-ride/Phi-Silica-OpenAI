@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    NpuBridge.Core: everything with logic, and nothing that touches WinRT.
+    OpenAI DTOs and endpoint mapping, prompt flattening, context cache, scheduler, SSE, tool emulation,
+    the backend interface and the fake backend. Runs anywhere .NET runs, so the test suite never
+    needs the NPU. See docs/PLAN.md §2 and docs/DECISIONS.md D1.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>NpuBridge</RootNamespace>
+    <AssemblyName>NpuBridge.Core</AssemblyName>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Endpoint mapping lives here so TestServer-based tests cover the real HTTP surface. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="NpuBridge.Tests" />
+  </ItemGroup>
+
+</Project>

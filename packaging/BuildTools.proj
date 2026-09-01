@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.Build.NoTargets/3.7.56">
+  <!--
+    Restore-only project: pulls the Windows SDK build tools NuGet (makeappx.exe, signtool.exe) into the
+    NuGet cache so scripts/identity.ps1 can pack and sign the sparse package without Visual Studio or a
+    registry-installed Windows SDK. Run: dotnet restore packaging/BuildTools.proj
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.4948" GeneratePathProperty="true" />
+  </ItemGroup>
+</Project>

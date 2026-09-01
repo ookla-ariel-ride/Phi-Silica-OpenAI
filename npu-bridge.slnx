@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/NpuBridge.Core/NpuBridge.Core.csproj" />
+    <Project Path="src/NpuBridge/NpuBridge.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/NpuBridge.Tests/NpuBridge.Tests.csproj" />
+  </Folder>
+</Solution>

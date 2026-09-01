@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    NpuBridge: the ARM64 executable. Hosts Kestrel, parses the command line, runs as a Windows service,
+    and contains the two real adapters (PhiSilicaBackend, AionBackend) plus packaging glue.
+    Keep logic out of here; if it needs a test, it belongs in NpuBridge.Core.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.26100.0</TargetPlatformMinVersion>
+    <SupportedOSPlatformVersion>10.0.26100.0</SupportedOSPlatformVersion>
+    <RootNamespace>NpuBridge</RootNamespace>
+    <AssemblyName>NpuBridge</AssemblyName>
+
+    <!-- Both on-device model frameworks are ARM64-only (docs/FUTURE.md covers x64). -->
+    <Platforms>ARM64</Platforms>
+    <Platform Condition="'$(Platform)' == '' Or '$(Platform)' == 'AnyCPU'">ARM64</Platform>
+    <RuntimeIdentifier>win-arm64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <!-- LibraryImport source generation (ProcessIdentity.cs) and CsWinRT projections need this. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!--
+      Do NOT let the Windows App SDK auto-initialize its bootstrapper at process start. Only the
+      Phi Silica adapter needs it, and `- -backend fake` must start on a machine without the runtime.
+      (docs/DECISIONS.md D13). Takes effect once Microsoft.WindowsAppSDK is referenced in chunk 2.
+    -->
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSdkBootstrapInitialize>false</WindowsAppSdkBootstrapInitialize>
+    <WindowsAppSDKSelfContained>false</WindowsAppSDKSelfContained>
+
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NpuBridge.Core\NpuBridge.Core.csproj" />
+    <!-- Console SDK on purpose (service tooling, no wwwroot); Kestrel comes from the shared framework. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="appsettings.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.11" />
+  </ItemGroup>
+
+</Project>
