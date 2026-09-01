@@ -52,8 +52,9 @@ public static class DebugEndpoints
         BackendLifecycle lifecycle,
         HttpContext http)
     {
+        // Fail closed: an unknown remote address is not a loopback address.
         var remote = http.Connection.RemoteIpAddress;
-        if (remote is not null && !IPAddress.IsLoopback(remote))
+        if (remote is null || !IPAddress.IsLoopback(remote))
         {
             return OpenAiError.Result(StatusCodes.Status403Forbidden, "The debug endpoint accepts loopback connections only.", OpenAiError.InvalidRequest, code: "loopback_only");
         }

@@ -195,6 +195,17 @@ guidance; a hidden logon task must never start it silently.
 **D40. `/debug/generate` is loopback-only** (403 otherwise) because it bypasses the request queue that
 chunk 8 adds. Routing it through the scheduler is deferred.
 
+**D41. Progress callbacks are drained before `GenerateAsync` returns (Codex review, chunk 2).** WinRT
+does not guarantee the last `Progress` invocation has finished when the operation completes. The
+adapter counts in-flight callbacks, closes a gate on completion so stragglers are dropped instead of
+delivered, and waits (bounded, 5 s) for the count to reach zero. Callers can therefore dispose the
+context or reuse it the moment the call returns.
+
+**D42. Supervisor halves validate the process, not just the pid.** Pids are reused; both the parent
+(child pid from activation) and the child (`--supervisor-pid`) check image name and a plausible start
+time before waiting on or killing anything, and the parent unsubscribes its Ctrl+C/exit handlers.
+`/debug/generate` also fails closed when the remote address is unknown.
+
 **Observations recorded for later chunks.** (1) Phi Silica's `Progress` callback delivers multi-token
 chunks under speculative decoding (11 callbacks for ~25 words), so `completion_tokens` estimated from
 callbacks undercounts; a character-based estimate may be better. (2) A strict system prompt set through

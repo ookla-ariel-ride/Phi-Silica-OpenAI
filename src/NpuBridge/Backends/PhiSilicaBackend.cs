@@ -170,22 +170,40 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
 
         // Progress delivers the newest token(s) only; accumulate here so a cancelled run still has its
         // partial text. An exception from onDelta would otherwise vanish on the WinRT callback thread.
+        // Completion of the operation does not guarantee the last Progress callback has finished (or even
+        // started), so callbacks are counted and drained before this method returns; anything arriving
+        // after the barrier is dropped rather than delivered to a caller that has moved on.
         var accumulated = new StringBuilder();
         Exception? deltaFailure = null;
+        var inFlight = 0;
+        var closed = 0;
         op.Progress = (_, delta) =>
         {
-            lock (accumulated)
-            {
-                accumulated.Append(delta);
-            }
-
+            Interlocked.Increment(ref inFlight);
             try
             {
-                onDelta(delta);
+                if (Volatile.Read(ref closed) == 1)
+                {
+                    return;
+                }
+
+                lock (accumulated)
+                {
+                    accumulated.Append(delta);
+                }
+
+                try
+                {
+                    onDelta(delta);
+                }
+                catch (Exception ex)
+                {
+                    Interlocked.CompareExchange(ref deltaFailure, ex, null);
+                }
             }
-            catch (Exception ex)
+            finally
             {
-                Interlocked.CompareExchange(ref deltaFailure, ex, null);
+                Interlocked.Decrement(ref inFlight);
             }
         };
 
@@ -196,12 +214,16 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
         }
         catch (OperationCanceledException)
         {
+            DrainCallbacks();
             return new GenerationResult(Partial(), GenerationStatus.Cancelled, "cancelled");
         }
         catch (Exception ex) when ((uint)ex.HResult == AccessDenied)
         {
+            DrainCallbacks();
             throw new BackendUnavailableException($"Phi Silica refused access (E_ACCESSDENIED) during generation. {_lafHint}", ex);
         }
+
+        DrainCallbacks();
 
         if (deltaFailure is not null)
         {
@@ -227,7 +249,20 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
                 return accumulated.ToString();
             }
         }
+
+        void DrainCallbacks()
+        {
+            // Close the gate first so a late callback exits early, then wait for any that are mid-flight.
+            Volatile.Write(ref closed, 1);
+            if (!SpinWait.SpinUntil(() => Volatile.Read(ref inFlight) == 0, CallbackDrainTimeout))
+            {
+                _logger.LogWarning("A Phi Silica progress callback did not finish within {Timeout}; continuing.", CallbackDrainTimeout);
+            }
+        }
     }
+
+    /// <summary>Upper bound on waiting for a straggling Progress callback after the operation completed.</summary>
+    private static readonly TimeSpan CallbackDrainTimeout = TimeSpan.FromSeconds(5);
 
     public ValueTask DisposeAsync()
     {

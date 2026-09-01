@@ -35,4 +35,4 @@
 - Chunk 1: in-session hostile review (20 findings, 15 fixed, blocker: env-var key mapping);
   Codex adversarial review (7 findings, all fixed). Commits `b6ae632`, `663fce5`.
 - Chunk 2: in-session hostile review (29 findings; blocker: environment lost across activation;
-  fixed with supervisor + env forwarding; 6 deferred to FUTURE.md). Codex pass: pending.
+  fixed with supervisor + env forwarding; 6 deferred to FUTURE.md); Codex adversarial review (5 findings, all fixed: callback drain, pid validation, fail-closed loopback, dependency version check, handler teardown).

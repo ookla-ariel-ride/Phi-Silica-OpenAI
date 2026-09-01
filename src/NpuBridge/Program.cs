@@ -177,6 +177,7 @@ internal static class Program
         }
 
         uint pid;
+        var activatedAt = DateTime.UtcNow;
         try
         {
             pid = PackageActivation.Activate(family, plan.Arguments);
@@ -188,7 +189,7 @@ internal static class Program
         }
 
         Console.WriteLine($"npu-bridge: activated instance with package identity ({family}) as pid {pid}: {plan.Arguments}");
-        return await Supervisor.WaitForChildAsync(pid).ConfigureAwait(false);
+        return await Supervisor.WaitForChildAsync(pid, activatedAt).ConfigureAwait(false);
     }
 }
 

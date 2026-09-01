@@ -47,6 +47,38 @@ public class DebugGenerateTests
         Assert.False(doc.RootElement.TryGetProperty("usable_prompt_chars", out _));
     }
 
+    [Theory]
+    [InlineData("10.0.0.5")]
+    [InlineData("::ffff:192.168.1.2")]
+    public async Task Non_loopback_callers_get_403(string remote)
+    {
+        await using var host = await BridgeTestHost.StartAsync(remoteAddress: System.Net.IPAddress.Parse(remote));
+        var response = await host.Client.PostAsJsonAsync("/debug/generate", new { prompt = "x" });
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal("loopback_only", doc.RootElement.GetProperty("error").GetProperty("code").GetString());
+        Assert.Empty(host.Fake.Calls);
+    }
+
+    [Fact]
+    public async Task Unknown_remote_address_is_rejected()
+    {
+        // TestServer supplies no address; the host normally simulates loopback. Passing IPAddress.None
+        // exercises the fail-closed branch for "no usable address".
+        await using var host = await BridgeTestHost.StartAsync(remoteAddress: System.Net.IPAddress.None);
+        var response = await host.Client.PostAsJsonAsync("/debug/generate", new { prompt = "x" });
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Ipv6_loopback_is_accepted()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake, remoteAddress: System.Net.IPAddress.IPv6Loopback);
+        var response = await host.Client.PostAsJsonAsync("/debug/generate", new { prompt = "x" });
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
     [Fact]
     public async Task Missing_prompt_is_400()
     {

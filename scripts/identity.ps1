@@ -162,15 +162,22 @@ function Install-ManifestDependencies {
         foreach ($c in $candidates) {
             try {
                 Add-AppxPackage -Path $c.FullName -ErrorAction Stop
+                # The install succeeding is not enough: the package must satisfy the manifest's minimum version.
+                $now = Get-AppxPackage -Name $name -ErrorAction SilentlyContinue |
+                    Where-Object { [version]$_.Version -ge $min -and $_.Architecture -in @('Arm64', 'Neutral') }
+                if (-not $now) {
+                    Write-Warn2 "Installed $($c.FullName) but it does not satisfy $name >= $min; trying the next candidate."
+                    continue
+                }
                 $ddlm = Join-Path $c.DirectoryName ($name -replace 'WindowsAppRuntime\.', 'WindowsAppRuntime.DDLM.') + '.msix'
                 if (Test-Path $ddlm) { Add-AppxPackage -Path $ddlm -ErrorAction SilentlyContinue }
-                Write-Ok "Installed $name from $($c.FullName)"
+                Write-Ok "Installed $name $($now[0].Version) from $($c.FullName)"
                 $installed = $true
                 break
             } catch { Write-Warn2 "Failed installing $($c.FullName): $($_.Exception.Message)" }
         }
         if (-not $installed) {
-            throw "Dependency $name >= $min is not installed and no MSIX was found in the NuGet cache. Build the exe first (dotnet build src/NpuBridge) so NuGet restores Microsoft.WindowsAppSDK.Runtime, or install it with winget."
+            throw "Dependency $name >= $min (Arm64) is not installed and no suitable MSIX was found in the NuGet cache. Build the exe first (dotnet build src/NpuBridge) so NuGet restores the matching Microsoft.WindowsAppSDK.Runtime, or install the runtime with winget."
         }
     }
 }

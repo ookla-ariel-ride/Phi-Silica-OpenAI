@@ -31,13 +31,16 @@ internal sealed class BridgeTestHost : IAsyncDisposable
 
     public BackendLifecycle Lifecycle => _app.Services.GetRequiredService<BackendLifecycle>();
 
+    /// <param name="remoteAddress">Remote IP presented to endpoints; TestServer has none, so loopback is simulated by default.</param>
     public static async Task<BridgeTestHost> StartAsync(
         ILanguageModelBackend? backend = null,
         BridgeOptions? options = null,
         IProcessIdentity? identity = null,
         TimeProvider? time = null,
-        bool waitForReady = true)
+        bool waitForReady = true,
+        System.Net.IPAddress? remoteAddress = null)
     {
+        remoteAddress ??= System.Net.IPAddress.Loopback;
         backend ??= new FakeBackend();
         options ??= new BridgeOptions { Backend = BackendKind.Fake };
 
@@ -58,6 +61,11 @@ internal sealed class BridgeTestHost : IAsyncDisposable
         builder.Services.AddNpuBridgeCore(options, _ => backend);
 
         var app = builder.Build();
+        app.Use((context, next) =>
+        {
+            context.Connection.RemoteIpAddress = remoteAddress;
+            return next(context);
+        });
         app.MapNpuBridge();
         await app.StartAsync();
 
