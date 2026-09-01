@@ -1,0 +1,37 @@
+#!/usr/bin/env sh
+# Pre-commit hook: block commits that contain secrets.
+# Enabled per clone with:  git config core.hooksPath .githooks
+# Requires gitleaks (winget install --id Gitleaks.Gitleaks). Bypass for a false positive with
+#   git commit --no-verify   (and then fix .gitleaks.toml so it doesn't recur).
+
+set -e
+
+find_gitleaks() {
+  if command -v gitleaks >/dev/null 2>&1; then
+    command -v gitleaks
+    return 0
+  fi
+  # winget portable install on Windows; the Links alias is not always created.
+  if [ -n "$LOCALAPPDATA" ]; then
+    base="$LOCALAPPDATA"
+    if command -v cygpath >/dev/null 2>&1; then
+      base="$(cygpath -u "$LOCALAPPDATA")"
+    fi
+    for candidate in "$base/Microsoft/WinGet/Links/gitleaks.exe" \
+                     "$base"/Microsoft/WinGet/Packages/Gitleaks.Gitleaks_*/gitleaks.exe; do
+      if [ -x "$candidate" ]; then
+        echo "$candidate"
+        return 0
+      fi
+    done
+  fi
+  return 1
+}
+
+GITLEAKS="$(find_gitleaks)" || {
+  echo "pre-commit: gitleaks not found. Install with: winget install --id Gitleaks.Gitleaks" >&2
+  echo "pre-commit: refusing to commit without a secret scan (use --no-verify to override)." >&2
+  exit 1
+}
+
+exec "$GITLEAKS" git --pre-commit --staged --redact --config .gitleaks.toml

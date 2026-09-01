@@ -1,0 +1,87 @@
+# ---- .NET build output ----
+bin/
+obj/
+out/
+publish/
+artifacts/
+*.binlog
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+coverage/
+BenchmarkDotNet.Artifacts/
+
+# ---- IDE / editor ----
+.vs/
+.vscode/
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ---- NuGet ----
+*.nupkg
+*.snupkg
+# Aion SDK NuGet is downloaded into nuget-local/ (see docs/PLAN.md); keep the folder, not the package.
+!nuget-local/.gitkeep
+.nuget/
+packages/
+project.lock.json
+*.nuget.props
+*.nuget.targets
+
+# ---- Secrets and local config (never commit) ----
+# LAF token / attestation, listener overrides, anything machine-specific.
+appsettings.local.json
+appsettings.*.local.json
+appsettings.Development.json
+secrets.json
+.env
+.env.*
+!.env.example
+*.secret
+*.token
+laf.*
+!laf.example.*
+
+# ---- Certificates and signing material ----
+# identity.ps1 creates a self-signed cert for the sparse package; the private key must not be tracked.
+*.pfx
+*.p12
+*.key
+*.pem
+*.cer
+*.crt
+packaging/cert/
+
+# ---- MSIX / packaging output ----
+*.msix
+*.msixbundle
+*.appx
+*.appxbundle
+*.appxsym
+*.appxupload
+AppPackages/
+packaging/out/
+
+# ---- Logs, traces, smoke-test captures ----
+*.log
+logs/
+*.etl
+*.dmp
+smoke-*.txt
+scripts/out/
+
+# ---- OS / misc ----
+*.bak
+*.tmp
+*.orig

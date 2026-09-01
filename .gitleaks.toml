@@ -1,0 +1,65 @@
+# gitleaks configuration for npu-bridge.
+# Extends the built-in default ruleset and adds rules for the secrets this project actually handles:
+# the Phi Silica Limited Access Feature (LAF) token and attestation string, and packaging certificates.
+#
+# Run locally:   gitleaks git --pre-commit --staged --redact   (wired via .githooks/pre-commit)
+#                gitleaks dir . --redact                        (scan the working tree)
+#                gitleaks git . --redact                        (scan full history)
+
+title = "npu-bridge gitleaks config"
+
+[extend]
+useDefault = true
+
+# --- Project-specific rules -------------------------------------------------
+
+[[rules]]
+id = "npu-bridge-laf-token"
+description = "Phi Silica LAF unlock token assigned in code or config"
+# Matches: laf-token / laf_token / LafToken / NPU_BRIDGE_LAF_TOKEN followed by a quoted or bare value.
+regex = '''(?i)(npu_bridge_laf_token|laf[-_]?token)\s*[:=]\s*["']?([A-Za-z0-9+/=_\-]{12,})["']?'''
+secretGroup = 2
+keywords = ["laf_token", "laf-token", "laftoken", "NPU_BRIDGE_LAF_TOKEN"]
+
+[[rules]]
+id = "npu-bridge-laf-attestation"
+description = "Phi Silica LAF attestation string (bound to a Package Family Name)"
+# Microsoft's attestation format: "<publisher-id> has registered their use of <feature> with Microsoft and agrees to the terms of use."
+regex = '''(?i)[A-Za-z0-9._\-]+ has registered their use of [A-Za-z0-9._\-]+ with Microsoft and agrees to the terms of use'''
+keywords = ["has registered their use of"]
+
+[[rules]]
+id = "npu-bridge-tryunlockfeature-literal"
+description = "LimitedAccessFeatures.TryUnlockFeature called with a literal token instead of configuration"
+# Flags a TryUnlockFeature call whose second argument is a string literal. gitleaks uses RE2 (no
+# lookahead), so placeholders such as "YOUR_TOKEN_HERE" or "<token>" are excluded via the allowlist.
+regex = '''TryUnlockFeature\s*\(\s*"[^"]+"\s*,\s*"([A-Za-z0-9+/=_\-]{12,})"'''
+secretGroup = 1
+keywords = ["TryUnlockFeature"]
+
+[[rules]]
+id = "npu-bridge-pfx-password"
+description = "Signing certificate password for the sparse-package identity script"
+regex = '''(?i)(pfx[-_]?password|cert[-_]?password|-Password\s+\(ConvertTo-SecureString)\s*[:=]?\s*["']?([^\s"']{6,})["']?'''
+secretGroup = 2
+keywords = ["pfxpassword", "pfx_password", "pfx-password", "certpassword", "ConvertTo-SecureString"]
+
+# --- Allowlist ----------------------------------------------------------------
+
+[allowlist]
+description = "Global allowlist"
+paths = [
+  '''(^|/)\.gitleaks\.toml$''',
+  '''(^|/)docs/PLAN\.md$''',          # contains the documented attestation *format*, not a real one
+  '''(^|/)memory-bank/.*\.md$''',
+  '''(^|/)bin/''',
+  '''(^|/)obj/''',
+]
+regexes = [
+  '''YOUR_TOKEN_HERE''',
+  '''YOUR_ATTESTATION_HERE''',
+  '''YOUR_ATTESTATION_STRING_HERE''',
+  '''TryUnlockFeature\s*\(\s*"[^"]+"\s*,\s*"<[^"]*>"''',   # "<token>"-style placeholder literal
+  '''<publisher-id> has registered their use of''',       # the placeholder format line in this file and docs
+]
+stopwords = ["example", "placeholder", "sample"]

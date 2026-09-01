@@ -1,0 +1,19 @@
+# Normalize line endings in the repo; check out as LF except where Windows tooling needs CRLF.
+* text=auto eol=lf
+
+# Shell scripts and git hooks must stay LF or the shebang/`sh` parsing breaks under Git Bash.
+*.sh          text eol=lf
+.githooks/*   text eol=lf
+
+# PowerShell and Windows batch files are happier with CRLF.
+*.ps1         text eol=crlf
+*.psm1        text eol=crlf
+*.cmd         text eol=crlf
+*.bat         text eol=crlf
+
+# Binary assets
+*.nupkg  binary
+*.msix   binary
+*.pfx    binary
+*.png    binary
+*.ico    binary
