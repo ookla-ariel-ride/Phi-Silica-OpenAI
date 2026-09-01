@@ -39,7 +39,15 @@
       If registration fails with 0x80073D19 ("no matching framework packages"), the missing runtime is named
       in the error; install it with winget (Microsoft.WindowsAppRuntime.2.0 / .1.8).
     -->
-    <PackageDependency Name="Microsoft.WindowsAppRuntime.2" MinVersion="2.0.1.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
+    <!--
+      The exe is built against the EXPERIMENTAL Windows App SDK channel (2.4.1-experimental), which Microsoft
+      recommends for Phi Silica testing because it needs no LAF token. Experimental runtimes are a separate
+      framework family; this name and version must match Microsoft.WindowsAppSDK.Runtime's
+      WindowsAppSDK-VersionInfo.cs (Runtime.Packages.Framework.PackageFamilyName / Version). The framework MSIX
+      is in that NuGet under tools/MSIX/win10-arm64 and is installed by scripts/identity.ps1 -Install.
+      For the stable channel use Name="Microsoft.WindowsAppRuntime.2" MinVersion="2.4.0.0".
+    -->
+    <PackageDependency Name="Microsoft.WindowsAppRuntime.2-experimentalB" MinVersion="2.4.1.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
     <PackageDependency Name="Microsoft.WindowsAppRuntime.1.8" MinVersion="8000.625.330.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
   </Dependencies>
 

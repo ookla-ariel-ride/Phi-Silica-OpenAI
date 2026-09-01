@@ -142,6 +142,39 @@ function New-LogoPng([string] $path, [int] $size) {
     $bmp.Dispose()
 }
 
+function Install-ManifestDependencies {
+    # Every PackageDependency in the manifest must be installed or Add-AppxPackage fails with 0x80073D19.
+    # Windows App Runtime frameworks (stable and experimental) ship inside the Microsoft.WindowsAppSDK.Runtime
+    # NuGet under tools/MSIX/win10-arm64; install from the NuGet cache when missing.
+    $nugetRoot = if ($env:NUGET_PACKAGES) { $env:NUGET_PACKAGES } else { Join-Path $env:USERPROFILE '.nuget\packages' }
+    foreach ($dep in $manifest.Package.Dependencies.PackageDependency) {
+        $name = $dep.Name
+        $min = [version]$dep.MinVersion
+        # The sparse package is ARM64; an x64 or arm64ec runtime of the same name does not satisfy it.
+        $have = Get-AppxPackage -Name $name -ErrorAction SilentlyContinue |
+            Where-Object { [version]$_.Version -ge $min -and $_.Architecture -in @('Arm64', 'Neutral') }
+        if ($have) { Write-Ok "Dependency $name >= $min installed ($($have[0].Version), $($have[0].Architecture))."; continue }
+        Write-Step "Dependency $name >= $min (Arm64) is not installed; looking in the NuGet cache..."
+        $candidates = Get-ChildItem (Join-Path $nugetRoot 'microsoft.windowsappsdk.runtime') -Recurse -Filter "$name.msix" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\win10-arm64\\' } |
+            Sort-Object { try { [version](($_.FullName -split '\\microsoft\.windowsappsdk\.runtime\\')[1] -split '\\')[0].Split('-')[0] } catch { [version]'0.0' } } -Descending
+        $installed = $false
+        foreach ($c in $candidates) {
+            try {
+                Add-AppxPackage -Path $c.FullName -ErrorAction Stop
+                $ddlm = Join-Path $c.DirectoryName ($name -replace 'WindowsAppRuntime\.', 'WindowsAppRuntime.DDLM.') + '.msix'
+                if (Test-Path $ddlm) { Add-AppxPackage -Path $ddlm -ErrorAction SilentlyContinue }
+                Write-Ok "Installed $name from $($c.FullName)"
+                $installed = $true
+                break
+            } catch { Write-Warn2 "Failed installing $($c.FullName): $($_.Exception.Message)" }
+        }
+        if (-not $installed) {
+            throw "Dependency $name >= $min is not installed and no MSIX was found in the NuGet cache. Build the exe first (dotnet build src/NpuBridge) so NuGet restores Microsoft.WindowsAppSDK.Runtime, or install it with winget."
+        }
+    }
+}
+
 function Get-RegisteredPackage {
     Get-AppxPackage -Name $identityName -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1
 }
@@ -179,6 +212,9 @@ switch ($PSCmdlet.ParameterSetName) {
         if (-not $cert) { $cert = New-SigningCert }
         Write-Ok "Using certificate $($cert.Thumbprint)"
         Install-CertTrust $cert
+
+        Write-Step 'Checking manifest package dependencies'
+        Install-ManifestDependencies
 
         Write-Step 'Staging manifest and logos'
         if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force }

@@ -1,5 +1,3 @@
-using System.Diagnostics;
-using System.Security.Principal;
 using NpuBridge.Configuration;
 using NpuBridge.Hosting;
 
@@ -36,11 +34,10 @@ internal static class ServiceCommands
             return 2;
         }
 
-        var exePath = Environment.ProcessPath
-            ?? throw new InvalidOperationException("Cannot determine the path of the running executable.");
-        if (Path.GetFileName(exePath).Equals("dotnet.exe", StringComparison.OrdinalIgnoreCase))
+        var exePath = ExternalCommands.ResolveExePath(out var pathError);
+        if (exePath is null)
         {
-            Console.Error.WriteLine("error: 'service install' must be run from the built NpuBridge.exe, not via 'dotnet NpuBridge.dll' or 'dotnet run'.");
+            Console.Error.WriteLine($"error: {pathError}");
             return 2;
         }
 
@@ -55,23 +52,24 @@ internal static class ServiceCommands
             return 2;
         }
 
-        if (!IsElevated())
+        if (string.Equals(verb, "install", StringComparison.OrdinalIgnoreCase) && options.Backend == BackendKind.PhiSilica)
+        {
+            Console.Error.WriteLine("error: a Windows service starts without package identity, which Phi Silica requires (DECISIONS D24).");
+            Console.Error.WriteLine("       Use 'task install' for --backend phi-silica; 'service install' works for --backend aion or fake.");
+            return 2;
+        }
+
+        if (!ExternalCommands.IsElevated())
         {
             Console.Error.WriteLine("error: 'service' commands change the Service Control Manager and need an elevated (Administrator) prompt.");
             Console.Error.WriteLine($"       Re-run from an elevated terminal: {Path.GetFileName(exePath)} service {verb}");
             return 5;
         }
 
-        foreach (var command in commands)
+        var exit = ExternalCommands.RunAll(commands);
+        if (exit != 0)
         {
-            Console.WriteLine($"> {command.Description}");
-            Console.WriteLine($"  {command.FileName} {command.Arguments}");
-            var exit = Execute(command);
-            if (exit != 0 && !command.IgnoreFailure)
-            {
-                Console.Error.WriteLine($"error: '{command.FileName} {command.Arguments}' exited with code {exit}.");
-                return exit;
-            }
+            return exit;
         }
 
         if (string.Equals(verb, "install", StringComparison.OrdinalIgnoreCase))
@@ -80,46 +78,9 @@ internal static class ServiceCommands
             Console.WriteLine($"Service '{options.ServiceName}' installed (start type: automatic). Start it with:");
             Console.WriteLine($"  {Path.GetFileName(exePath)} service start");
             Console.WriteLine("Logs: Windows Event Log > Application, source 'npu-bridge'. Settings: the options shown above plus");
-            Console.WriteLine($"  {Path.Combine(AppContext.BaseDirectory, "appsettings.json")} and appsettings.local.json (for LafToken/LafAttestation).");
-            if (options.Backend == BackendKind.PhiSilica)
-            {
-                Console.WriteLine();
-                Console.WriteLine("Note: a service process starts without package identity, which Phi Silica requires.");
-                Console.WriteLine("      The service verbs suit --backend aion or fake; the Phi Silica auto-start path is the logon task (chunk 2).");
-            }
+            Console.WriteLine($"  {Path.Combine(AppContext.BaseDirectory, "appsettings.json")} and appsettings.local.json.");
         }
 
         return 0;
-    }
-
-    private static int Execute(ServiceCommand command)
-    {
-        var psi = new ProcessStartInfo
-        {
-            FileName = command.FileName,
-            Arguments = command.Arguments,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-        };
-
-        using var process = Process.Start(psi) ?? throw new InvalidOperationException($"Failed to start {command.FileName}.");
-        var stderrTask = process.StandardError.ReadToEndAsync();
-        var stdout = process.StandardOutput.ReadToEnd();
-        var stderr = stderrTask.GetAwaiter().GetResult();
-        process.WaitForExit();
-
-        foreach (var line in (stdout + stderr).Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            Console.WriteLine($"  {line}");
-        }
-
-        return process.ExitCode;
-    }
-
-    private static bool IsElevated()
-    {
-        using var identity = WindowsIdentity.GetCurrent();
-        return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
     }
 }

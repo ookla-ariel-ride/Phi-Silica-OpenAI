@@ -4,6 +4,7 @@ public enum CommandVerb
 {
     Run,
     Service,
+    Task,
     Help,
     Version,
 }
@@ -43,6 +44,11 @@ public static class CommandLine
         ["--laf-attestation"] = nameof(BridgeOptions.LafAttestation),
         ["--verbose"] = nameof(BridgeOptions.Verbose),
         ["--service-name"] = nameof(BridgeOptions.ServiceName),
+        ["--task-name"] = nameof(BridgeOptions.TaskName),
+        ["--self-relaunch"] = nameof(BridgeOptions.SelfRelaunch),
+        ["--hide-console"] = nameof(BridgeOptions.HideConsole),
+        ["--install-model"] = nameof(BridgeOptions.InstallModel),
+        ["--supervisor-pid"] = nameof(BridgeOptions.SupervisorPid),
     };
 
     /// <summary>Options that may appear without a value, meaning <c>true</c>.</summary>
@@ -50,6 +56,8 @@ public static class CommandLine
     {
         "--truncate-history",
         "--verbose",
+        "--hide-console",
+        "--install-model",
     };
 
     public const string Usage = """
@@ -57,9 +65,12 @@ public static class CommandLine
 
         Usage:
           npu-bridge [run] [options]              Start the HTTP server (default verb)
-          npu-bridge service install [options]    Register as a Windows service (elevated prompt)
+          npu-bridge service install [options]    Register as a Windows service (elevated; aion/fake backends)
           npu-bridge service uninstall            Remove the Windows service
           npu-bridge service start|stop           Control the installed service
+          npu-bridge task install [options]       Register a logon task that starts npu-bridge with package
+                                                  identity (elevated; required for the phi-silica backend)
+          npu-bridge task uninstall|status        Remove / inspect the logon task
           npu-bridge --help | --version
 
         Options (also settable in appsettings.json and as NPU_BRIDGE_<NAME> environment variables):
@@ -73,9 +84,42 @@ public static class CommandLine
           --context-window-hint <tokens>    Used only for pressure warnings    [4096]
           --laf-token <token>               Phi Silica LAF token (prefer env NPU_BRIDGE_LAF_TOKEN)
           --laf-attestation <text>          Phi Silica LAF attestation (prefer env NPU_BRIDGE_LAF_ATTESTATION)
+          --self-relaunch on|off            Relaunch via package activation when phi-silica lacks identity [on]
+                                            (the by-path process then supervises the activated one; Ctrl+C stops both)
+          --hide-console                    Hide the console window after startup
+          --install-model                   Let Phi Silica download its model via Windows Update if missing (GBs)
+          --supervisor-pid <pid>            Internal: exit when that process exits (set by self-relaunch)
           --service-name <name>             Windows service name               [NpuBridge]
+          --task-name <name>                Logon task name                    [npu-bridge]
           --verbose                         Log flattened prompts and raw model output
         """;
+
+    /// <summary>
+    /// Renders normalised <c>Key=value</c> settings back into <c>--option value</c> pairs, each value quoted
+    /// per C-runtime rules so <see cref="Parse"/> reads them back identically.
+    /// </summary>
+    public static string Render(IReadOnlyList<string> configArgs)
+    {
+        ArgumentNullException.ThrowIfNull(configArgs);
+        var parts = new List<string>(configArgs.Count * 2);
+        foreach (var setting in configArgs)
+        {
+            var eq = setting.IndexOf('=', StringComparison.Ordinal);
+            if (eq <= 0)
+            {
+                throw new ArgumentException($"Setting '{setting}' is not in Key=value form.", nameof(configArgs));
+            }
+
+            var key = setting[..eq];
+            var value = setting[(eq + 1)..];
+            var option = Options.FirstOrDefault(kv => string.Equals(kv.Value, key, StringComparison.OrdinalIgnoreCase)).Key
+                ?? throw new ArgumentException($"Setting '{key}' has no command-line option.", nameof(configArgs));
+            parts.Add(option);
+            parts.Add(Hosting.ServiceCommandBuilder.CrtQuote(value, force: false));
+        }
+
+        return string.Join(' ', parts);
+    }
 
     public static CommandLineParse Parse(IReadOnlyList<string> args)
     {
@@ -95,6 +139,9 @@ public static class CommandLine
                     break;
                 case "service":
                     verb = CommandVerb.Service;
+                    break;
+                case "task":
+                    verb = CommandVerb.Task;
                     break;
                 case "help":
                 case "/?":
@@ -124,7 +171,7 @@ public static class CommandLine
 
             if (!arg.StartsWith("--", StringComparison.Ordinal))
             {
-                if (verb == CommandVerb.Service)
+                if (verb is CommandVerb.Service or CommandVerb.Task)
                 {
                     verbArgs.Add(arg);
                     continue;
@@ -184,6 +231,11 @@ public static class CommandLine
         if (verb == CommandVerb.Service && verbArgs.Count == 0)
         {
             return Error("The 'service' command needs one of: install, uninstall, start, stop.");
+        }
+
+        if (verb == CommandVerb.Task && verbArgs.Count == 0)
+        {
+            return Error("The 'task' command needs one of: install, uninstall, status.");
         }
 
         return new CommandLineParse(verb, verbArgs, config, null);

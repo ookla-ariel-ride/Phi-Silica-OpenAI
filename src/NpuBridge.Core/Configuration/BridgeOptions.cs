@@ -57,6 +57,31 @@ public sealed class BridgeOptions
 
     /// <summary>Windows service name used by the <c>service</c> verbs.</summary>
     public string ServiceName { get; set; } = "NpuBridge";
+
+    /// <summary>
+    /// When the Phi Silica backend starts without package identity and the sparse package is registered for
+    /// this exe, relaunch through package activation (which is the only way identity is granted) and exit.
+    /// </summary>
+    public bool SelfRelaunch { get; set; } = true;
+
+    /// <summary>Hide the console window after startup (for the logon task / activated instance).</summary>
+    public bool HideConsole { get; set; }
+
+    /// <summary>Scheduled task name used by the <c>task</c> verbs.</summary>
+    public string TaskName { get; set; } = "npu-bridge";
+
+    /// <summary>
+    /// Allow the Phi Silica adapter to call <c>EnsureReadyAsync</c> when the model is not installed, which
+    /// starts a multi-gigabyte Windows Update download. Off by default: a headless server must not do that
+    /// without an explicit opt-in.
+    /// </summary>
+    public bool InstallModel { get; set; }
+
+    /// <summary>
+    /// Internal: set by the by-path parent on the activated child. The child exits when this process
+    /// exits, so stopping the parent (Ctrl+C, <c>schtasks /End</c>) stops the server.
+    /// </summary>
+    public int? SupervisorPid { get; set; }
 }
 
 public static class BackendKinds

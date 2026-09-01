@@ -23,6 +23,24 @@ public class BridgeOptionsBinderTests
         Assert.Null(o.LafAttestation);
         Assert.False(o.Verbose);
         Assert.Equal("NpuBridge", o.ServiceName);
+        Assert.True(o.SelfRelaunch);
+        Assert.False(o.HideConsole);
+        Assert.Equal("npu-bridge", o.TaskName);
+    }
+
+    [Fact]
+    public void Relaunch_console_and_task_name_bind()
+    {
+        var o = Bind(("SelfRelaunch", "off"), ("HideConsole", "yes"), ("TaskName", "npu-dev"), ("InstallModel", "on"), ("SupervisorPid", "4321"));
+        Assert.False(o.SelfRelaunch);
+        Assert.True(o.HideConsole);
+        Assert.Equal("npu-dev", o.TaskName);
+        Assert.True(o.InstallModel);
+        Assert.Equal(4321, o.SupervisorPid);
+        Assert.Null(Bind().SupervisorPid);
+        Assert.False(Bind().InstallModel);
+        Assert.Throws<BridgeConfigurationException>(() => Bind(("TaskName", "npu dev")));
+        Assert.Throws<BridgeConfigurationException>(() => Bind(("SupervisorPid", "0")));
     }
 
     [Fact]

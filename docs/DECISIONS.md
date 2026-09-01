@@ -138,6 +138,69 @@ service the server would run as.
 **D30. 404s use OpenAI's `invalid_request_error` type.** OpenAI has no `not_found_error`; unknown models
 and endpoints are `invalid_request_error` with codes `model_not_found` / `unknown_endpoint` and HTTP 404.
 
+## 2026-09-01 — Chunk 2 (Phi Silica adapter)
+
+**D31. Experimental Windows App SDK channel, no LAF token.** Verified on this machine: with stable
+2.4.0 `TryUnlockFeature` returns `Unavailable` and no token was available; with 2.4.1-experimental the
+model loads and generates although the LAF probe still says `Unavailable`. Microsoft's troubleshooting
+page recommends experimental releases for exactly this reason. Costs: the experimental runtime is a
+separate framework family (`Microsoft.WindowsAppRuntime.2-experimentalB`) that `identity.ps1` now installs
+from the NuGet payload, the sparse manifest must name it, and experimental APIs may change between
+releases. Switching back to stable is two version strings plus one manifest line, documented in the manifest.
+
+**D32. LAF failure is logged, not fatal.** The adapter records `laf_status` in `/healthz`, warns, and lets
+`GetReadyState`/`CreateAsync` decide; an `E_ACCESSDENIED` from those is turned into a message that names
+the Package Family Name to request a token for. This keeps one code path for both channels.
+
+**D33. Self-relaunch through package activation, verified.** `IApplicationActivationManager.ActivateApplication`
+passes the argument string to a packaged Win32 exe's command line (the child honoured `--listen`), so
+options survive the relaunch. The child is started with `--self-relaunch off` so a misconfiguration can never
+loop. The parent exits 0 after printing the child's pid.
+
+**D34. Logon scheduled task is the Phi Silica auto-start; the service stays for aion/fake.**
+`task install` creates an `ONLOGON` task for the current user with `/IT` (interactive session) and `/RL
+LIMITED`, action = the exe by path with `--hide-console`; the exe relaunches itself with identity.
+`service install --backend phi-silica` is refused with an explanation. The chunk 1 question "do the
+Windows AI APIs work from a non-interactive session" is moot: `/IT` keeps the process in the interactive
+session, and the service path is not used for Phi Silica at all.
+
+**D35. `POST /debug/generate` is a permanent diagnostic.** One prompt straight into the backend with timing
+(ttft, tok/s), bypassing template, cache and scheduler. It let the adapter be verified on the NPU before the
+OpenAI endpoints existed and stays for debugging what the model does with a literal prompt. Not part of
+the OpenAI surface; same localhost listener.
+
+**D36. Build output path is fixed to `bin\<Config>\<tfm>\win-arm64`.** `AppendPlatformToOutputPath=false`
+so project-level and solution-level builds agree; the sparse package is registered against that folder and
+a second exe copy in `bin\ARM64\...` silently broke relaunch once.
+
+**D37. The by-path process supervises the activated instance (chunk 2 review).** Activation makes the
+child a stranger to the parent: the parent used to exit 0 immediately, so a scheduled task could not stop
+the server, `task status` was always "Ready / last result 0", a child that died at startup was reported as
+success, and a second `schtasks /Run` produced a port fight. Now the parent waits on the child's pid,
+forwards its exit code, kills it on Ctrl+C or its own exit, and reports an immediate child death; the
+child receives `--supervisor-pid` and stops when that process disappears (covers `schtasks /End`, which
+is `TerminateProcess`). Net effect: Ctrl+C, `/End` and crashes behave like a single ordinary process.
+
+**D38. Environment is re-expressed on the child's command line.** Package activation does not inherit
+the parent's process environment, so `NPU_BRIDGE_*` set in the shell used to vanish across the relaunch
+(review blocker). `RelaunchArguments` forwards every effective, non-secret `NPU_BRIDGE_*` value as a CLI
+option (CLI values still win). Secrets set only in the parent's process environment are dropped with a
+warning: they belong in `appsettings.local.json`, which the child reads from the exe folder; secrets given
+on the parent's command line are forwarded unchanged since they were already visible there.
+
+**D39. No unsolicited model download.** `EnsureReadyAsync` (a multi-GB Windows Update download) runs only
+with `--install-model`; otherwise `NotReady` fails with the Settings path. Follows Microsoft's consent
+guidance; a hidden logon task must never start it silently.
+
+**D40. `/debug/generate` is loopback-only** (403 otherwise) because it bypasses the request queue that
+chunk 8 adds. Routing it through the scheduler is deferred.
+
+**Observations recorded for later chunks.** (1) Phi Silica's `Progress` callback delivers multi-token
+chunks under speculative decoding (11 callbacks for ~25 words), so `completion_tokens` estimated from
+callbacks undercounts; a character-based estimate may be better. (2) A strict system prompt set through
+`CreateContext(systemPrompt)` was not followed ("I am Ada" → "AI Assistant"); chunk 3 should test whether
+rendering the system text into the user turn works better on this model.
+
 **D23. `identity.ps1` signs from the certificate store, never from a PFX on disk.** `signtool /sha1
 <thumbprint>` uses the key in `CurrentUser\My`; only the public `.cer` is exported (to
 `packaging/out`, gitignored) for the one-time `TrustedPeople` import.

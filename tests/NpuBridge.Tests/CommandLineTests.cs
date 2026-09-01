@@ -137,6 +137,17 @@ public class CommandLineTests
         Assert.True(parsed.IsError);
     }
 
+    [Fact]
+    public void Task_verb_collects_subverb_and_settings()
+    {
+        var parsed = CommandLine.Parse(["task", "install", "--hide-console", "--self-relaunch", "off", "--task-name", "npu-dev"]);
+        Assert.False(parsed.IsError, parsed.Error);
+        Assert.Equal(CommandVerb.Task, parsed.Verb);
+        Assert.Equal(["install"], parsed.VerbArgs);
+        Assert.Equal(["HideConsole=true", "SelfRelaunch=off", "TaskName=npu-dev"], parsed.ConfigArgs);
+        Assert.True(CommandLine.Parse(["task"]).IsError);
+    }
+
     [Theory]
     [InlineData("--help")]
     [InlineData("-h")]
@@ -162,6 +173,40 @@ public class CommandLineTests
         var parsed = CommandLine.Parse(["serve"]);
         Assert.True(parsed.IsError);
         Assert.Contains("serve", parsed.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Render_round_trips_through_parse()
+    {
+        string[] settings = ["Backend=fake", "LafAttestation=x has \"registered\" its use", "Listen=http://127.0.0.1:5273", "Verbose=true", "ContextWindowHint=-1"];
+        var rendered = CommandLine.Render(settings);
+        Assert.Equal("--backend fake --laf-attestation \"x has \\\"registered\\\" its use\" --listen http://127.0.0.1:5273 --verbose true --context-window-hint -1", rendered);
+
+        // Split the way the C runtime would, then parse.
+        var argv = new List<string>();
+        var cur = new System.Text.StringBuilder();
+        var q = false;
+        for (var i = 0; i < rendered.Length; i++)
+        {
+            var c = rendered[i];
+            if (c == '\\' && i + 1 < rendered.Length && rendered[i + 1] == '"') { cur.Append('"'); i++; continue; }
+            if (c == '"') { q = !q; continue; }
+            if (c == ' ' && !q) { argv.Add(cur.ToString()); cur.Clear(); continue; }
+            cur.Append(c);
+        }
+
+        argv.Add(cur.ToString());
+        var parsed = CommandLine.Parse(argv);
+        Assert.False(parsed.IsError, parsed.Error);
+        Assert.Equal(settings, parsed.ConfigArgs);
+    }
+
+    [Fact]
+    public void Render_rejects_unknown_keys_and_malformed_settings()
+    {
+        Assert.Throws<ArgumentException>(() => CommandLine.Render(["NotAnOption=1"]));
+        Assert.Throws<ArgumentException>(() => CommandLine.Render(["Verbose"]));
+        Assert.Equal(string.Empty, CommandLine.Render([]));
     }
 
     [Fact]

@@ -23,6 +23,7 @@ public static class BridgeEndpoints
         app.MapGet("/healthz", HealthEndpoint.Get);
         app.MapGet("/v1/models", ModelsEndpoint.List);
         app.MapGet("/v1/models/{id}", ModelsEndpoint.Get);
+        app.MapNpuBridgeDebug();
 
         // Anything else under /v1 gets an OpenAI-shaped 404 (or 405 for a known path) instead of an empty body.
         app.MapFallback("/v1/{**path}", (HttpContext http, string? path) => FallbackEndpoint.Handle(http, path));

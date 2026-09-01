@@ -82,7 +82,6 @@ public static class ServiceCommandBuilder
         ArgumentException.ThrowIfNullOrWhiteSpace(exePath);
         ArgumentNullException.ThrowIfNull(configArgs);
 
-        var parts = new List<string> { CrtQuote(exePath, force: true), "run" };
         foreach (var setting in configArgs)
         {
             var eq = setting.IndexOf('=', StringComparison.Ordinal);
@@ -91,21 +90,18 @@ public static class ServiceCommandBuilder
                 throw new ArgumentException($"Setting '{setting}' is not in Key=value form.", nameof(configArgs));
             }
 
-            var key = setting[..eq];
-            var value = setting[(eq + 1)..];
-            if (SecretSettings.Contains(key))
+            if (SecretSettings.Contains(setting[..eq]))
             {
                 throw new ArgumentException(
-                    $"'{key}' must not be baked into the service command line (it would be readable by every local user in the registry). " +
+                    $"'{setting[..eq]}' must not be baked into the service command line (it would be readable by every local user in the registry). " +
                     "Put it in appsettings.local.json next to the exe instead.", nameof(configArgs));
             }
-
-            var option = CommandLine.Options.First(kv => string.Equals(kv.Value, key, StringComparison.OrdinalIgnoreCase)).Key;
-            parts.Add(option);
-            parts.Add(CrtQuote(value, force: false));
         }
 
-        return string.Join(' ', parts);
+        var rendered = CommandLine.Render(configArgs);
+        return rendered.Length == 0
+            ? $"{CrtQuote(exePath, force: true)} run"
+            : $"{CrtQuote(exePath, force: true)} run {rendered}";
     }
 
     /// <summary>

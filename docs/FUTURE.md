@@ -22,15 +22,49 @@ land here instead of widening the chunk. Each entry says where it came from and 
 - **LoRA adapters** (`LanguageModelOptions.LowRankAdapter`).
 - **Multiple model ids per process** (e.g. serve both backends at once, one model each).
 
+## Chunk 2 review deferrals
+
+- **In-flight generation tracking in the adapter.** `PhiSilicaBackend.DisposeAsync` disposes the model
+  (and would call `Bootstrap.Shutdown`, a no-op under identity) while caller-owned contexts or an
+  in-flight `GenerateAsync` may exist. Harmless today; chunk 5/8 (cache + scheduler) should drain
+  in-flight work before disposal.
+- **UAC over-the-shoulder elevation.** If a standard user elevates with an admin's credentials, the
+  elevated token is the admin's: `task install` would register the task for the wrong account and the
+  package lookup would miss the user's registration. Detect (elevated token user ≠ interactive session
+  user) and refuse; needs `WTSQuerySessionInformation` or similar.
+- **`--hide-console` under Windows Terminal.** `GetConsoleWindow` returns the ConPTY pseudo-window, so
+  hiding works with conhost (as observed) but not when Windows Terminal is the default host. A `WinExe`
+  launcher stub would fix it properly.
+- **Slimmer package graph.** The `Microsoft.WindowsAppSDK` metapackage copies WinUI, WebView2 and
+  OnnxRuntime binaries into the output. `Microsoft.WindowsAppSDK.AI` + `.Foundation`/`.Runtime` would
+  be smaller; deferred because CsWinRT projection setup is fiddly and the metapackage is known to work.
+- **`/debug/generate` through the scheduler** once chunk 8 exists, so it cannot bypass the queue.
+- **Automated cancel assertion on the NPU.** The smoke test proves a client disconnect is survived and
+  drained; it cannot observe the adapter's `Cancelled` status from an aborted HTTP request. A future
+  streaming smoke step (chunk 4) can assert the truncated stream instead.
+
+## Chunk 2 deferrals
+
+- **Stable-channel Phi Silica once a LAF token arrives.** The code path is identical; switching is
+  `Microsoft.WindowsAppSDK`/`.Runtime` back to the stable version and the manifest's
+  `PackageDependency` back to `Microsoft.WindowsAppRuntime.2`. Worth doing when the token is issued so
+  the bridge does not depend on experimental packages.
+- **Token counting.** Progress callbacks undercount on Phi Silica (speculative decoding batches tokens).
+  Consider `chars/4` for completion tokens too, or expose both. Decide in chunk 3 when `usage` is built.
+- **System prompt fidelity on Phi Silica.** `CreateContext(systemPrompt)` did not make the model follow a
+  strict identity instruction. Chunk 3's template should be measured both ways (native context vs.
+  rendered into the user turn) with the smoke test.
+- **Activated instance's console.** With `--hide-console` the window is hidden after startup but still
+  flashes briefly; a `WinExe` variant or a launcher stub would avoid it. Logs from the activated process
+  are otherwise lost; add file logging (see chunk 1 deferral).
+- **Self-relaunch args and secrets.** `LafToken` passed on the parent's command line is forwarded to the
+  child's command line (visible in Task Manager for the user's own processes). Prefer the local settings file.
+
 ## Chunk 1 deferrals
 
-- **Phi Silica auto-start needs package activation, not the SCM** (DECISIONS D24, verified). Chunk 2
-  scope: (1) when `--backend phi-silica` starts without identity and the package is registered for the
-  exe's folder, relaunch through `IApplicationActivationManager.ActivateApplication` with the same
-  arguments and exit; (2) `task install|uninstall` verbs that create a logon-triggered scheduled task
-  whose action is that activation, as the Phi Silica counterpart of `service install`. The service verbs
-  stay for `aion`/`fake`. Open question for chunk 2: whether the Windows AI APIs work at all from a
-  non-interactive session, which would also rule out a service for Phi Silica on grounds unrelated to identity.
+- ~~Phi Silica auto-start needs package activation, not the SCM~~ — done in chunk 2: self-relaunch with
+  supervision and `task install|uninstall|status` (D33, D34, D37). The non-interactive-session question is
+  moot because the task runs with `/IT` in the user's session.
 - **Automated validation of `identity.ps1` and the manifest** (Codex review, chunk 1). A Pester test
   that runs `makeappx pack /nv` against `packaging/AppxManifest.xml` and checks `-Status` output would
   catch schema regressions without the UAC step. Windows-only; run manually for now.

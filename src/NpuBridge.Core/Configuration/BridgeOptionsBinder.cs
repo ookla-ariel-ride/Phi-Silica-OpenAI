@@ -48,6 +48,24 @@ public static class BridgeOptionsBinder
         o.TruncateHistory = GetBool(configuration, nameof(BridgeOptions.TruncateHistory), o.TruncateHistory);
         o.ToolEmulation = GetBool(configuration, nameof(BridgeOptions.ToolEmulation), o.ToolEmulation);
         o.Verbose = GetBool(configuration, nameof(BridgeOptions.Verbose), o.Verbose);
+        o.SelfRelaunch = GetBool(configuration, nameof(BridgeOptions.SelfRelaunch), o.SelfRelaunch);
+        o.HideConsole = GetBool(configuration, nameof(BridgeOptions.HideConsole), o.HideConsole);
+        o.InstallModel = GetBool(configuration, nameof(BridgeOptions.InstallModel), o.InstallModel);
+
+        if (Get(configuration, nameof(BridgeOptions.SupervisorPid)) is { } supervisor)
+        {
+            o.SupervisorPid = GetInt(configuration, nameof(BridgeOptions.SupervisorPid), 0, min: 1, max: int.MaxValue);
+        }
+
+        if (Get(configuration, nameof(BridgeOptions.TaskName)) is { } taskName)
+        {
+            if (!IsValidServiceName(taskName))
+            {
+                throw Bad(nameof(BridgeOptions.TaskName), taskName, "must be 1-256 characters with no whitespace, slashes or quotes");
+            }
+
+            o.TaskName = taskName;
+        }
 
         if (Get(configuration, nameof(BridgeOptions.ToolSchema)) is { } schema)
         {

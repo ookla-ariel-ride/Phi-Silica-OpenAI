@@ -18,6 +18,8 @@
     <Platform Condition="'$(Platform)' == '' Or '$(Platform)' == 'AnyCPU'">ARM64</Platform>
     <RuntimeIdentifier>win-arm64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
+    <!-- One output folder whether built via the solution or the project: bin\<Config>\<tfm>\win-arm64. The sparse package is registered against it. -->
+    <AppendPlatformToOutputPath>false</AppendPlatformToOutputPath>
     <!-- LibraryImport source generation (ProcessIdentity.cs) and CsWinRT projections need this. -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
@@ -29,6 +31,14 @@
     <WindowsPackageType>None</WindowsPackageType>
     <WindowsAppSdkBootstrapInitialize>false</WindowsAppSdkBootstrapInitialize>
     <WindowsAppSDKSelfContained>false</WindowsAppSDKSelfContained>
+
+    <!--
+      CsWinRT's projection step looks for a registry-installed Windows SDK by default. Use the
+      NuGet-delivered Windows metadata instead so the build needs only the .NET SDK (as the Aion sample does).
+    -->
+    <WindowsAppSdkVersion>2.4.1-experimental</WindowsAppSdkVersion>
+    <WindowsSdkPackageVersion>10.0.26100.57</WindowsSdkPackageVersion>
+    <CsWinRTWindowsMetadata>$(NuGetPackageRoot)microsoft.windows.sdk.net.ref\$(WindowsSdkPackageVersion)\winmd</CsWinRTWindowsMetadata>
 
   </PropertyGroup>
 
@@ -44,6 +54,30 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.11" />
+    <!--
+      Phi Silica: Microsoft.Windows.AI.Text ships in the Windows App SDK (stable 2.x). CsWinRT must be a
+      DIRECT reference or its projection targets never run (see the Aion sample README).
+    -->
+    <!--
+      One place for the Windows App SDK version. packaging/AppxManifest.xml must name the matching runtime
+      framework family (experimental channels use a different family than stable); see DECISIONS D31.
+    -->
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="$(WindowsAppSdkVersion)" />
+    <PackageReference Include="Microsoft.Windows.CsWinRT" Version="2.3.1" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.4948">
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <!-- Direct reference only to get $(PkgMicrosoft_WindowsAppSDK_Runtime) for the version-constants source below. -->
+    <PackageReference Include="Microsoft.WindowsAppSDK.Runtime" Version="$(WindowsAppSdkVersion)" GeneratePathProperty="true" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Release/Runtime version constants used by the explicit Bootstrap call in PhiSilicaBackend. If
+      WindowsAppSdkBootstrapInitialize is ever turned on, the SDK targets add their own copy of this file
+      and this Compile item must go (CS0101 duplicate type otherwise).
+    -->
+    <Compile Include="$(PkgMicrosoft_WindowsAppSDK_Runtime)\include\WindowsAppSDK-VersionInfo.cs" Link="Generated\WindowsAppSDK-VersionInfo.cs" />
   </ItemGroup>
 
 </Project>

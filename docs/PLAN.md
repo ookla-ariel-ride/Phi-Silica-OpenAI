@@ -393,8 +393,8 @@ LAF token and install runtimes while I build 3–5.
 |---|---|---|
 | Q1 | Project layout | **Three projects**: `NpuBridge.Core`, `NpuBridge` (exe), `NpuBridge.Tests`. |
 | Q2 | .NET SDK | **.NET 10 SDK installed (10.0.400 arm64); target `net10.0`** (LTS). Fall back to `net9.0` only if the Aion/CsWinRT build breaks, and record why. |
-| Q3 | Service vs identity | **Build the service verbs; verify service + Phi Silica on this machine in chunk 2.** Scheduled-task fallback only if identity doesn't reach the SCM-launched process. |
-| Q4 | LAF token | **No token yet. Request one (form + PFN reply) as soon as chunk 1 prints the PFN; try the stable SDK meanwhile**, switch to the experimental channel if `TryUnlockFeature` returns `Unavailable` without a token. |
+| Q3 | Service vs identity | **Build the service verbs; verify service + Phi Silica on this machine in chunk 2.** Scheduled-task fallback only if identity doesn't reach the SCM-launched process. *Outcome: identity is granted only by package activation (D24), so the service verbs serve aion/fake and `task install` (logon task + self-relaunch with supervision, D34/D37) is the Phi Silica auto-start.* |
+| Q4 | LAF token | **No token yet. Request one (form + PFN reply) as soon as chunk 1 prints the PFN; try the stable SDK meanwhile**, switch to the experimental channel if `TryUnlockFeature` returns `Unavailable` without a token. *Outcome (chunk 2): stable returned `Unavailable`; the exe now targets 2.4.1-experimental, which loads and generates without a token (D31). PFN: `NpuBridge_jtas4mnxdyzpe`.* |
 | Q5 | Defaults | **`127.0.0.1:5273`, backend `phi-silica`.** |
 | Q6 | Tool buffering | **Buffer the whole reply when `tools` is present, then stream**; keep-alive comments meanwhile. |
 | Q7 | Phi Silica first | **Yes for the adapter (chunk 2); core chunks stay backend-agnostic.** |
