@@ -185,6 +185,26 @@ public class FakeBackendTests
     }
 
     [Fact]
+    public async Task Fail_after_last_token_fires_with_full_text()
+    {
+        var fake = await ReadyAsync(new FakeBackendOptions
+        {
+            Responder = _ => ["x", "y", "z"],
+            FailAfterTokens = 3,
+            FailureStatus = GenerationStatus.PromptLargerThanContext,
+        });
+        using var ctx = fake.CreateContext(null);
+        var deltas = 0;
+
+        var result = await fake.GenerateAsync(ctx, "p", null, _ => Interlocked.Increment(ref deltas), CancellationToken.None);
+
+        Assert.Equal(GenerationStatus.PromptLargerThanContext, result.Status);
+        Assert.Equal("xyz", result.Text);
+        Assert.Equal(3, deltas);
+        Assert.Empty(fake.Calls[0].History);
+    }
+
+    [Fact]
     public async Task Injected_exception_propagates()
     {
         var fake = await ReadyAsync(new FakeBackendOptions

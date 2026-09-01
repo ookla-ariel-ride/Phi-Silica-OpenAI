@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.Security.Principal;
-using Microsoft.Extensions.Configuration;
 using NpuBridge.Configuration;
 using NpuBridge.Hosting;
 
@@ -24,13 +23,12 @@ internal static class ServiceCommands
             return 2;
         }
 
-        // Validate the settings now, with the same binder the service will use, so a typo fails here
-        // instead of as an opaque SCM start error later.
+        // Resolve settings exactly as the server does (appsettings.json < local < NPU_BRIDGE_* < CLI) so
+        // the service name matches, and so a typo fails here instead of as an opaque SCM start error.
         BridgeOptions options;
         try
         {
-            var config = new ConfigurationBuilder().AddCommandLine([.. parsed.ConfigArgs]).Build();
-            options = BridgeOptionsBinder.Bind(config);
+            options = BridgeOptionsBinder.Bind(BridgeConfiguration.Build(AppContext.BaseDirectory, parsed.ConfigArgs));
         }
         catch (BridgeConfigurationException ex)
         {

@@ -93,7 +93,9 @@ function Install-CertTrust([System.Security.Cryptography.X509Certificates.X509Ce
         Import-Certificate -FilePath $cerPath -CertStoreLocation 'Cert:\LocalMachine\TrustedPeople' | Out-Null
     } else {
         Write-Step 'Trusting the certificate needs one elevated prompt (LocalMachine\TrustedPeople)...'
-        $cmd = "Import-Certificate -FilePath '$cerPath' -CertStoreLocation 'Cert:\LocalMachine\TrustedPeople' | Out-Null"
+        # Single-quoted literal: double any apostrophe in the path so it cannot terminate the string.
+        $safePath = $cerPath.Replace("'", "''")
+        $cmd = "Import-Certificate -FilePath '$safePath' -CertStoreLocation 'Cert:\LocalMachine\TrustedPeople' | Out-Null"
         # -EncodedCommand sidesteps argument re-quoting of paths with spaces.
         $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
         Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile', '-EncodedCommand', $encoded -Verb RunAs -Wait

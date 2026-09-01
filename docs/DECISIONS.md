@@ -125,6 +125,19 @@ thread-pool thread (as WinRT `Progress` does), use before `InitializeAsync` thro
 on every member, and a first-token delay is separate from the per-token delay. Tests that pass
 against the fake should not pass vacuously against the NPU.
 
+**D28. `BackendLifecycle` owns the backend (Codex review, chunk 1).** The backend is no longer a
+container-owned disposable; the lifecycle disposes it after initialization finishes, with a 15 s grace
+period for a runtime whose `CreateAsync` ignores cancellation. Prevents tearing down a WinRT model
+handle underneath its own creation during shutdown.
+
+**D29. One configuration composition for the server and the service verbs.** `BridgeConfiguration`
+defines `appsettings.json < appsettings.local.json < NPU_BRIDGE_* < CLI` once; `service install|…`
+resolves `ServiceName` through it, so a name set in the JSON file or the environment targets the same
+service the server would run as.
+
+**D30. 404s use OpenAI's `invalid_request_error` type.** OpenAI has no `not_found_error`; unknown models
+and endpoints are `invalid_request_error` with codes `model_not_found` / `unknown_endpoint` and HTTP 404.
+
 **D23. `identity.ps1` signs from the certificate store, never from a PFX on disk.** `signtool /sha1
 <thumbprint>` uses the key in `CurrentUser\My`; only the public `.cer` is exported (to
 `packaging/out`, gitignored) for the one-time `TrustedPeople` import.

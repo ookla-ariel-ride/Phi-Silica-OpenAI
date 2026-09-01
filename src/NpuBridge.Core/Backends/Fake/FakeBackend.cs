@@ -184,6 +184,18 @@ public sealed partial class FakeBackend : ILanguageModelBackend
             }
         }
 
+        // A fault configured at exactly the end of the stream fires after the last delta, like a runtime
+        // that streams everything and then reports a non-Complete status.
+        if (_options.FailAfterTokens == emitted)
+        {
+            if (_options.FailureException is { } ex)
+            {
+                throw ex;
+            }
+
+            return new GenerationResult(text.ToString(), _options.FailureStatus, "fake: injected failure after last token");
+        }
+
         var full = text.ToString();
         fake.Record(prompt, full);
         return GenerationResult.Complete(full);

@@ -26,9 +26,13 @@ public static class NpuBridgeServiceCollectionExtensions
         services.TryAddSingleton(TimeProvider.System);
         services.TryAddSingleton<IProcessIdentity>(NoProcessIdentity.Instance);
 
-        // The container owns the backend's lifetime (IAsyncDisposable is honoured on shutdown).
-        services.AddSingleton(backendFactory);
-        services.AddSingleton<BackendLifecycle>();
+        // BackendLifecycle owns the backend and disposes it only after initialization has finished.
+        // The backend is deliberately not registered as its own disposable singleton, which would let
+        // the container tear it down while a stubborn InitializeAsync is still running.
+        services.AddSingleton(sp => new BackendLifecycle(
+            backendFactory(sp),
+            sp.GetRequiredService<TimeProvider>(),
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<BackendLifecycle>>()));
         services.AddHostedService(sp => sp.GetRequiredService<BackendLifecycle>());
 
         services.Configure<JsonOptions>(o =>

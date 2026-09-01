@@ -31,6 +31,11 @@ land here instead of widening the chunk. Each entry says where it came from and 
   whose action is that activation, as the Phi Silica counterpart of `service install`. The service verbs
   stay for `aion`/`fake`. Open question for chunk 2: whether the Windows AI APIs work at all from a
   non-interactive session, which would also rule out a service for Phi Silica on grounds unrelated to identity.
+- **Automated validation of `identity.ps1` and the manifest** (Codex review, chunk 1). A Pester test
+  that runs `makeappx pack /nv` against `packaging/AppxManifest.xml` and checks `-Status` output would
+  catch schema regressions without the UAC step. Windows-only; run manually for now.
+- **End-to-end `sc.exe` boundary test.** The quoting is verified by an in-test argv parser and by the
+  reviewers' emulation, not by creating a real service (needs elevation). Add an opt-in elevated test.
 - **Console output of an activated process.** A package-activated console exe gets its own console
   window rather than the caller's. Once self-relaunch exists, logs for the Phi Silica path should also go
   to a file or the Event Log so they are not lost.

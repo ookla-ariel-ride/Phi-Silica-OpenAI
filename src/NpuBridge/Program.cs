@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Configuration.EnvironmentVariables;
+using Microsoft.Extensions.Configuration.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Hosting.WindowsServices;
@@ -53,17 +54,17 @@ internal static class Program
             ContentRootPath = AppContext.BaseDirectory,
         });
 
-        // Precedence (last wins): appsettings.json < appsettings.local.json < NPU_BRIDGE_* env < command line.
-        // CreateBuilder also registers an *unprefixed* environment provider, which would let a stray
-        // VERBOSE=1 or BACKEND=... in the shell override the config file; remove it.
-        foreach (var source in builder.Configuration.Sources.OfType<EnvironmentVariablesConfigurationSource>().ToList())
+        // CreateBuilder registers appsettings*.json and an *unprefixed* environment provider (which would
+        // let a stray VERBOSE=1 in the shell override the config file). Drop those and add the single
+        // composition shared with the service verbs (BridgeConfiguration): json < local json < NPU_BRIDGE_* < CLI.
+        foreach (var source in builder.Configuration.Sources
+                     .Where(s => s is EnvironmentVariablesConfigurationSource or JsonConfigurationSource)
+                     .ToList())
         {
             builder.Configuration.Sources.Remove(source);
         }
 
-        builder.Configuration.AddJsonFile("appsettings.local.json", optional: true, reloadOnChange: false);
-        builder.Configuration.AddNpuBridgeEnvironmentVariables();
-        builder.Configuration.AddCommandLine([.. parsed.ConfigArgs]);
+        builder.Configuration.AddNpuBridgeSources(AppContext.BaseDirectory, parsed.ConfigArgs);
 
         BridgeOptions options;
         try

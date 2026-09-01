@@ -7,10 +7,14 @@ public sealed record OpenAiErrorBody(OpenAiErrorDetail Error);
 
 public sealed record OpenAiErrorDetail(string Message, string Type, string? Param, string? Code);
 
+/// <summary>
+/// Error types are the ones OpenAI actually emits: <c>invalid_request_error</c> (including 404s for
+/// unknown models and endpoints), <c>rate_limit_error</c>, <c>server_error</c>. Status codes carry the
+/// HTTP semantics; <c>code</c> carries the specific reason.
+/// </summary>
 public static class OpenAiError
 {
     public const string InvalidRequest = "invalid_request_error";
-    public const string NotFound = "not_found_error";
     public const string RateLimit = "rate_limit_error";
     public const string Server = "server_error";
 
@@ -20,6 +24,7 @@ public static class OpenAiError
     public static IResult BadRequest(string message, string? code = null, string? param = null) =>
         Result(StatusCodes.Status400BadRequest, message, InvalidRequest, code, param);
 
+    /// <summary>404 with OpenAI's <c>invalid_request_error</c> type, as returned for unknown models and routes.</summary>
     public static IResult NotFoundResult(string message, string? code = "not_found", string? param = null) =>
-        Result(StatusCodes.Status404NotFound, message, NotFound, code, param);
+        Result(StatusCodes.Status404NotFound, message, InvalidRequest, code, param);
 }

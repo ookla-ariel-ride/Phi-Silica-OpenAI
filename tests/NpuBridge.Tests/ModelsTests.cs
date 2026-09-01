@@ -45,7 +45,7 @@ public class ModelsTests
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         var error = doc.RootElement.GetProperty("error");
-        Assert.Equal("not_found_error", error.GetProperty("type").GetString());
+        Assert.Equal("invalid_request_error", error.GetProperty("type").GetString());
         Assert.Equal("model_not_found", error.GetProperty("code").GetString());
         Assert.Equal("model", error.GetProperty("param").GetString());
         Assert.Contains("gpt-4o", error.GetProperty("message").GetString());
@@ -62,6 +62,19 @@ public class ModelsTests
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.Equal("unknown_endpoint", doc.RootElement.GetProperty("error").GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public async Task Unknown_subroute_of_known_path_with_allowed_method_is_404()
+    {
+        await using var host = await BridgeTestHost.StartAsync();
+
+        var response = await host.Client.GetAsync("/v1/models/fake/extra");
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var error = doc.RootElement.GetProperty("error");
+        Assert.Equal("unknown_endpoint", error.GetProperty("code").GetString());
+        Assert.Equal("invalid_request_error", error.GetProperty("type").GetString());
     }
 
     [Fact]

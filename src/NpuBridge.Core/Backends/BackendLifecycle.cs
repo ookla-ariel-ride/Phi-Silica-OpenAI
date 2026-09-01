@@ -25,14 +25,19 @@ public sealed record BackendSnapshot(
 }
 
 /// <summary>
-/// Starts <see cref="ILanguageModelBackend.InitializeAsync"/> in the background at host start and tracks
-/// its outcome, so requests arriving during a multi-minute first-run compile get a 503 with a reason
-/// instead of blocking or crashing. Does not dispose the backend; the DI container owns it.
+/// Owns the backend. Starts <see cref="ILanguageModelBackend.InitializeAsync"/> in the background at host
+/// start and tracks its outcome, so requests arriving during a multi-minute first-run compile get a 503
+/// with a reason instead of blocking or crashing. Disposes the backend only after initialization has
+/// finished (or a bounded grace period has elapsed) so a runtime that ignores cancellation is never
+/// torn down underneath its own <c>CreateAsync</c>.
 /// </summary>
-public sealed class BackendLifecycle : IHostedService, IDisposable
+public sealed class BackendLifecycle : IHostedService, IAsyncDisposable
 {
     /// <summary>Loading longer than this is almost certainly the one-time NPU model compile.</summary>
     public static readonly TimeSpan FirstRunCompileThreshold = TimeSpan.FromSeconds(60);
+
+    /// <summary>How long disposal waits for a still-running initialization before giving up on a clean teardown.</summary>
+    public static readonly TimeSpan DisposeGracePeriod = TimeSpan.FromSeconds(15);
 
     private readonly ILanguageModelBackend _backend;
     private readonly TimeProvider _time;
@@ -42,6 +47,7 @@ public sealed class BackendLifecycle : IHostedService, IDisposable
 
     private BackendSnapshot _snapshot = new(BackendStateKind.NotStarted, null, null, null);
     private Task _initialization = Task.CompletedTask;
+    private bool _disposed;
 
     public BackendLifecycle(ILanguageModelBackend backend, TimeProvider time, ILogger<BackendLifecycle> logger)
     {
@@ -89,12 +95,35 @@ public sealed class BackendLifecycle : IHostedService, IDisposable
         await _shutdown.CancelAsync().ConfigureAwait(false);
 
         // Give an in-flight initialization a moment to observe cancellation; never block shutdown on it.
+        // A stubborn runtime is handled by DisposeAsync's grace period instead.
         var finished = await Task.WhenAny(_initialization, Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken))
             .ConfigureAwait(false);
         if (finished != _initialization)
         {
-            _logger.LogWarning("Backend {Backend} was still initializing at shutdown; abandoning it.", _backend.DisplayName);
+            _logger.LogWarning("Backend {Backend} was still initializing at shutdown; disposal will wait up to {Grace}s for it.",
+                _backend.DisplayName, DisposeGracePeriod.TotalSeconds);
         }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        await _shutdown.CancelAsync().ConfigureAwait(false);
+
+        var finished = await Task.WhenAny(_initialization, Task.Delay(DisposeGracePeriod)).ConfigureAwait(false);
+        if (finished != _initialization)
+        {
+            _logger.LogError("Backend {Backend} did not finish initializing within {Grace}s; disposing it anyway.",
+                _backend.DisplayName, DisposeGracePeriod.TotalSeconds);
+        }
+
+        await _backend.DisposeAsync().ConfigureAwait(false);
+        _shutdown.Dispose();
     }
 
     private async Task RunInitializationAsync()
@@ -124,8 +153,6 @@ public sealed class BackendLifecycle : IHostedService, IDisposable
             _logger.LogError(ex, "{Backend} failed to initialize.", _backend.DisplayName);
         }
     }
-
-    public void Dispose() => _shutdown.Dispose();
 
     private void SetFailed(string error)
     {

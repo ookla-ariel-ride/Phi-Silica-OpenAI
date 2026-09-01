@@ -8,6 +8,39 @@ public class BackendLifecycleTests
 {
     private static readonly DateTimeOffset T0 = new(2026, 9, 1, 8, 0, 0, TimeSpan.Zero);
 
+    /// <summary>Models a WinRT runtime whose CreateAsync cannot be cancelled.</summary>
+    private sealed class IgnoresCancellationBackend : ILanguageModelBackend
+    {
+        private readonly Task _init;
+
+        public IgnoresCancellationBackend(Task init) => _init = init;
+
+        public bool Disposed { get; private set; }
+
+        public string ModelId => "stubborn";
+
+        public string DisplayName => "Stubborn";
+
+        public BackendCapabilities Capabilities => BackendCapabilities.None;
+
+        public IReadOnlyDictionary<string, object?> Diagnostics { get; } = new Dictionary<string, object?>();
+
+        public Task InitializeAsync(CancellationToken cancellationToken) => _init;
+
+        public IModelContext CreateContext(string? systemPrompt) => throw new NotSupportedException();
+
+        public int? GetUsablePromptLength(IModelContext context, string prompt) => null;
+
+        public Task<GenerationResult> GenerateAsync(IModelContext context, string prompt, SamplingOptions? sampling, Action<string> onDelta, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public ValueTask DisposeAsync()
+        {
+            Disposed = true;
+            return ValueTask.CompletedTask;
+        }
+    }
+
     [Fact]
     public async Task Transitions_not_started_to_loading_to_ready()
     {
@@ -76,7 +109,42 @@ public class BackendLifecycleTests
         await lifecycle.StopAsync(hostTimeout.Token);
         await lifecycle.Initialization; // completes because StopAsync cancelled the gate wait
         Assert.Equal(BackendStateKind.Failed, lifecycle.Snapshot.Kind);
-        lifecycle.Dispose();
+        await lifecycle.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Dispose_waits_for_initialization_before_disposing_the_backend()
+    {
+        // A backend that ignores cancellation: InitGate is only released by the test, never by the token.
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stubborn = new IgnoresCancellationBackend(gate.Task);
+        var lifecycle = new BackendLifecycle(stubborn, new ManualTimeProvider(T0), NullLogger<BackendLifecycle>.Instance);
+        await lifecycle.StartAsync(CancellationToken.None);
+
+        using var hostTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+        await lifecycle.StopAsync(hostTimeout.Token);
+        Assert.False(stubborn.Disposed);
+
+        var dispose = lifecycle.DisposeAsync().AsTask();
+        await Task.Delay(100);
+        Assert.False(dispose.IsCompleted, "dispose must wait while initialization is still running");
+        Assert.False(stubborn.Disposed);
+
+        gate.SetResult();
+        await dispose;
+        Assert.True(stubborn.Disposed);
+        Assert.True(lifecycle.Initialization.IsCompleted);
+        Assert.Equal(BackendStateKind.Ready, lifecycle.Snapshot.Kind);
+    }
+
+    [Fact]
+    public async Task Dispose_is_idempotent_and_safe_before_start()
+    {
+        var fake = new FakeBackend();
+        var lifecycle = new BackendLifecycle(fake, new ManualTimeProvider(T0), NullLogger<BackendLifecycle>.Instance);
+        await lifecycle.DisposeAsync();
+        await lifecycle.DisposeAsync();
+        Assert.Throws<ObjectDisposedException>(() => fake.CreateContext(null));
     }
 
     [Fact]

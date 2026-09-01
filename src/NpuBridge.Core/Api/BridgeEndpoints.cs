@@ -44,8 +44,12 @@ internal static class FallbackEndpoint
         path ??= string.Empty;
         foreach (var (prefix, allow) in KnownPaths)
         {
-            if (path.Equals(prefix, StringComparison.OrdinalIgnoreCase)
-                || path.StartsWith(prefix + "/", StringComparison.OrdinalIgnoreCase))
+            var isKnownPath = path.Equals(prefix, StringComparison.OrdinalIgnoreCase)
+                || path.StartsWith(prefix + "/", StringComparison.OrdinalIgnoreCase);
+            var methodAllowed = allow.Split(',').Any(m => m.Trim().Equals(http.Request.Method, StringComparison.OrdinalIgnoreCase));
+
+            // A known path with an allowed method that still fell through is an unknown sub-route → 404.
+            if (isKnownPath && !methodAllowed)
             {
                 http.Response.Headers.Allow = allow;
                 return OpenAiError.Result(StatusCodes.Status405MethodNotAllowed,
