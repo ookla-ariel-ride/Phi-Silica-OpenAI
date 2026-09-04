@@ -1,14 +1,19 @@
 # Active Context — npu-bridge
 
-_Last updated: 2026-09-01 (end of chunk 2)_
+_Last updated: 2026-09-03 (state re-verified; no code changed)_
 
 ## Where we are
 Chunks 1 and 2 are done, reviewed twice each (in-session hostile review + Codex adversarial review)
-and committed. Working tree clean at `2097d03` on `main`. Next up: **chunk 3**, not yet started;
+and committed. Working tree clean at `93454a1` on `main`. Next up: **chunk 3**, not yet started;
 the owner paused to reset the session before giving the go.
 
 Commits so far: `16e8f33` docs/hygiene · `b6ae632` chunk 1 · `663fce5` chunk 1 Codex fixes ·
-`09ddd02` chunk 2 · `2097d03` chunk 2 Codex fixes.
+`09ddd02` chunk 2 · `2097d03` chunk 2 Codex fixes · `ea4aa25` + `93454a1` handoff docs.
+
+Re-verified 2026-09-03: build clean, **191 tests** green, identity registered
+(PFN `NpuBridge_jtas4mnxdyzpe`), `smoke.ps1 -Backend phi-silica` all steps passed. Cold model create
+was 16.2 s that run (vs ~10 s after chunk 2), so cold-load time is variable. Full detail in
+`docs/SESSION-HANDOFF.md`.
 
 ## What works (verified live on this NPU)
 - Phi Silica through the bridge on Windows App SDK 2.4.1-experimental: `scripts/smoke.ps1 -Backend
@@ -23,8 +28,8 @@ Commits so far: `16e8f33` docs/hygiene · `b6ae632` chunk 1 · `663fce5` chunk 1
   `.claude/skills/` were swept into commit `09ddd02`; untrack them if unwanted.
 - **LAF token request** for PFN `NpuBridge_jtas4mnxdyzpe` is optional while on the experimental channel.
 - **System prompt fidelity**: Phi Silica ignored a strict system prompt via `CreateContext(system)`
-  ("I am Ada" → "AI Assistant"). Chunk 3 must measure native-context vs rendered-into-user-turn and
-  default the template to what the model follows.
+  ("I am Ada" → "AI Assistant"), reproduced again on 2026-09-03, so it is not a one-off. Chunk 3 must
+  measure native-context vs rendered-into-user-turn and default the template to what the model follows.
 - **Token counting**: Progress callbacks undercount (11 callbacks ≈ 178 chars); decide the `usage`
   estimate in chunk 3 (likely chars/4 for both sides, documented as estimate).
 
