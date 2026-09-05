@@ -194,6 +194,9 @@ try {
     }
 
     Step 'client disconnect mid-generation is survived' {
+        if ($Backend -eq 'fake') {
+            Skip 'the fake backend generates with no token delay, so there is no window in which to abort; meaningful on phi-silica and aion only'
+        }
         $body = @{ prompt = 'Write a very long, detailed essay about the history of computing, at least 800 words.' } | ConvertTo-Json
         $aborted = $false
         try { $null = Get-Json '/debug/generate' 'POST' $body @(200) 2 } catch { $aborted = $true }
@@ -260,29 +263,38 @@ try {
     InfoStep 'measurement: chars/4 estimate vs progress-callback count' {
         $prompt = 'In two or three sentences, explain what a neural processing unit does and why a Copilot+ PC has one.'
 
-        # A bare user message with no system text and no history renders to the backend as this exact
-        # raw string (PLAN 2.3), so /v1/chat/completions and /debug/generate see the same prompt.
-        $chatBody = @{ model = $Backend; messages = @(@{ role = 'user'; content = $prompt }) } | ConvertTo-Json -Depth 5
-        $c = Get-Json '/v1/chat/completions' 'POST' $chatBody
-        if ($c.choices[0].finish_reason -ne 'stop') { throw "chat finish_reason=$($c.choices[0].finish_reason)" }
-        $completionTokens = $c.usage.completion_tokens
-        $rawChars = $c.choices[0].message.content.Length
-
+        # Single generation: read the callback count and the character count off the same response, so
+        # the ratio measures the thing being decided rather than the difference between two replies.
         $g = Get-Json '/debug/generate' 'POST' (@{ prompt = $prompt } | ConvertTo-Json)
         if ($g.status -ne 'Complete') { throw "debug/generate status=$($g.status)" }
         $callbacks = $g.progress_callbacks
-
-        $ratio = if ($callbacks -gt 0) { [Math]::Round(($rawChars / 4.0) / $callbacks, 2) } else { $null }
+        $chars = $g.chars
+        $estimate = [Math]::Ceiling($chars / 4.0)
+        $ratio = if ($callbacks -gt 0) { [Math]::Round($estimate / $callbacks, 2) } else { $null }
         $ratioText = if ($null -ne $ratio) { "${ratio}x" } else { 'n/a (0 callbacks)' }
 
+        # Cross-check only, from a second, separate generation through the real endpoint. Deliberately
+        # not folded into the ratio above: two different replies of different lengths would measure
+        # that difference, not the estimate-vs-callbacks question this step exists to answer.
+        $chatBody = @{ model = $Backend; messages = @(@{ role = 'user'; content = $prompt }) } | ConvertTo-Json -Depth 5
+        $c = Get-Json '/v1/chat/completions' 'POST' $chatBody
+        $crossCheck = if ($c.choices[0].finish_reason -eq 'stop') {
+            "usage.completion_tokens=$($c.usage.completion_tokens) for a $($c.choices[0].message.content.Length)-char reply"
+        } else {
+            "finish_reason=$($c.choices[0].finish_reason)"
+        }
+
         @"
-asked: one bare user-message prompt ($($prompt.Length) chars), same text sent to both endpoints so the model sees an identical prompt
-progress-callback count (backend, via /debug/generate, separate generation) = $callbacks (debug/generate produced $($g.chars) chars)
-chars/4 estimate returned as usage.completion_tokens (via /v1/chat/completions) = $completionTokens
-raw completion character count (the /v1/chat/completions reply actually scored above) = $rawChars
-verdict: chars/4 estimate is $ratioText the callback count for this run. Chunk 3 chose chars/4 over
-counting callbacks because callbacks were measured undercounting by roughly 4x (11 callbacks for 178
-chars); this number is that assumption checked against real hardware, not a recollection.
+asked: one bare user-message prompt ($($prompt.Length) chars) to /debug/generate, one generation
+progress-callback count (this generation) = $callbacks
+raw completion character count (this generation) = $chars
+chars/4 estimate derived from this generation = $estimate
+ratio: chars/4 estimate is $ratioText the callback count, both numbers from the same generation
+cross-check (a different generation, same prompt, via /v1/chat/completions): $crossCheck -- for
+comparison only, not part of the ratio above
+verdict: chunk 3 chose chars/4 over counting callbacks because callbacks were measured undercounting by
+roughly 4x (11 callbacks for 178 chars); this ratio is that assumption checked on one real generation,
+not a recollection.
 "@
     }
 
