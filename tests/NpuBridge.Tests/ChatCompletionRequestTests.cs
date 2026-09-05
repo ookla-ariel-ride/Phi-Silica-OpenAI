@@ -102,6 +102,62 @@ public class ChatCompletionRequestTests
         Assert.Contains("image_url", result.Failure.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// System.Text.Json puts a JSON null into the list despite the non-nullable element annotation, so
+    /// the validator must check rather than trust the type. Before the check this threw, and because
+    /// validation runs before the endpoint's try block, the request became a 500.
+    /// </summary>
+    [Theory]
+    [InlineData("""{"messages":[null]}""")]
+    [InlineData("""{"messages":[{"role":"user","content":"hi"},null]}""")]
+    [InlineData("""{"messages":[null,{"role":"user","content":"hi"}]}""")]
+    public void Null_message_element_fails_validation_instead_of_throwing(string json)
+    {
+        var request = JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!;
+
+        var result = ChatCompletionRequestValidator.Validate(request);
+
+        Assert.False(result.IsValid);
+        Assert.Equal("messages", result.Failure!.Param);
+        Assert.Null(result.Failure.Code);
+        Assert.Contains("null", result.Failure.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("""{"messages":[{"role":"user","content":[{"type":"text"}]}]}""")]
+    [InlineData("""{"messages":[{"role":"user","content":[{"type":"text","text":null}]}]}""")]
+    [InlineData("""{"messages":[{"role":"user","content":[{"type":"text","text":"ok"},{"type":"text"}]}]}""")]
+    public void Text_content_part_without_text_fails_validation(string json)
+    {
+        var request = JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!;
+
+        var result = ChatCompletionRequestValidator.Validate(request);
+
+        Assert.False(result.IsValid);
+        Assert.Equal("messages", result.Failure!.Param);
+    }
+
+    [Fact]
+    public void An_empty_text_content_part_stays_valid()
+    {
+        var json = """{"messages":[{"role":"user","content":[{"type":"text","text":""}]}]}""";
+
+        var request = JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!;
+
+        Assert.True(ChatCompletionRequestValidator.Validate(request).IsValid);
+    }
+
+    /// <summary>Ruled deliberate: a message with no content at all renders as empty text, not an error.</summary>
+    [Theory]
+    [InlineData("""{"messages":[{"role":"user"}]}""")]
+    [InlineData("""{"messages":[{"role":"user","content":null}]}""")]
+    public void A_message_without_content_stays_valid(string json)
+    {
+        var request = JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!;
+
+        Assert.True(ChatCompletionRequestValidator.Validate(request).IsValid);
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("banana")]

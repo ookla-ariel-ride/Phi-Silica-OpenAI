@@ -359,6 +359,70 @@ public class ChatCompletionsTests
         Assert.Equal("messages", error.GetProperty("param").GetString());
     }
 
+    /// <summary>
+    /// Regression: <c>{"messages":[null]}</c> used to escape validation as an unhandled exception and
+    /// come back as a 500. Validation runs before the handler's try block, so a null element has to be
+    /// caught by the validator itself.
+    /// </summary>
+    [Theory]
+    [InlineData("""{"messages":[null]}""")]
+    [InlineData("""{"messages":[{"role":"user","content":"hi"},null]}""")]
+    [InlineData("""{"messages":[null,{"role":"user","content":"hi"}]}""")]
+    public async Task A_null_message_element_is_400_not_500(string json)
+    {
+        await using var host = await BridgeTestHost.StartAsync();
+
+        var response = await PostRaw(host, json);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var error = (await ReadJson(response)).GetProperty("error");
+        Assert.Equal("invalid_request_error", error.GetProperty("type").GetString());
+        Assert.Equal("messages", error.GetProperty("param").GetString());
+        Assert.Empty(host.Fake.Calls);
+        AssertNoLeak(host.Fake);
+    }
+
+    /// <summary>The content-part converter rejects a null part while reading; this pins that it stays a 400.</summary>
+    [Fact]
+    public async Task A_null_content_part_is_400()
+    {
+        await using var host = await BridgeTestHost.StartAsync();
+
+        var response = await PostRaw(host, """{"messages":[{"role":"user","content":[null]}]}""");
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal("invalid_request_error", (await ReadJson(response)).GetProperty("error").GetProperty("type").GetString());
+        Assert.Empty(host.Fake.Calls);
+    }
+
+    [Theory]
+    [InlineData("""{"messages":[{"role":"user","content":[{"type":"text"}]}]}""")]
+    [InlineData("""{"messages":[{"role":"user","content":[{"type":"text","text":null}]}]}""")]
+    public async Task A_text_content_part_with_no_text_is_400_and_never_generates(string json)
+    {
+        await using var host = await BridgeTestHost.StartAsync();
+
+        var response = await PostRaw(host, json);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal("messages", (await ReadJson(response)).GetProperty("error").GetProperty("param").GetString());
+        Assert.Empty(host.Fake.Calls);
+        AssertNoLeak(host.Fake);
+    }
+
+    [Fact]
+    public async Task An_empty_text_content_part_still_generates()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await PostRaw(host, """{"model":"fake","messages":[{"role":"user","content":[{"type":"text","text":""}]}]}""");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(string.Empty, Assert.Single(fake.Calls).Prompt);
+        AssertNoLeak(fake);
+    }
+
     [Fact]
     public async Task Streaming_is_400_until_chunk_4()
     {
@@ -657,6 +721,13 @@ public class ChatCompletionsTests
                 new { role = "user", content = "hi" },
             },
         });
+
+    /// <summary>Posts a literal JSON body, for shapes an anonymous object cannot express (nulls, junk).</summary>
+    private static async Task<HttpResponseMessage> PostRaw(BridgeTestHost host, string json)
+    {
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        return await host.Client.PostAsync(Path, content);
+    }
 
     private static void AssertNoLeak(FakeBackend fake)
     {

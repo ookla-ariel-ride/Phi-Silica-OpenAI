@@ -53,22 +53,40 @@ public static class ChatCompletionRequestValidator
             return ChatCompletionValidationResult.Invalid("messages is required and must be a non-empty array.", param: "messages");
         }
 
-        foreach (var message in request.Messages)
+        for (var i = 0; i < request.Messages.Count; i++)
         {
+            // System.Text.Json happily deserializes a JSON null into a list of a non-nullable reference
+            // type, so the annotation is not a guarantee: check, or a hostile body crashes the request.
+            var message = request.Messages[i];
+            if (message is null)
+            {
+                return ChatCompletionValidationResult.Invalid(
+                    $"messages[{i}] is null; every message must be a JSON object.", param: "messages");
+            }
+
             if (message.Role is null || Array.IndexOf(KnownRoles, message.Role) < 0)
             {
                 return ChatCompletionValidationResult.Invalid(
-                    $"messages contains an unknown or missing role: '{message.Role}'.", param: "messages");
+                    $"messages[{i}] has an unknown or missing role: '{message.Role}'.", param: "messages");
             }
 
             if (message.Content is { IsParts: true, Parts: { } parts })
             {
-                foreach (var part in parts)
+                for (var p = 0; p < parts.Count; p++)
                 {
+                    var part = parts[p];
                     if (!string.Equals(part.Type, "text", StringComparison.Ordinal))
                     {
                         return ChatCompletionValidationResult.Invalid(
-                            $"messages contains a content part of type '{part.Type}'; only 'text' is supported.", param: "messages");
+                            $"messages[{i}].content[{p}] is a content part of type '{part.Type}'; only 'text' is supported.", param: "messages");
+                    }
+
+                    // A part that calls itself text must carry text. An empty string is text; a missing
+                    // or null field is a malformed part, not an empty message.
+                    if (part.Text is null)
+                    {
+                        return ChatCompletionValidationResult.Invalid(
+                            $"messages[{i}].content[{p}] is a 'text' content part with no 'text' field.", param: "messages");
                     }
                 }
             }
