@@ -3,7 +3,7 @@
 ## Works today (verified)
 | Area | Status | Evidence |
 |---|---|---|
-| Solution, build, tests | ✅ | `dotnet build` clean, 191 xunit tests green (re-run 2026-09-03) |
+| Solution, build, tests | ✅ | `dotnet build` clean, 278 xunit tests green (chunk 3, 2026-09-05) |
 | `/healthz`, `/v1/models`, `/v1` fallback | ✅ | TestServer tests + live curl on the exe |
 | Config precedence json < local < env < CLI | ✅ | real-file test + live probes |
 | CLI verbs `run`, `service`, `task`, `help`, `version` | ✅ | tests + live exit codes |
@@ -11,13 +11,14 @@
 | Sparse package identity (`identity.ps1`) | ✅ | registered; PFN `NpuBridge_jtas4mnxdyzpe` |
 | Self-relaunch via package activation + supervision | ✅ | child had identity, saw shell env, died with the parent |
 | Phi Silica adapter (experimental SDK) | ✅ | smoke: generate, preflight, system prompt, disconnect drain |
+| `/v1/chat/completions` non-streaming | ✅ | 278 tests; smoke on the real NPU: 677 ms, correct shape and usage |
+| PromptTemplate (message flattening) | ✅ | exact-string tests; both system-prompt placements measured on hardware |
 | Logon task install/status/run/uninstall | ✅ | live, elevated (pre-supervisor build; `/End` path covered by kill-parent probe) |
 | Windows service verbs | ⚠️ commands verified by tests and emulation; not exercised against the SCM |
 | gitleaks hook + CI | ✅ | planted secrets blocked |
 
 ## Not built yet
-- `/v1/chat/completions` (non-streaming, streaming), `/v1/completions` — chunks 3, 4, 8
-- Message flattening / prompt template — chunk 3
+- `/v1/chat/completions` streaming (SSE), `/v1/completions` — chunks 4, 8
 - Context cache, overflow → 400, `--truncate-history` — chunk 5
 - Aion adapter — chunk 6
 - Tool-call emulation — chunk 7

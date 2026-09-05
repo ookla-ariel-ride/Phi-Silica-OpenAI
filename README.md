@@ -14,15 +14,16 @@ Two real backends behind one interface, chosen at runtime:
 
 ## Status
 
-**Early: 2 of 8 chunks done.** Last reviewed 2026-09-05.
+**Early: 3 of 8 chunks done.** Last reviewed 2026-09-05.
 
-Working today: `GET /healthz`, `GET /v1/models`, `POST /debug/generate`, configuration, the Windows
-service and logon-task verbs, package identity, and the Phi Silica adapter. 191 tests pass against the
-fake backend, and `scripts/smoke.ps1` passes every step against the real NPU.
+Working today: `POST /v1/chat/completions` (non-streaming), `GET /healthz`, `GET /v1/models`,
+`POST /debug/generate`, configuration, the Windows service and logon-task verbs, package identity,
+and the Phi Silica adapter. 278 tests pass against the fake backend, and `scripts/smoke.ps1` passes
+every step against the real NPU.
 
-Not built yet: `/v1/chat/completions` (chunks 3 and 4), the context cache (chunk 5), the Aion adapter
-(chunk 6), tool-call emulation (chunk 7), and request queueing with `/v1/completions` (chunk 8). Until
-chunk 3 lands there is no OpenAI chat endpoint, so no agent tool can drive this yet. See `docs/PLAN.md`.
+Not built yet: streaming (chunk 4), the context cache (chunk 5), the Aion adapter
+(chunk 6), tool-call emulation (chunk 7), and request queueing with `/v1/completions` (chunk 8). A
+request with `stream: true` returns 400 until chunk 4. See `docs/PLAN.md`.
 
 Measured on a Snapdragon X Elite with Phi Silica: model load 10 to 17 seconds cold and about 50 ms
 warm, first token in roughly 0.6 to 1.0 seconds, and about 10 tokens per second thereafter.
@@ -119,7 +120,7 @@ pre-commit hook and a GitHub Actions workflow scan for tokens; enable the hook w
 | `GET /healthz` | backend, ready/loading/failed, loading time, package identity, LAF status, diagnostics |
 | `GET /v1/models`, `GET /v1/models/{id}` | the active backend's model id |
 | `POST /debug/generate` | one literal prompt into the backend, returning text and timing. Diagnostic, loopback-only |
-| `POST /v1/chat/completions` | chunk 3 (non-streaming), chunk 4 (SSE) |
+| `POST /v1/chat/completions` | non-streaming chat completions. `stream: true` returns 400 until chunk 4 |
 | `POST /v1/completions` | chunk 8 |
 
 Errors use OpenAI's body shape, `{"error":{"message","type","param","code"}}`. Token counts in `usage`

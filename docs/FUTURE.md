@@ -22,6 +22,50 @@ land here instead of widening the chunk. Each entry says where it came from and 
 - **LoRA adapters** (`LanguageModelOptions.LowRankAdapter`).
 - **Multiple model ids per process** (e.g. serve both backends at once, one model each).
 
+## Chunk 3 review deferrals
+
+- **Error envelopes omit `param` and `code` when they are null.** The real OpenAI API emits all four
+  fields, including nulls. Ours drops them because the shared `JsonDefaults.Options` sets
+  `WhenWritingNull` and every endpoint since chunk 1 uses the shared `OpenAiError` helper. Found by the
+  Codex adversarial review. Deferred because changing it alters the error contract of every endpoint
+  shipped in chunks 1 and 2, so it deserves its own decision and its own review rather than being
+  absorbed into a chunk that happened to notice it.
+- **Error messages escape apostrophes as `\u0027`.** Same shared serializer options, same reasoning.
+  Raised by the implementer rather than a reviewer, which is the right instinct. Fix it alongside the
+  entry above.
+- **The prompt template does not escape its own turn markers (chunk 5 blocker).** A user whose message
+  literally contains a line reading `[Assistant]` can imitate a turn boundary, so two different
+  conversations can render to the same string. Harmless today. It stops being harmless in chunk 5,
+  where PLAN section 2.5 hashes exactly this string as a conversation identity: distinct histories that
+  render identically would collide on one cached context. Decide the escaping, or a boundary-preserving
+  hash input, before the cache lands.
+- **`ChatMessage` carries no `tool_calls` field (chunks 5 and 7).** An assistant message with
+  `content: null` and a `tool_calls` array deserializes to an empty assistant turn, so the tool call it
+  made is lost. Chunk 7 needs it to render the model its own protocol, and chunk 5 needs it for the
+  canonicalization PLAN section 2.5 describes, where a client that re-serializes our output must still
+  hit the cache.
+- **`ChatCompletionRequest` is an 18-argument positional record.** Tests construct it with long runs of
+  positional nulls, so inserting a field could silently shift arguments without a compiler error. Add a
+  test builder or use named arguments before the parameter list grows in chunks 4, 7 and 8.
+- **The context-leak assertions are vacuous on four cases.** The cases that never reach the backend
+  (`n` greater than one, `stream: true`, missing `messages`, and forcing an unsupported placement)
+  trivially satisfy created-equals-disposed because nothing was ever created. Asserting a context *was*
+  created where one is expected would make the guard non-vacuous everywhere.
+- **The per-request log line is only pinned for successful requests.** The rejected-request line, and
+  the polymorphic `status=` field that carries an exception type name on the catch path, are untested.
+  Consider `status=exception` with the type in the message so the field stays machine-parsable.
+- **Two 502 shapes for one client-visible condition.** A backend `Error` status emits no error code
+  (the spec table says so) while a thrown backend exception emits `backend_error`. If you unify them,
+  drop the code from the exception path rather than adding one to the status path.
+- **Smaller test gaps**, all noted by reviewers and none load-bearing: no test deserializes a message
+  with the `role` key entirely absent; the empty-but-present system text case is untested; no dedicated
+  test for a conversation with zero user or assistant turns; no test drives
+  `--system-prompt-placement` through the command-line parser to the config key; the placement
+  measurement's reply text in `smoke.ps1` is not truncated, unlike its two sibling lines.
+- **Untested generation paths** flagged by the Codex review: a backend-originated `Cancelled` status
+  with a client still connected, an unknown status value, a context-creation failure, and a throwing
+  `Dispose`. None confirmed as production defects; all worth a fake-backend fault case.
+
 ## Chunk 2 review deferrals
 
 - **In-flight generation tracking in the adapter.** `PhiSilicaBackend.DisposeAsync` disposes the model

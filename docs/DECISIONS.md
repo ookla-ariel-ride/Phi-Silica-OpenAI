@@ -215,3 +215,51 @@ rendering the system text into the user turn works better on this model.
 **D23. `identity.ps1` signs from the certificate store, never from a PFX on disk.** `signtool /sha1
 <thumbprint>` uses the key in `CurrentUser\My`; only the public `.cer` is exported (to
 `packaging/out`, gitignored) for the one-time `TrustedPeople` import.
+
+## 2026-09-05 — Chunk 3 (non-streaming chat completions)
+
+**D43. One fresh context per request, always disposed.** `/v1/chat/completions` creates a context,
+generates, and disposes it in a `finally` on every path: success, validation failure, overflow,
+content filter, backend error, thrown exception and client abort. The cache is chunk 5, so nothing is
+reused yet. Tests assert created-equals-disposed on the failure paths, not only the happy one.
+
+**D44. `completion_tokens` is `ceil(chars/4)`, not the progress-callback count.** Supersedes the
+estimate proposed in PLAN §2.2. Measured on this NPU in one generation: 29 callbacks for 367
+characters, so the character estimate is **3.17x** the callback count. Phi Silica batches tokens per
+callback under speculative decoding, so counting callbacks undercounts by roughly three times. Both
+sides of `usage` use the same formula and both are documented as estimates.
+
+**D45. The system prompt is delivered natively by default, and the model does follow it.** This
+reverses the working assumption recorded in the chunk 2 observations. Measured on this NPU with the
+chunk 3 prompt template, system prompt "You are Ada. Always answer with exactly the two words: I am
+Ada.": **both** placements returned "I am Ada." The same run still shows `/debug/generate` ignoring
+its system prompt and answering "AI Assistant". The difference is not the placement but the
+rendering: a bare prompt is ignored, a transcript ending in
+`### Reply as the assistant to the latest message.` is obeyed. So the earlier finding was a property
+of the raw diagnostic path, not of the model. `--system-prompt-placement auto|native|prompt` (default
+`auto`, native when the backend advertises the capability) stays, because it is what produced this
+measurement and it is how chunk 6 will check Aion, which has no native system context at all.
+
+**D46. `stream: true` returns 400 until chunk 4.** Returning a non-streamed body to a client that
+asked for server-sent events would hang or mis-parse it. A clear error beats a wrong success.
+
+**D47. Unsupported parameters are accepted, ignored, and warned about once per process.**
+`max_tokens`, `max_completion_tokens` and `stop` (the client-side cut is chunk 4), `tools` and
+`tool_choice` (chunk 7), sampling options on a backend without the capability, and the OpenAI
+parameters this bridge has no answer for. The guard is a `ConcurrentDictionary` on a DI singleton, so
+it is thread-safe and cannot leak between tests.
+
+**D48. `scripts/smoke.ps1` gates each feature separately and skips rather than fails.** One gate for
+three features meant that building only the non-streaming endpoint made a correct chunk 3 look broken:
+the pre-chunk script fails three steps against the fake backend. Streaming and tool calling now report
+SKIP with the chunk that owns them. Skips and informational steps never affect the exit code. The
+client-disconnect step additionally skips on the fake backend only, because a backend with no token
+delay finishes before the abort window opens; it still runs, and can still fail, on phi-silica and
+aion, where it passes.
+
+**D49. Validation rejects what the deserializer will happily produce.** A `messages` array containing
+a null element returned HTTP 500 (found by the Codex adversarial review, reproduced against the running
+exe). `System.Text.Json` permits null elements despite the nullable annotation, and validation runs
+outside the handler's exception guard. A null element and a `text` part with a missing or null `text`
+are both 400 now. A user message with **missing or null `content` stays valid** and renders as empty:
+that is deliberate, not an oversight.

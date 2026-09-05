@@ -1,49 +1,47 @@
 # Active Context — npu-bridge
 
-_Last updated: 2026-09-03 (state re-verified; no code changed)_
+_Last updated: 2026-09-05 (end of chunk 3)_
 
 ## Where we are
-Chunks 1 and 2 are done, reviewed twice each (in-session hostile review + Codex adversarial review)
-and committed. Working tree clean at `93454a1` on `main`. Next up: **chunk 3**, not yet started;
-the owner paused to reset the session before giving the go.
+Chunks 1, 2 and 3 are done. Chunk 3 was built by four subagent-implemented tasks, each with its own
+spec-and-quality review, plus a Codex adversarial review over the whole branch. Next up: **chunk 4**
+(streaming SSE), not yet started.
 
-Commits so far: `16e8f33` docs/hygiene · `b6ae632` chunk 1 · `663fce5` chunk 1 Codex fixes ·
-`09ddd02` chunk 2 · `2097d03` chunk 2 Codex fixes · `ea4aa25` + `93454a1` handoff docs.
+Branch `chunk-3-chat-completions` carries the work: `796252b` DTOs + validation · `2c4bdc5`
+PromptTemplate · `d6236e9` endpoint + pipeline · `8f533fe` review fixes · `91383f4` + `030d49c` smoke
+steps and measurements.
 
-Re-verified 2026-09-03: build clean, **191 tests** green, identity registered
-(PFN `NpuBridge_jtas4mnxdyzpe`), `smoke.ps1 -Backend phi-silica` all steps passed. Cold model create
-was 16.2 s that run (vs ~10 s after chunk 2), so cold-load time is variable. Full detail in
-`docs/SESSION-HANDOFF.md`.
+## What works (verified live on this NPU, 2026-09-05)
+- `POST /v1/chat/completions` non-streaming, end to end on Phi Silica: 677 ms for a short reply,
+  correct shape, usage estimates, error mapping.
+- The full smoke suite passes on the real NPU: all steps passed, 2 skipped (streaming, tool calling),
+  2 informational measurements. Cold model load 15.7 s.
+- 278 unit tests against the fake backend; build clean with zero warnings.
 
-## What works (verified live on this NPU)
-- Phi Silica through the bridge on Windows App SDK 2.4.1-experimental: `scripts/smoke.ps1 -Backend
-  phi-silica` passes all steps (ready, models, generate ~10 tok/s, preflight, system prompt, disconnect drain).
-- Self-relaunch through package activation with supervision: shell `NPU_BRIDGE_*` reaches the child,
-  env secrets are dropped with a warning, killing the parent stops the child.
-- Logon task verbs (`task install|status|uninstall`) verified before the supervisor change; the
-  `schtasks /End` path after it is covered by the kill-parent probe (UAC re-check was cancelled).
+## The two measurements this chunk owed (both answered on hardware)
+- **System prompt: the model does obey it.** With the chunk 3 template, *both* placements returned
+  "I am Ada." exactly as instructed. The same run still shows `/debug/generate` ignoring its system
+  prompt. So the chunk 2 observation was a property of the bare diagnostic path, not the model. The
+  default stays `auto` (native context when available). See D45.
+- **Tokens: callbacks undercount by ~3x.** One generation: 29 callbacks, 367 chars, chars/4 = 92, a
+  ratio of 3.17. `completion_tokens` is `ceil(chars/4)`. See D44.
 
 ## Open threads
-- **Owner decision pending**: the `powershell-master` skill files under `.agents/skills/` and
-  `.claude/skills/` were swept into commit `09ddd02`; untrack them if unwanted.
-- **LAF token request** for PFN `NpuBridge_jtas4mnxdyzpe` is optional while on the experimental channel.
-- **System prompt fidelity**: Phi Silica ignored a strict system prompt via `CreateContext(system)`
-  ("I am Ada" → "AI Assistant"), reproduced again on 2026-09-03, so it is not a one-off. Chunk 3 must
-  measure native-context vs rendered-into-user-turn and default the template to what the model follows.
-- **Token counting**: Progress callbacks undercount (11 callbacks ≈ 178 chars); decide the `usage`
-  estimate in chunk 3 (likely chars/4 for both sides, documented as estimate).
-
-## Chunk 3 plan (from docs/PLAN.md, awaiting go)
-Request DTOs + validation (`messages` with string or text-part content, `tool` role rendering can wait
-for chunk 7), `PromptTemplate` (system + transcript + newest turn; bare single user message sent raw),
-non-streaming `POST /v1/chat/completions` (fresh context per request; cache is chunk 5), `usage`
-estimate, error mapping (400 `context_length_exceeded`, 503 loading, 502 backend error), per-request
-log line (backend, prompt chars, ttft, tokens, tok/s, status), `--verbose` prompt echo, smoke steps for
-the OpenAI endpoint (already scaffolded in `scripts/smoke.ps1`, gated on the endpoint existing).
-Loop: build → tests vs fake → smoke on Phi Silica → in-session review → Codex review → commit.
+- **Chunk 5 blocker, recorded in FUTURE.md**: the prompt template does not escape its own turn
+  markers, so two different conversations can render to the same string. The cache hashes that string
+  as a conversation identity, so decide escaping before the cache lands.
+- **Chunk 7 needs `tool_calls` on `ChatMessage`**; it is absent today, so assistant tool history is
+  dropped on deserialization.
+- Error envelopes omit null `param`/`code` where OpenAI emits them. Shared helper from chunk 1, so it
+  needs its own decision rather than a quiet fix.
+- Owner decisions still open: the `powershell-master` skill files under `.agents/`/`.claude/`, and the
+  optional LAF token request for PFN `NpuBridge_jtas4mnxdyzpe`.
 
 ## How to resume
-1. Read `CLAUDE.md`, then `memory-bank/progress.md` and `docs/DECISIONS.md` (D31–D42 are chunk 2).
-2. `dotnet build; dotnet test` (191 tests) and `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298`
-   to confirm the machine state (identity registered, experimental runtime installed).
-3. Ask the owner for the chunk 3 go, then start with the DTOs and `PromptTemplate` in `NpuBridge.Core`.
+1. Read `CLAUDE.md`, then `docs/DECISIONS.md` (D43-D49 are chunk 3) and the chunk 3 section of
+   `docs/FUTURE.md`.
+2. `dotnet build; dotnet test` (278) and `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298`.
+3. Chunk 4 is streaming: the SSE writer, the channel hand-off from the WinRT callback thread, the
+   mid-stream error event, disconnect-cancel-drain, keep-alive comments, `stream_options.include_usage`,
+   and the `max_tokens`/`stop` client-side cut that chunk 3 deliberately accepted and ignored.
+   Removing the `stream: true` 400 and un-skipping the smoke step are part of it.
