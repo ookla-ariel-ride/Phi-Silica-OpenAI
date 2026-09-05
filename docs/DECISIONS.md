@@ -218,10 +218,16 @@ rendering the system text into the user turn works better on this model.
 
 ## 2026-09-05 — Chunk 3 (non-streaming chat completions)
 
-**D43. One fresh context per request, always disposed.** `/v1/chat/completions` creates a context,
-generates, and disposes it in a `finally` on every path: success, validation failure, overflow,
-content filter, backend error, thrown exception and client abort. The cache is chunk 5, so nothing is
-reused yet. Tests assert created-equals-disposed on the failure paths, not only the happy one.
+**D43. One fresh context per request, disposed on every path that creates one.**
+`/v1/chat/completions` creates its context immediately before generating and disposes it in a
+`finally`, so success, prompt overflow, content filter, a backend `Error` or `Cancelled` status, a
+thrown backend exception and a client abort all release it. Four rejections return *before* a context
+exists and so never create one: an unreadable or non-JSON body, a validation failure, a backend that
+is not `Ready`, and the forced-`native` system-prompt placement conflict. The disposal guarantee is
+therefore about the paths that create a context, not literally about every path. Tests pin it on the
+failure paths and not only the happy one, and each leak case also asserts how many contexts were
+created — one where the backend is reached, zero for the early rejections — so the guard cannot be
+satisfied vacuously. The cache is chunk 5, so nothing is reused yet.
 
 **D44. `completion_tokens` is `ceil(chars/4)`, not the progress-callback count.** Supersedes the
 estimate proposed in PLAN §2.2. Measured on this NPU in one generation: 29 callbacks for 367

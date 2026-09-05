@@ -24,21 +24,40 @@ land here instead of widening the chunk. Each entry says where it came from and 
 
 ## Chunk 3 review deferrals
 
-- **Error envelopes omit `param` and `code` when they are null.** The real OpenAI API emits all four
-  fields, including nulls. Ours drops them because the shared `JsonDefaults.Options` sets
-  `WhenWritingNull` and every endpoint since chunk 1 uses the shared `OpenAiError` helper. Found by the
-  Codex adversarial review. Deferred because changing it alters the error contract of every endpoint
-  shipped in chunks 1 and 2, so it deserves its own decision and its own review rather than being
-  absorbed into a chunk that happened to notice it.
+- **Null fields are omitted rather than emitted as `null`, in error bodies *and* in responses.** The
+  real OpenAI API emits all four error fields including nulls; ours drops `param` and `code` when they
+  are null because the shared `JsonDefaults.Options` sets `WhenWritingNull` and every endpoint since
+  chunk 1 uses the shared `OpenAiError` helper. The same serializer setting reaches success responses:
+  `ChatCompletionResponseMessage.Content` is `string?`, and OpenAI emits `"content": null` alongside a
+  `tool_calls` array, so in chunk 7 a tool-call reply would omit the `content` key entirely instead of
+  sending it as null. Clients that read `message.content` unconditionally would break on that shape.
+  Found by the Codex adversarial review. Deferred because changing it alters the error contract of every
+  endpoint shipped in chunks 1 and 2, so it deserves its own decision and its own review rather than
+  being absorbed into a chunk that happened to notice it — but chunk 7 cannot ship the tool-call
+  response shape without settling it first.
 - **Error messages escape apostrophes as `\u0027`.** Same shared serializer options, same reasoning.
   Raised by the implementer rather than a reviewer, which is the right instinct. Fix it alongside the
   entry above.
-- **The prompt template does not escape its own turn markers (chunk 5 blocker).** A user whose message
-  literally contains a line reading `[Assistant]` can imitate a turn boundary, so two different
-  conversations can render to the same string. Harmless today. It stops being harmless in chunk 5,
-  where PLAN section 2.5 hashes exactly this string as a conversation identity: distinct histories that
-  render identically would collide on one cached context. Decide the escaping, or a boundary-preserving
-  hash input, before the cache lands.
+- **The rendered prompt is not a usable conversation identity (chunk 5 blocker).** Distinct
+  conversations can produce the same rendered string, so anything that treats that string as an identity
+  will hand one cached context to two different conversations. Note what the cache key actually is:
+  PLAN section 2.5 keys on SHA-256 over a *canonical rendering* of `(system, turn_0 … turn_k)`, which is
+  a different function from what `PromptTemplate.Render` emits — an earlier version of this entry said
+  the cache "hashes exactly this string", and it does not. Three collision surfaces the chunk 5
+  canonicalization has to close:
+  1. **Turn markers are not escaped.** A user message containing a line reading `[Assistant]` (or
+     `[User]`, or `### Conversation so far`) imitates a turn boundary, so a single forged user turn and
+     a real two-turn history render identically.
+  2. **Native placement drops the system text from the prompt entirely.** With
+     `nativeSystemPromptSupported: true` the system text is returned separately in
+     `RenderedPrompt.SystemText` and left out of `RenderedPrompt.Prompt`, so two conversations that
+     differ *only* in their system prompt render byte-identically. Whatever the placement, the hash
+     input must carry the system text — which is why PLAN section 2.5 puts `system` in the key.
+  3. **The raw-passthrough branch has no markers at all.** A lone bare user message is sent verbatim, so
+     a single user message whose text happens to *be* a rendered transcript collides with that real
+     transcript's rendering.
+  Harmless today, because nothing is cached yet. Decide the escaping and a boundary-preserving canonical
+  hash input, kept distinct from the prompt string, before the cache lands.
 - **`ChatMessage` carries no `tool_calls` field (chunks 5 and 7).** An assistant message with
   `content: null` and a `tool_calls` array deserializes to an empty assistant turn, so the tool call it
   made is lost. Chunk 7 needs it to render the model its own protocol, and chunk 5 needs it for the
@@ -47,10 +66,6 @@ land here instead of widening the chunk. Each entry says where it came from and 
 - **`ChatCompletionRequest` is an 18-argument positional record.** Tests construct it with long runs of
   positional nulls, so inserting a field could silently shift arguments without a compiler error. Add a
   test builder or use named arguments before the parameter list grows in chunks 4, 7 and 8.
-- **The context-leak assertions are vacuous on four cases.** The cases that never reach the backend
-  (`n` greater than one, `stream: true`, missing `messages`, and forcing an unsupported placement)
-  trivially satisfy created-equals-disposed because nothing was ever created. Asserting a context *was*
-  created where one is expected would make the guard non-vacuous everywhere.
 - **The per-request log line is only pinned for successful requests.** The rejected-request line, and
   the polymorphic `status=` field that carries an exception type name on the catch path, are untested.
   Consider `status=exception` with the type in the message so the field stays machine-parsable.
@@ -65,6 +80,45 @@ land here instead of widening the chunk. Each entry says where it came from and 
 - **Untested generation paths** flagged by the Codex review: a backend-originated `Cancelled` status
   with a client still connected, an unknown status value, a context-creation failure, and a throwing
   `Dispose`. None confirmed as production defects; all worth a fake-backend fault case.
+- **Nothing serializes concurrent requests against the single model handle (chunk 8 owns the fix).**
+  Chunk 3 opens a generation endpoint that Kestrel will happily enter on several threads at once, while
+  the request scheduler — one worker, bounded queue, PLAN section 2.7 — is chunk 8. Between the two,
+  context creation and generation on one shared `LanguageModel` are unguarded, and the smoke suite is
+  strictly single-threaded, so two simultaneous requests against a real NPU are entirely untested. This
+  is deliberate scope, not an oversight, but it is a real gap in what has been verified: any claim that
+  the endpoint works is a claim about one request at a time. Chunk 8 should include a concurrent smoke
+  step, not just unit coverage of the queue.
+- **`RenderedPrompt.SystemInPrompt` is unused by production code.** No caller reads it; the endpoint
+  re-derives the same fact from its own `useNativeSystem` plus `rendered.SystemText`, and only
+  `PromptTemplateTests` asserts on the flag. Two ways to say one thing, which is how they drift. Either
+  delete the flag and let the caller keep deriving it, or use it at the call site and stop deriving.
+- **The raw-passthrough rule omits the `tools` clause PLAN section 2.3 specifies.** The plan sends a
+  single bare user message raw only when there is no system text, **no history and no tools**;
+  `PromptTemplate.Render` tests only `messages.Count == 1 && role == "user"`. Harmless in chunk 3, where
+  `tools` is accepted and ignored, but chunk 7 must restore the clause: a request carrying tools needs
+  the marker format so the model sees the tool protocol it is meant to answer in.
+- **A present-but-empty system message reaches the native create-context call as `""`.** `BuildSystemText`
+  deliberately returns the empty string (not null) for a `system` message with empty content, so the
+  caller can tell "no system message" from "an empty one" — but the endpoint then passes that empty
+  string straight into `backend.CreateContext(nativeSystem)`. `FakeBackend` does not care; what the
+  Phi Silica and Aion runtimes do with an empty system context is unmeasured. Collapse it to null at the
+  call site, or measure it, before it matters.
+- **The response echoes back whatever `model` string the client sent.** `model` in the response body is
+  `request.Model ?? backend.ModelId`, with no check that the requested model is the one being served, so
+  a client asking for `gpt-4o` gets `"model": "gpt-4o"` back from the on-device model. Convenient for
+  tools that assert on their own model id, and it is why the field is left alone for now, but it is not
+  honest. Decide between echoing, validating against `/v1/models`, and always returning the served id.
+- **Extract the prepared-request pipeline first in chunk 4, before writing the streaming path.**
+  `ChatCompletionsEndpoint.PostAsync` is one long method owning parse, validate, readiness, ignored-
+  parameter warnings, placement, render, generate, response shaping and logging. The streaming path
+  needs everything up to and including generation and none of the shaping after it. If chunk 4 writes
+  the SSE path alongside this method instead of on top of a shared prepared-request shape, the two will
+  drift on exactly the parts that are easy to get subtly different: readiness, system-prompt placement
+  and the usage estimate. This is chunk 4's opening task, not a defect in chunk 3 — the method is
+  correct as it stands. **Ruling (controller, end of chunk 3):** the pipeline is *not* being extracted
+  now. The review calls it an extension rather than a rewrite provided it happens before the streaming
+  path is written, and this project's method forbids widening a chunk to absorb review findings. Cost if
+  that judgement is wrong: chunk 4 opens with a refactor instead of a feature.
 
 ## Chunk 2 review deferrals
 

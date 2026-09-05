@@ -139,58 +139,61 @@ internal sealed class ChatCompletionsEndpoint
             }
         }
 
-        // 5. System-prompt placement, then rendering.
+        // 5. System-prompt placement. Chosen here, enforced only after rendering: forcing `native` on
+        // a backend with no native system context is a conflict solely for a request that actually
+        // carries system text. A request with none needs no native context and is served normally --
+        // rejecting it up front would reject every request on such a backend (Aion, chunk 6).
         var nativeSupported = capabilities.HasFlag(BackendCapabilities.SystemPromptContext);
-        bool useNativeSystem;
-        switch (options.SystemPromptPlacement)
-        {
-            case SystemPromptPlacement.Native when !nativeSupported:
-                LogRequest(logger, requestId, backendName, promptChars: 0, ttftMs: 0, tokens: 0,
-                    status: "invalid_request", finish: "-", httpStatus: StatusCodes.Status400BadRequest);
-                return OpenAiError.BadRequest(
-                    $"--system-prompt-placement native was requested but backend '{backend.ModelId}' has no native system-prompt context. Use auto or prompt.",
-                    code: "system_prompt_placement_unsupported");
-            case SystemPromptPlacement.Native:
-                useNativeSystem = true;
-                break;
-            case SystemPromptPlacement.Prompt:
-                useNativeSystem = false;
-                break;
-            default:
-                useNativeSystem = nativeSupported;
-                break;
-        }
-
-        var rendered = PromptTemplate.Render(request.Messages!, useNativeSystem);
-        var nativeSystem = useNativeSystem ? rendered.SystemText : null;
-
-        // Chars the model actually sees: the prompt string, plus the system text when it travels
-        // separately through the native context.
-        var promptChars = rendered.Prompt.Length + (nativeSystem?.Length ?? 0);
-
-        if (options.Verbose)
-        {
-            logger.LogInformation(
-                "req={RequestId} prompt (system placement: {Placement}):\n---- system ----\n{System}\n---- prompt ----\n{Prompt}\n---- end ----",
-                requestId,
-                string.IsNullOrEmpty(rendered.SystemText) ? "no system message"
-                    : useNativeSystem ? "native context" : "folded into prompt",
-                rendered.SystemText ?? "(no system message)",
-                rendered.Prompt);
-        }
+        var useNativeSystem = options.SystemPromptPlacement != SystemPromptPlacement.Prompt && nativeSupported;
 
         var sampling = samplingSupported
             ? new SamplingOptions(request.Temperature, request.TopP, request.TopK)
             : null;
 
-        var stopwatch = Stopwatch.StartNew();
-        long firstTokenTicks = 0;
-        var callbacks = 0;
+        var promptChars = 0;
 
         IModelContext? context = null;
         try
         {
-            // 6. A fresh context per request, disposed in the finally: D11 says a context whose generation
+            // 6. Rendering, inside the guard. It cannot throw today -- validation guarantees non-null
+            // messages and known roles -- but D49 records exactly that reasoning failing once already,
+            // and chunk 7 adds tool-call rendering to this call. A throw here has to come out as an
+            // OpenAI-shaped error, not a 500.
+            var rendered = PromptTemplate.Render(request.Messages!, useNativeSystem);
+
+            if (options.SystemPromptPlacement == SystemPromptPlacement.Native
+                && !nativeSupported
+                && !string.IsNullOrEmpty(rendered.SystemText))
+            {
+                LogRequest(logger, requestId, backendName, promptChars: 0, ttftMs: 0, tokens: 0,
+                    status: "invalid_request", finish: "-", httpStatus: StatusCodes.Status400BadRequest);
+                return OpenAiError.BadRequest(
+                    $"--system-prompt-placement native was requested but backend '{backend.ModelId}' has no native system-prompt context. Use auto or prompt.",
+                    code: "system_prompt_placement_unsupported");
+            }
+
+            var nativeSystem = useNativeSystem ? rendered.SystemText : null;
+
+            // Chars the model actually sees: the prompt string, plus the system text when it travels
+            // separately through the native context.
+            promptChars = rendered.Prompt.Length + (nativeSystem?.Length ?? 0);
+
+            if (options.Verbose)
+            {
+                logger.LogInformation(
+                    "req={RequestId} prompt (system placement: {Placement}):\n---- system ----\n{System}\n---- prompt ----\n{Prompt}\n---- end ----",
+                    requestId,
+                    string.IsNullOrEmpty(rendered.SystemText) ? "no system message"
+                        : useNativeSystem ? "native context" : "folded into prompt",
+                    rendered.SystemText ?? "(no system message)",
+                    rendered.Prompt);
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            long firstTokenTicks = 0;
+            var callbacks = 0;
+
+            // 7. A fresh context per request, disposed in the finally: D11 says a context whose generation
             // did not end Complete has indeterminate state, and there is no cache to return it to yet.
             context = backend.CreateContext(nativeSystem);
 

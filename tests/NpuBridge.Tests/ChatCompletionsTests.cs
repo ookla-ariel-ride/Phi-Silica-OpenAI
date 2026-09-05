@@ -191,7 +191,7 @@ public class ChatCompletionsTests
     }
 
     [Fact]
-    public async Task Placement_native_is_400_when_the_backend_has_no_native_context()
+    public async Task Placement_native_is_400_when_the_backend_has_no_native_context_and_the_request_has_system_text()
     {
         var fake = new FakeBackend(new FakeBackendOptions
         {
@@ -207,6 +207,37 @@ public class ChatCompletionsTests
         Assert.Equal("invalid_request_error", error.GetProperty("type").GetString());
         Assert.Equal("system_prompt_placement_unsupported", error.GetProperty("code").GetString());
         Assert.Empty(fake.Calls);
+        AssertNoLeak(fake);
+    }
+
+    /// <summary>
+    /// The placement conflict is a property of the request, not of the option alone: a request with no
+    /// system message needs no native context, so forcing <c>native</c> on a backend that has none must
+    /// still serve it. Rejecting on the option alone would reject every request on such a backend, which
+    /// is what chunk 6's Aion backend will be.
+    /// </summary>
+    [Fact]
+    public async Task Placement_native_still_serves_a_request_with_no_system_message_on_a_backend_with_no_native_context()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Capabilities = BackendCapabilities.None,
+            Responder = _ => ["ok"],
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake, Options(SystemPromptPlacement.Native));
+
+        var response = await host.Client.PostAsJsonAsync(Path, Simple());
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var root = await ReadJson(response);
+        var choice = Assert.Single(root.GetProperty("choices").EnumerateArray().ToArray());
+        Assert.Equal("ok", choice.GetProperty("message").GetProperty("content").GetString());
+        Assert.Equal("stop", choice.GetProperty("finish_reason").GetString());
+
+        var call = Assert.Single(fake.Calls);
+        Assert.Null(call.SystemPrompt);
+        Assert.Equal("say hi", call.Prompt);
+        Assert.Equal(1, fake.ContextsCreated);
         AssertNoLeak(fake);
     }
 
@@ -654,25 +685,31 @@ public class ChatCompletionsTests
 
     /// <summary>
     /// The leak guard: whatever the outcome, every context the backend created was disposed. Asserted
-    /// explicitly on created-vs-disposed counts, not on a side effect.
+    /// explicitly on created-vs-disposed counts, not on a side effect. <c>expectedContexts</c> keeps the
+    /// guard honest: created-equals-disposed is trivially true when nothing is created, so each case
+    /// also pins how many contexts should have existed — one for anything that reaches the backend,
+    /// zero for a request rejected before it. Chunks 5 and 8 lean on this guard harder than chunk 3.
     /// </summary>
     [Fact]
     public async Task Every_outcome_disposes_every_context_it_created()
     {
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, Simple());
-        await AssertBalanced(new FakeBackendOptions { MaxPromptChars = 2, Responder = _ => ["ok"] }, Simple("a long prompt"));
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureStatus = GenerationStatus.Error }, Simple());
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureStatus = GenerationStatus.ContentFiltered }, Simple());
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureException = new InvalidOperationException("boom") }, Simple());
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, new { model = "fake", n = 2, messages = new[] { new { role = "user", content = "hi" } } });
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, new { model = "fake", stream = true, messages = new[] { new { role = "user", content = "hi" } } });
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, new { model = "fake" });
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, Simple(), expectedContexts: 1);
+        await AssertBalanced(new FakeBackendOptions { MaxPromptChars = 2, Responder = _ => ["ok"] }, Simple("a long prompt"), expectedContexts: 1);
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureStatus = GenerationStatus.Error }, Simple(), expectedContexts: 1);
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureStatus = GenerationStatus.ContentFiltered }, Simple(), expectedContexts: 1);
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureException = new InvalidOperationException("boom") }, Simple(), expectedContexts: 1);
 
-        static async Task AssertBalanced(FakeBackendOptions options, object body)
+        // Rejected before the backend is touched: zero created is the right expectation here.
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, new { model = "fake", n = 2, messages = new[] { new { role = "user", content = "hi" } } }, expectedContexts: 0);
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, new { model = "fake", stream = true, messages = new[] { new { role = "user", content = "hi" } } }, expectedContexts: 0);
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, new { model = "fake" }, expectedContexts: 0);
+
+        static async Task AssertBalanced(FakeBackendOptions options, object body, int expectedContexts)
         {
             var fake = new FakeBackend(options);
             await using var host = await BridgeTestHost.StartAsync(fake);
             await host.Client.PostAsJsonAsync(Path, body);
+            Assert.Equal(expectedContexts, fake.ContextsCreated);
             Assert.Equal(fake.ContextsCreated, fake.ContextsDisposed);
             Assert.Equal(0, fake.ActiveContexts);
         }
