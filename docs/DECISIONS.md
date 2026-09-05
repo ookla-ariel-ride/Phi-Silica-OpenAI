@@ -269,3 +269,13 @@ exe). `System.Text.Json` permits null elements despite the nullable annotation, 
 outside the handler's exception guard. A null element and a `text` part with a missing or null `text`
 are both 400 now. A user message with **missing or null `content` stays valid** and renders as empty:
 that is deliberate, not an oversight.
+
+**D50. Forcing a system-prompt placement only fails a request that actually has a system prompt.**
+Found by the final whole-branch review. `--system-prompt-placement native` on a backend without a
+native system context used to reject *every* request, because the check ran before the prompt was
+rendered and so consulted nothing about the request. A plain single-turn request with no system
+message needs no native context and now succeeds; only a request carrying system text is rejected,
+with the same error. Dormant on both shipping backends, which advertise the capability. It would have
+rejected all traffic in chunk 6, where Aion has no native system context at all. Verified after the
+fix that `auto` and `native` still deliver the system text through the native context and `prompt`
+still folds it into the prompt body.
