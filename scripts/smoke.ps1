@@ -42,16 +42,43 @@ $repo = Split-Path $PSScriptRoot -Parent
 $base = "http://127.0.0.1:$Port"
 $results = [System.Collections.Generic.List[object]]::new()
 
+# Thrown by a Step body to report SKIP instead of FAIL/PASS, without affecting the exit code.
+class SkipStepException : System.Exception {
+    SkipStepException([string] $message) : base($message) {}
+}
+
+function Skip([string] $reason) {
+    throw [SkipStepException]::new($reason)
+}
+
 function Step([string] $name, [scriptblock] $body) {
     Write-Host "==> $name" -ForegroundColor Cyan
     try {
         $detail = & $body
         $results.Add([pscustomobject]@{ Step = $name; Result = 'PASS'; Detail = "$detail" })
         Write-Host "    PASS $detail" -ForegroundColor Green
+    } catch [SkipStepException] {
+        $results.Add([pscustomobject]@{ Step = $name; Result = 'SKIP'; Detail = $_.Exception.Message })
+        Write-Host "    SKIP $($_.Exception.Message)" -ForegroundColor Yellow
     } catch {
         $results.Add([pscustomobject]@{ Step = $name; Result = 'FAIL'; Detail = $_.Exception.Message })
         Write-Host "    FAIL $($_.Exception.Message)" -ForegroundColor Red
     }
+}
+
+# For the two real-model measurements: prints numbers for docs/DECISIONS.md, but a model that
+# misbehaves or a step that cannot get a clean read is a finding, not a bridge failure, so this never
+# adds to the FAIL count or the exit code.
+function InfoStep([string] $name, [scriptblock] $body) {
+    Write-Host "==> $name" -ForegroundColor Cyan
+    try {
+        $detail = & $body
+    } catch {
+        $detail = "could not measure: $($_.Exception.Message)"
+    }
+    $results.Add([pscustomobject]@{ Step = $name; Result = 'INFO'; Detail = "$detail" })
+    Write-Host '    INFO' -ForegroundColor Yellow
+    ("$detail" -split "`n") | ForEach-Object { Write-Host "      $_" -ForegroundColor Yellow }
 }
 
 function Get-Json([string] $path, [string] $method = 'GET', [string] $body = $null, [int[]] $expect = @(200), [int] $timeoutSec = 300) {
@@ -64,6 +91,43 @@ function Get-Json([string] $path, [string] $method = 'GET', [string] $body = $nu
 
 function Test-PortListening([int] $p) {
     return $null -ne (Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue)
+}
+
+# Starts a second, throwaway NpuBridge.exe on its own port for a measurement that needs a startup
+# option (e.g. --system-prompt-placement) the already-running main server was not started with.
+# Waits for /healthz to report ready before returning; throws on failure. Independent of $proc/$base.
+function Start-AuxServer([string] $label, [int] $port, [string[]] $extraArgs) {
+    if (Test-PortListening $port) { throw "something already listens on port $port for the $label run" }
+    $exe = Get-ChildItem (Join-Path $repo 'src\NpuBridge\bin') -Recurse -Filter NpuBridge.exe -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $exe) { throw 'NpuBridge.exe not found; run: dotnet build src/NpuBridge' }
+    $log = Join-Path $env:TEMP "npu-bridge-smoke-$Backend-$label.log"
+    $allArgs = @('--backend', $Backend, '--listen', "http://127.0.0.1:$port", '--verbose') + $extraArgs
+    Write-Host "Starting $($exe.FullName) $($allArgs -join ' ') (log: $log)"
+    $p = Start-Process -FilePath $exe.FullName -ArgumentList $allArgs `
+        -RedirectStandardOutput $log -RedirectStandardError "$log.err" -PassThru -NoNewWindow
+
+    $deadline = (Get-Date).AddSeconds($ReadyTimeoutSeconds)
+    $last = $null
+    while ((Get-Date) -lt $deadline) {
+        if ($p.HasExited) { throw "$label server process exited with code $($p.ExitCode); see $log and $log.err" }
+        try {
+            $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/healthz" -SkipHttpErrorCheck -TimeoutSec 5
+            $last = $r.Content | ConvertFrom-Json
+            if ($r.StatusCode -eq 200) { return $p }
+            if ($last.status -eq 'failed') { throw "$label backend failed: $($last.error)" }
+        } catch [System.Net.Http.HttpRequestException] { }
+        Start-Sleep -Seconds 2
+    }
+    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    throw "$label server not ready after ${ReadyTimeoutSeconds}s; last: $($last | ConvertTo-Json -Compress)"
+}
+
+function Stop-AuxServer($p) {
+    if ($p -and -not $p.HasExited) {
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
+    }
 }
 
 # --- start server -----------------------------------------------------------
@@ -141,49 +205,127 @@ try {
         "aborted request drained; next request completed in $($sw.ElapsedMilliseconds)ms"
     }
 
-    # --- chat completions (chunk 3+) ----------------------------------------
-    $chatAvailable = $true
-    try { $null = Get-Json '/v1/chat/completions' 'POST' '{}' @(400) } catch { $chatAvailable = $false }
-    if (-not $chatAvailable) {
-        Write-Host '    (chat completions endpoint not built yet; skipping OpenAI generation steps)' -ForegroundColor Yellow
-    } else {
-        Step 'POST /v1/chat/completions (non-streaming)' {
-            $body = @{ model = $Backend; messages = @(@{ role = 'user'; content = 'Reply with exactly the word PONG.' }) } | ConvertTo-Json -Depth 5
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            $c = Get-Json '/v1/chat/completions' 'POST' $body
-            $sw.Stop()
-            $text = $c.choices[0].message.content
-            if (-not $text) { throw "empty content: $($c | ConvertTo-Json -Compress)" }
-            "in $($sw.ElapsedMilliseconds)ms finish=$($c.choices[0].finish_reason) usage=$($c.usage | ConvertTo-Json -Compress) text='$($text.Substring(0, [Math]::Min(80, $text.Length)))'"
+    # --- chat completions (chunk 3) ------------------------------------------
+    # One gate per feature: non-streaming is built now; streaming (chunk 4) and tool calls (chunk 7)
+    # are not, and must report SKIP, not FAIL, so a clean chunk-3 run stays "All steps passed".
+    Step 'POST /v1/chat/completions rejects an empty body' {
+        $c = Get-Json '/v1/chat/completions' 'POST' '{}' @(400)
+        if ($c.error.type -ne 'invalid_request_error') { throw "error.type=$($c.error.type): $($c | ConvertTo-Json -Compress)" }
+        "HTTP 400 error.type=$($c.error.type)"
+    }
+
+    Step 'POST /v1/chat/completions (non-streaming)' {
+        $body = @{
+            model    = $Backend
+            messages = @(
+                @{ role = 'system'; content = 'You are a terse assistant.' }
+                @{ role = 'user'; content = 'Reply with exactly the word PONG.' }
+            )
+        } | ConvertTo-Json -Depth 5
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $c = Get-Json '/v1/chat/completions' 'POST' $body
+        $sw.Stop()
+
+        if ($c.object -ne 'chat.completion') { throw "object=$($c.object)" }
+        if ($c.id -notlike 'chatcmpl-*') { throw "id=$($c.id) does not start with chatcmpl-" }
+        $choice = $c.choices[0]
+        if ($choice.message.role -ne 'assistant') { throw "message.role=$($choice.message.role)" }
+        $text = $choice.message.content
+        if (-not $text) { throw "empty content: $($c | ConvertTo-Json -Compress)" }
+        if ($choice.finish_reason -ne 'stop') { throw "finish_reason=$($choice.finish_reason)" }
+        $u = $c.usage
+        if (-not ($u.prompt_tokens -gt 0 -and $u.completion_tokens -gt 0 -and $u.total_tokens -gt 0)) {
+            throw "usage not all > 0: $($u | ConvertTo-Json -Compress)"
+        }
+        if ($u.total_tokens -ne ($u.prompt_tokens + $u.completion_tokens)) {
+            throw "total_tokens=$($u.total_tokens) != prompt_tokens+completion_tokens=$($u.prompt_tokens + $u.completion_tokens)"
         }
 
-        Step 'POST /v1/chat/completions (streaming SSE)' {
-            $body = @{ model = $Backend; stream = $true; messages = @(@{ role = 'user'; content = 'Count from 1 to 5, separated by spaces.' }) } | ConvertTo-Json -Depth 5
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            $r = Invoke-WebRequest -Uri "$base/v1/chat/completions" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 300
-            $sw.Stop()
-            if ($r.Headers['Content-Type'] -notmatch 'text/event-stream') { throw "content-type $($r.Headers['Content-Type'])" }
-            $lines = $r.Content -split "`n" | Where-Object { $_ -like 'data: *' }
-            if ($lines[-1].Trim() -ne 'data: [DONE]') { throw "no [DONE]; last line: $($lines[-1])" }
-            $chunks = $lines | Where-Object { $_ -ne 'data: [DONE]' } | ForEach-Object { ($_ -replace '^data: ', '') | ConvertFrom-Json }
-            $text = -join ($chunks | ForEach-Object { $_.choices[0].delta.content })
-            "$($chunks.Count) chunks in $($sw.ElapsedMilliseconds)ms text='$($text.Trim())'"
+        # Non-streaming: the whole JSON body is written in one shot, so there is no separate
+        # time-to-first-byte to observe client-side; ttft and total are the same clock reading here.
+        "ttft=$($sw.ElapsedMilliseconds)ms total=$($sw.ElapsedMilliseconds)ms (non-streaming: single write, so ttft==total) usage=$($u | ConvertTo-Json -Compress) text='$($text.Substring(0, [Math]::Min(80, $text.Length)))'"
+    }
+
+    Step 'POST /v1/chat/completions (streaming SSE)' {
+        Skip 'streaming arrives in chunk 4; stream: true deliberately returns 400 in chunk 3'
+    }
+
+    if ($ToolProbeRuns -gt 0) {
+        Step "tool-call compliance probe ($ToolProbeRuns runs)" {
+            Skip 'tool calling arrives in chunk 7; tools/tool_choice are accepted and ignored in chunk 3'
+        }
+    }
+
+    # --- measurement 1: does completion_tokens (chars/4) track progress callbacks? -----------------
+    InfoStep 'measurement: chars/4 estimate vs progress-callback count' {
+        $prompt = 'In two or three sentences, explain what a neural processing unit does and why a Copilot+ PC has one.'
+
+        # A bare user message with no system text and no history renders to the backend as this exact
+        # raw string (PLAN 2.3), so /v1/chat/completions and /debug/generate see the same prompt.
+        $chatBody = @{ model = $Backend; messages = @(@{ role = 'user'; content = $prompt }) } | ConvertTo-Json -Depth 5
+        $c = Get-Json '/v1/chat/completions' 'POST' $chatBody
+        if ($c.choices[0].finish_reason -ne 'stop') { throw "chat finish_reason=$($c.choices[0].finish_reason)" }
+        $completionTokens = $c.usage.completion_tokens
+        $rawChars = $c.choices[0].message.content.Length
+
+        $g = Get-Json '/debug/generate' 'POST' (@{ prompt = $prompt } | ConvertTo-Json)
+        if ($g.status -ne 'Complete') { throw "debug/generate status=$($g.status)" }
+        $callbacks = $g.progress_callbacks
+
+        $ratio = if ($callbacks -gt 0) { [Math]::Round(($rawChars / 4.0) / $callbacks, 2) } else { $null }
+        $ratioText = if ($null -ne $ratio) { "${ratio}x" } else { 'n/a (0 callbacks)' }
+
+        @"
+asked: one bare user-message prompt ($($prompt.Length) chars), same text sent to both endpoints so the model sees an identical prompt
+progress-callback count (backend, via /debug/generate, separate generation) = $callbacks (debug/generate produced $($g.chars) chars)
+chars/4 estimate returned as usage.completion_tokens (via /v1/chat/completions) = $completionTokens
+raw completion character count (the /v1/chat/completions reply actually scored above) = $rawChars
+verdict: chars/4 estimate is $ratioText the callback count for this run. Chunk 3 chose chars/4 over
+counting callbacks because callbacks were measured undercounting by roughly 4x (11 callbacks for 178
+chars); this number is that assumption checked against real hardware, not a recollection.
+"@
+    }
+
+    # --- measurement 2: which --system-prompt-placement does this model actually obey? -------------
+    InfoStep 'measurement: system-prompt placement (native vs prompt)' {
+        if ($NoStart) {
+            return 'skipped: -NoStart is set; this measurement starts two dedicated servers on an auxiliary port, which -NoStart precludes.'
         }
 
-        if ($ToolProbeRuns -gt 0) {
-            Step "tool-call compliance probe ($ToolProbeRuns runs)" {
-                $tools = @(@{ type = 'function'; function = @{ name = 'get_weather'; description = 'Get the current weather for a city'; parameters = @{ type = 'object'; properties = @{ city = @{ type = 'string' } }; required = @('city') } } })
-                $body = @{ model = $Backend; tools = $tools; messages = @(@{ role = 'user'; content = 'What is the weather in Paris right now? Use the tool.' }) } | ConvertTo-Json -Depth 8
-                $hits = 0
-                for ($i = 0; $i -lt $ToolProbeRuns; $i++) {
-                    $c = Get-Json '/v1/chat/completions' 'POST' $body
-                    $tc = $c.choices[0].message.tool_calls
-                    if ($c.choices[0].finish_reason -eq 'tool_calls' -and $tc -and $tc[0].function.name -eq 'get_weather') { $hits++ }
-                }
-                if ($hits -eq 0) { throw "0/$ToolProbeRuns runs produced a tool call" }
-                "$hits/$ToolProbeRuns runs produced a well-formed get_weather call"
+        $auxPort = $Port + 1
+        $system = 'You are Ada. Always answer with exactly the two words: I am Ada.'
+        $question = 'What is your name?'
+        $chatBody = @{
+            model    = $Backend
+            messages = @(
+                @{ role = 'system'; content = $system }
+                @{ role = 'user'; content = $question }
+            )
+        } | ConvertTo-Json -Depth 5
+
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add("asked (both placements, server restarted between them): system=`"$system`" user=`"$question`"")
+
+        foreach ($placement in 'native', 'prompt') {
+            $auxProc = $null
+            try {
+                $auxProc = Start-AuxServer "placement-$placement" $auxPort @('--system-prompt-placement', $placement)
+                $r = Invoke-WebRequest -Uri "http://127.0.0.1:$auxPort/v1/chat/completions" -Method Post -Body $chatBody `
+                    -ContentType 'application/json' -SkipHttpErrorCheck -TimeoutSec 120
+                if ([int]$r.StatusCode -ne 200) { throw "HTTP $($r.StatusCode): $($r.Content)" }
+                $c = $r.Content | ConvertFrom-Json -Depth 20
+                $text = $c.choices[0].message.content
+                $obeyed = $text -match 'Ada'
+                $lines.Add("$placement -> got: '$($text.Trim())' obeyed=$obeyed")
+            } catch {
+                $lines.Add("$placement -> error: $($_.Exception.Message)")
+            } finally {
+                Stop-AuxServer $auxProc
             }
         }
+
+        $lines.Add('verdict: compare the two "obeyed" lines above. Phi Silica has twice been observed ignoring a natively delivered system prompt (docs/DECISIONS.md); this is that check run on real hardware for this build.')
+        $lines -join "`n"
     }
 } finally {
     if ($proc -and -not $proc.HasExited) {
@@ -197,5 +339,7 @@ try {
 Write-Host ''
 $results | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
 $failed = @($results | Where-Object Result -eq 'FAIL').Count
+$skipped = @($results | Where-Object Result -eq 'SKIP').Count
+$info = @($results | Where-Object Result -eq 'INFO').Count
 if ($failed -gt 0) { Write-Host "$failed step(s) failed" -ForegroundColor Red; exit 1 }
-Write-Host 'All steps passed' -ForegroundColor Green
+Write-Host "All steps passed ($skipped skipped, $info informational)" -ForegroundColor Green
