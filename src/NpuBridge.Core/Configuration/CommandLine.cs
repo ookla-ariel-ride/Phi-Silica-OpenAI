@@ -37,6 +37,7 @@ public static class CommandLine
         ["--queue-capacity"] = nameof(BridgeOptions.QueueCapacity),
         ["--context-cache-size"] = nameof(BridgeOptions.ContextCacheSize),
         ["--truncate-history"] = nameof(BridgeOptions.TruncateHistory),
+        ["--system-prompt-placement"] = nameof(BridgeOptions.SystemPromptPlacement),
         ["--tool-emulation"] = nameof(BridgeOptions.ToolEmulation),
         ["--tool-schema"] = nameof(BridgeOptions.ToolSchema),
         ["--context-window-hint"] = nameof(BridgeOptions.ContextWindowHint),
@@ -79,6 +80,9 @@ public static class CommandLine
           --queue-capacity <n>              Queued requests before 429         [4]
           --context-cache-size <n>          Cached conversation contexts       [4]
           --truncate-history                Drop oldest turns on overflow instead of returning 400
+          --system-prompt-placement auto|native|prompt
+                                            Where the system message goes: the backend's native system
+                                            context, or the top of the prompt text        [auto]
           --tool-emulation on|off           Emulated function calling          [on]
           --tool-schema compact|full        How tool schemas reach the prompt  [compact]
           --context-window-hint <tokens>    Used only for pressure warnings    [4096]

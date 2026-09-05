@@ -16,6 +16,7 @@ public class BridgeOptionsBinderTests
         Assert.Equal(4, o.QueueCapacity);
         Assert.Equal(4, o.ContextCacheSize);
         Assert.False(o.TruncateHistory);
+        Assert.Equal(SystemPromptPlacement.Auto, o.SystemPromptPlacement);
         Assert.True(o.ToolEmulation);
         Assert.Equal(ToolSchemaMode.Compact, o.ToolSchema);
         Assert.Equal(4096, o.ContextWindowHint);
@@ -210,6 +211,22 @@ public class BridgeOptionsBinderTests
     }
 
     private static MemoryStream Stream(string json) => new(System.Text.Encoding.UTF8.GetBytes(json));
+
+    [Theory]
+    [InlineData("auto", SystemPromptPlacement.Auto)]
+    [InlineData("native", SystemPromptPlacement.Native)]
+    [InlineData("PROMPT", SystemPromptPlacement.Prompt)]
+    public void System_prompt_placement_binds(string value, SystemPromptPlacement expected)
+    {
+        Assert.Equal(expected, Bind(("SystemPromptPlacement", value)).SystemPromptPlacement);
+    }
+
+    [Fact]
+    public void Unknown_system_prompt_placement_is_rejected()
+    {
+        var ex = Assert.Throws<BridgeConfigurationException>(() => Bind(("SystemPromptPlacement", "sideways")));
+        Assert.Contains("SystemPromptPlacement", ex.Message, StringComparison.Ordinal);
+    }
 
     private static BridgeOptions Bind(params (string Key, string Value)[] pairs)
     {

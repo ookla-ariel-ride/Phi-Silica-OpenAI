@@ -94,6 +94,7 @@ then `appsettings.json`. Both files sit next to the exe. `NpuBridge.exe --help` 
 | `--queue-capacity <n>` | 4 | requests waiting for the single model worker before 429 |
 | `--context-cache-size <n>` | 4 | cached conversation contexts (LRU) |
 | `--truncate-history` | off | drop oldest turns on context overflow instead of returning 400 |
+| `--system-prompt-placement auto|native|prompt` | `auto` | deliver the system message through the backend's native context (`auto` when it has one) or folded into the prompt text |
 | `--tool-emulation on\|off` | on | emulated function calling |
 | `--tool-schema compact\|full` | compact | how tool schemas are rendered into the prompt |
 | `--context-window-hint <tokens>` | 4096 | used only for context-pressure warnings |

@@ -67,6 +67,17 @@ public static class BridgeOptionsBinder
             o.TaskName = taskName;
         }
 
+        if (Get(configuration, nameof(BridgeOptions.SystemPromptPlacement)) is { } placement)
+        {
+            o.SystemPromptPlacement = placement.Trim().ToLowerInvariant() switch
+            {
+                "auto" => SystemPromptPlacement.Auto,
+                "native" => SystemPromptPlacement.Native,
+                "prompt" => SystemPromptPlacement.Prompt,
+                _ => throw Bad(nameof(BridgeOptions.SystemPromptPlacement), placement, "expected auto, native or prompt"),
+            };
+        }
+
         if (Get(configuration, nameof(BridgeOptions.ToolSchema)) is { } schema)
         {
             o.ToolSchema = schema.Trim().ToLowerInvariant() switch

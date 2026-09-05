@@ -25,6 +25,7 @@ public static class NpuBridgeServiceCollectionExtensions
         services.AddSingleton(options);
         services.TryAddSingleton(TimeProvider.System);
         services.TryAddSingleton<IProcessIdentity>(NoProcessIdentity.Instance);
+        services.TryAddSingleton<IgnoredParameterLog>();
 
         // BackendLifecycle owns the backend and disposes it only after initialization has finished.
         // The backend is deliberately not registered as its own disposable singleton, which would let

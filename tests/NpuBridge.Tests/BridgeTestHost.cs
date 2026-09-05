@@ -38,7 +38,8 @@ internal sealed class BridgeTestHost : IAsyncDisposable
         IProcessIdentity? identity = null,
         TimeProvider? time = null,
         bool waitForReady = true,
-        System.Net.IPAddress? remoteAddress = null)
+        System.Net.IPAddress? remoteAddress = null,
+        ILoggerProvider? loggerProvider = null)
     {
         remoteAddress ??= System.Net.IPAddress.Loopback;
         backend ??= new FakeBackend();
@@ -47,6 +48,10 @@ internal sealed class BridgeTestHost : IAsyncDisposable
         var builder = WebApplication.CreateBuilder(new WebApplicationOptions { EnvironmentName = "Testing" });
         builder.WebHost.UseTestServer();
         builder.Logging.ClearProviders();
+        if (loggerProvider is not null)
+        {
+            builder.Logging.AddProvider(loggerProvider);
+        }
 
         if (identity is not null)
         {
@@ -83,6 +88,61 @@ internal sealed class BridgeTestHost : IAsyncDisposable
         Client.Dispose();
         await _app.StopAsync();
         await _app.DisposeAsync();
+    }
+}
+
+/// <summary>Collects every log record the host emits, so tests can assert on the per-request line.</summary>
+internal sealed class CapturingLoggerProvider : ILoggerProvider
+{
+    private readonly List<LogRecord> _records = new();
+
+    public IReadOnlyList<LogRecord> Records
+    {
+        get
+        {
+            lock (_records)
+            {
+                return _records.ToArray();
+            }
+        }
+    }
+
+    public ILogger CreateLogger(string categoryName) => new Capturing(this, categoryName);
+
+    public void Dispose()
+    {
+    }
+
+    private void Add(LogRecord record)
+    {
+        lock (_records)
+        {
+            _records.Add(record);
+        }
+    }
+
+    internal sealed record LogRecord(string Category, LogLevel Level, string Message);
+
+    private sealed class Capturing : ILogger
+    {
+        private readonly CapturingLoggerProvider _owner;
+        private readonly string _category;
+
+        public Capturing(CapturingLoggerProvider owner, string category)
+        {
+            _owner = owner;
+            _category = category;
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            ArgumentNullException.ThrowIfNull(formatter);
+            _owner.Add(new LogRecord(_category, logLevel, formatter(state, exception)));
+        }
     }
 }
 

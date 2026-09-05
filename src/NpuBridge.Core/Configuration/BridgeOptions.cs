@@ -7,6 +7,19 @@ public enum BackendKind
     Fake,
 }
 
+/// <summary>Where a request's system/developer text is delivered to the model.</summary>
+public enum SystemPromptPlacement
+{
+    /// <summary>Native system context when the backend advertises it, otherwise folded into the prompt.</summary>
+    Auto,
+
+    /// <summary>Always the backend's native system context; a backend without it fails the request.</summary>
+    Native,
+
+    /// <summary>Always folded into the prompt text, even when a native system context exists.</summary>
+    Prompt,
+}
+
 public enum ToolSchemaMode
 {
     /// <summary>Signature-style rendering (<c>name(arg: type, opt?: type) — description</c>); saves tokens.</summary>
@@ -38,6 +51,14 @@ public sealed class BridgeOptions
 
     /// <summary>Drop oldest non-system turns and retry on context overflow instead of returning 400.</summary>
     public bool TruncateHistory { get; set; }
+
+    /// <summary>
+    /// Where the system/developer text goes: the backend's native system context, or the top of the
+    /// rendered prompt. <see cref="SystemPromptPlacement.Auto"/> picks by capability; the explicit values
+    /// exist because Phi Silica has been measured ignoring a natively delivered system prompt, and which
+    /// placement a model actually obeys has to be measured on the real NPU.
+    /// </summary>
+    public SystemPromptPlacement SystemPromptPlacement { get; set; } = SystemPromptPlacement.Auto;
 
     public bool ToolEmulation { get; set; } = true;
 
