@@ -4,7 +4,7 @@ Supersedes the 2026-09-03 handoff (in git history). Everything below was verifie
 
 ## TL;DR
 
-- **Chunks 1, 2 and 3 of 8 are done**, on `main` at `f7456e6`, pushed to
+- **Chunks 1, 2 and 3 of 8 are done**, on `main`, pushed to
   `https://github.com/ookla-ariel-ride/Phi-Silica-OpenAI` (private).
 - `POST /v1/chat/completions` works non-streaming, on the real NPU. Next is **chunk 4** (streaming SSE).
 - Chunk 4 has a named opening task: extract the request pipeline before writing the streaming path.
@@ -78,7 +78,7 @@ Both are in `docs/FUTURE.md` with the reasoning:
 
 ```powershell
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\Phi-Silica-OpenAI
-git status; git log --oneline | Select-Object -First 3   # expect clean at f7456e6
+git status; git log --oneline | Select-Object -First 3   # expect a clean tree, main in sync
 dotnet build; dotnet test                                # expect 279 passed
 .\scripts\smoke.ps1 -Backend phi-silica -Port 5298       # expect all passed, 2 skipped, 2 informational
 ```
