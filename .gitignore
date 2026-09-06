@@ -85,3 +85,8 @@ scripts/out/
 *.bak
 *.tmp
 *.orig
+
+# ---- locally installed agent skills (not part of the project) ----
+.agents/skills/
+.claude/skills/
+skills-lock.json
