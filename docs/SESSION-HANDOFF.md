@@ -83,9 +83,15 @@ dotnet build; dotnet test                                # expect 279 passed
 .\scripts\smoke.ps1 -Backend phi-silica -Port 5298       # expect all passed, 2 skipped, 2 informational
 ```
 
-## Owner action items
+## Owner decisions, settled 2026-09-06
 
-1. Decide on the `powershell-master` skill files under `.agents/skills/` and `.claude/skills/`.
-2. Optional: request a Phi Silica LAF token for `NpuBridge_jtas4mnxdyzpe` to leave the experimental
-   SDK channel.
-3. Give the go for chunk 4.
+All three long-standing items are closed. Do not re-raise them.
+
+1. **Agent skill files: untracked.** The `powershell-master` files under `.agents/` and `.claude/`, and
+   `skills-lock.json`, are a local tool install rather than part of this project. They are out of git,
+   still on disk, and now gitignored. The scaffold `SKILL.md` in the repo root was deleted.
+2. **LAF token: not being pursued.** Staying on the experimental Windows App SDK channel is a
+   deliberate choice, not a pending task. The switch back to stable remains cheap if a token ever
+   arrives (two version strings and one manifest line, per D31), but nobody is waiting on it.
+3. **Chunk 4: go given.** Work happens on a branch and fast-forward merges when the chunk is verified,
+   the same as chunk 3.

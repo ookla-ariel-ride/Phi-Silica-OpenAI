@@ -28,5 +28,6 @@ so `completion_tokens` is `ceil(chars/4)` (D44).
   dropped on deserialization.
 - Error envelopes omit null `param`/`code` where OpenAI emits them. Shared helper from chunk 1, so it
   needs its own decision rather than a quiet fix.
-- Owner decisions still open: the `powershell-master` skill files under `.agents/`/`.claude/`, and the
-  optional LAF token request for PFN `NpuBridge_jtas4mnxdyzpe`.
+- No owner decisions are open. The three that stood for several sessions were settled on 2026-09-06:
+  the agent skill files are untracked, the LAF token is deliberately not being pursued, and chunk 4 has
+  the go. See the handoff for the detail.
