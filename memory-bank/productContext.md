@@ -31,8 +31,21 @@ so those tools can run fully local, offline, and free.
 
 ## Known user-facing behaviours (decided)
 - Default listener `http://127.0.0.1:5273`; default backend `phi-silica`.
-- Model ids: `phi-silica`, `aion-instruct`, `fake`.
-- With `tools` in a request the whole reply is buffered before streaming (reliable tool-call detection
-  over first-token latency).
-- Context overflow returns HTTP 400 `context_length_exceeded` unless `--truncate-history` is set.
-- Token counts in `usage` are estimates and documented as such.
+- Model ids: `phi-silica` and `fake` today; `aion-instruct` is planned for chunk 6, when the Aion
+  adapter lands — no backend emits it yet.
+- `POST /v1/chat/completions` works end to end, **non-streaming only**: a client gets a correct
+  OpenAI-shaped response with message content, `finish_reason` and a `usage` block. `stream: true`
+  is rejected with HTTP 400 until chunk 4 lands SSE, rather than returning a body the client can't parse.
+- A system message is delivered to the model by default (`--system-prompt-placement auto`, native
+  context when the backend supports one), and the model does follow it under both placements (D45).
+  `max_tokens`,
+  `max_completion_tokens`, `stop`, `tools` and `tool_choice` are accepted but currently ignored (each
+  warns once per process); the client-side `stop`/`max_tokens` cut and tool-call handling land in
+  chunks 4 and 7.
+- With `tools` in a request the whole reply will be buffered before streaming once tool-call emulation
+  ships (chunk 7); today `tools` is accepted and ignored, as above.
+- Context overflow returns HTTP 400 `context_length_exceeded`. `--truncate-history`,
+  `--context-cache-size` and `--queue-capacity` are accepted on the command line but do nothing yet —
+  they take effect in chunks 5 and 8.
+- Token counts in `usage` are estimates on both sides (`ceil(chars/4)`), documented as such, because
+  Phi Silica's progress callbacks undercount tokens roughly threefold.

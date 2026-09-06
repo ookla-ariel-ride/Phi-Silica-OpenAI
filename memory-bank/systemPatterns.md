@@ -4,13 +4,44 @@
 ```
 NpuBridge (exe, ARM64)          NpuBridge.Core (net10.0, no WinRT)          NpuBridge.Tests
   Program.cs (CLI, host)  --->    Api/        endpoints, OpenAI DTOs, errors     TestServer + FakeBackend
-  Backends/PhiSilica*             Backends/   ILanguageModelBackend, Lifecycle, Fake
-  PackageActivation.cs            Configuration/ options, binder, CLI, sources
-  ServiceCommands/TaskCommands    Hosting/    sc.exe + schtasks builders, identity
-  ProcessIdentity.cs              (chunk 3+) Prompting/, Context/, Engine/, Streaming/, Tools/
+  Backends/PhiSilica*              Backends/   ILanguageModelBackend, Lifecycle, Fake
+  PackageActivation.cs             Configuration/ options, binder, CLI, sources
+  ServiceCommands/TaskCommands     Hosting/    sc.exe + schtasks builders, identity
+  ProcessIdentity.cs               Prompting/  PromptTemplate (message flattening)
+                                    (not yet)   Context/, Streaming/, Tools/
 ```
 Logic lives in Core so it is testable without the NPU; the exe holds only wiring, WinRT adapters and
-Windows-specific glue. Tests boot the real endpoint pipeline in-process.
+Windows-specific glue. Tests boot the real endpoint pipeline in-process. `Context/` (cache, chunk 5),
+`Streaming/` (SSE, chunk 4) and `Tools/` (tool-call emulation, chunk 7) don't exist yet; there is no
+separate `Engine/` folder — the request pipeline below lives in `Api/ChatCompletionsEndpoint`.
+
+## Request flow (as built through chunk 3)
+`ChatCompletionsEndpoint.PostAsync` does, in order: parse the JSON body (malformed body → 400, no
+context created) → validate the DTO against what the deserializer can actually produce, not just what
+the type declares (400 on failure, no context created) → check the backend is `Ready` (503 if not, no
+context created) → warn once per process on any accepted-but-ignored parameter → render the prompt
+(`PromptTemplate`, chooses native vs. prompt-folded system placement) → create the context → generate,
+in a `finally` that disposes the context on every path that reached this point (success, overflow,
+content filter, backend `Error`/`Cancelled`, a thrown exception, client abort) → shape the OpenAI
+response JSON → log the outcome. There is no context cache yet (chunk 5): every request creates and
+disposes its own context.
+
+## Conventions this chunk established
+- **Validate what the deserializer can produce, not just what the type says.** `System.Text.Json` will
+  happily hand the handler a `messages` array containing a null element despite non-nullable
+  annotations; that must be a validation failure (400), not something that reaches the handler and
+  throws (500). Found the hard way: a null element crashed the endpoint until validation was widened
+  (D49).
+- **A context is disposed on every path that creates one, and never on a path that doesn't.** The
+  four early-rejection paths (bad JSON, validation failure, backend not ready, a placement conflict —
+  which is checked after the prompt is rendered but before any context is created) return before any
+  context exists, so they create none. Every other exit
+  disposes the one context it created, in a `finally`. Tests assert not just "no leak" but the actual
+  create-vs-dispose count on each path, so the guarantee can't be satisfied by accident (D43).
+- **A capability check that gates on backend support must first check the request needs the
+  capability.** Forcing `--system-prompt-placement native` on a backend without native system-prompt
+  support should reject only requests that actually carry a system message, not every request — the
+  check runs after the prompt is rendered, not before (D50).
 
 ## Backend contract (`ILanguageModelBackend`)
 - `InitializeAsync` once, possibly minutes; `BackendLifecycle` runs it in the background, owns the

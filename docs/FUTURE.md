@@ -147,11 +147,15 @@ land here instead of widening the chunk. Each entry says where it came from and 
   `Microsoft.WindowsAppSDK`/`.Runtime` back to the stable version and the manifest's
   `PackageDependency` back to `Microsoft.WindowsAppRuntime.2`. Worth doing when the token is issued so
   the bridge does not depend on experimental packages.
-- **Token counting.** Progress callbacks undercount on Phi Silica (speculative decoding batches tokens).
-  Consider `chars/4` for completion tokens too, or expose both. Decide in chunk 3 when `usage` is built.
-- **System prompt fidelity on Phi Silica.** `CreateContext(systemPrompt)` did not make the model follow a
+- ~~**Token counting.** Progress callbacks undercount on Phi Silica (speculative decoding batches tokens).
+  Consider `chars/4` for completion tokens too, or expose both. Decide in chunk 3 when `usage` is built.~~
+  — answered in chunk 3: `usage` is `ceil(chars/4)` on both sides, after one generation measured 29
+  callbacks for 367 characters, a 3.17x undercount (D44).
+- ~~**System prompt fidelity on Phi Silica.** `CreateContext(systemPrompt)` did not make the model follow a
   strict identity instruction. Chunk 3's template should be measured both ways (native context vs.
-  rendered into the user turn) with the smoke test.
+  rendered into the user turn) with the smoke test.~~ — answered in chunk 3: both placements were measured
+  on the NPU and both produced the instructed reply; the chunk 2 observation belonged to the bare
+  `/debug/generate` path, not to the model (D45).
 - **Activated instance's console.** With `--hide-console` the window is hidden after startup but still
   flashes briefly; a `WinExe` variant or a launcher stub would avoid it. Logs from the activated process
   are otherwise lost; add file logging (see chunk 1 deferral).

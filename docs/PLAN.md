@@ -1,7 +1,10 @@
 # npu-bridge — Plan
 
 OpenAI-compatible HTTP endpoint over the Copilot+ PC on-device language model (Phi Silica today,
-Aion Instruct Preview next). Status: **draft for sign-off, no code written yet.**
+Aion Instruct Preview next). Status: **signed off (§4); chunks 1 to 3 of 8 built and merged; chunk 4
+next.** This document is the historical design record and is not updated to match the code as it
+ships — current state lives in `memory-bank/progress.md`, and decisions made since sign-off are in
+`docs/DECISIONS.md`.
 
 Research inputs (read 2026-09-01): the Aion sample repo (README, `unpackaged-console/Program.cs`,
 `FrameworkDependency.cs`, `AionInstructClient.cs`, `ViewModels/ChatViewModel.cs`, both csproj files,
@@ -180,6 +183,9 @@ Response: standard `chat.completion` / `chat.completion.chunk` objects with `id`
 **Usage estimate.** `completion_tokens` = number of `Progress` callbacks (Aion documents one token
 per callback; Phi Silica's speculative decoding may batch, so it can undercount). `prompt_tokens` =
 `ceil(prompt_chars / 4)`. Documented as an estimate in `CLIENTS.md` and `DECISIONS.md`.
+[Superseded by D44: measured on hardware, Phi Silica's progress callbacks undercounted completion
+tokens by about 3x (29 callbacks for 367 characters), so `completion_tokens` is `ceil(chars/4)` too,
+matching `prompt_tokens`.]
 
 **Error bodies** follow OpenAI's `{"error":{"message","type","param","code"}}`:
 
@@ -187,11 +193,11 @@ per callback; Phi Silica's speculative decoding may batch, so it can undercount)
 |---|---|---|
 | Malformed JSON / schema | 400 | `invalid_request_error` |
 | `PromptLargerThanContext` (and truncation off or exhausted) | 400 | `invalid_request_error` / `context_length_exceeded` |
-| Content filtered (Phi Silica) | 200 with `finish_reason:"content_filter"` and empty content (matches OpenAI) |
+| Content filtered (Phi Silica) | 200 | `finish_reason:"content_filter"` and empty content (matches OpenAI) |
 | Backend not ready (loading/compiling) | 503 + `Retry-After: 10` | `server_error` / `model_loading` |
 | Backend failed to initialize | 503 | `server_error` / `model_unavailable` |
 | Queue full | 429 + `Retry-After` | `rate_limit_error` / `queue_full` |
-| Backend `Error` status mid-generation | non-stream: 502; stream: error event then `[DONE]` (see 2.4) |
+| Backend `Error` status mid-generation | non-stream: 502 | stream: error event then `[DONE]` (see 2.4) |
 
 **`POST /v1/completions`**: `prompt` (string or single-element array) → one user message → same
 pipeline → `text_completion` object; streaming emits `text` deltas.
@@ -210,6 +216,12 @@ pipeline → `text_completion` object; streaming emits `text` deltas.
 
 The model runtime wraps whatever we send as *one user turn* in its own chat template. So we render a
 transcript *inside* that turn. One `PromptTemplate` class owns the format; `--verbose` echoes it.
+[This is what shipped in chunk 3. D45 measured on hardware that rendering through this template is
+what makes the model follow a system prompt at all — under both native `CreateContext(system)` and
+folding the system text into the prompt body, the same instruction was obeyed; the bare, unrendered
+`/debug/generate` path still ignores its system prompt. This corrects the chunk 2 observation that
+Phi Silica ignores system prompts, which turned out to be a property of that unrendered path, not of
+the model.]
 
 ```
 <system text>                                   ← Phi Silica: via CreateContext(system); Aion: this block
@@ -373,9 +385,9 @@ build + tests green, an adversarial review pass, and updates to `DECISIONS.md` /
 
 | # | Chunk | Verifiable here (x64) | Verifiable only on the laptop |
 |---|---|---|---|
-| 1 | **Skeleton.** Solution, Core/exe/tests, config precedence, Kestrel host, `/healthz`, `/v1/models`, `ILanguageModelBackend` + `FakeBackend`, service verbs, `packaging/AppxManifest.xml` + `scripts/identity.ps1`, `DECISIONS.md`/`FUTURE.md` seeded. | build, tests, config tests | `identity.ps1` registers, PFN printed, `/healthz` shows `package_identity:true` |
-| 2 | **Phi Silica adapter (thin).** `PhiSilicaBackend`: WAR bootstrap, LAF unlock (optional token), ready-state, `CreateAsync`, `CreateContext(system)`, options mapping, status mapping, `GetUsablePromptLength`. `scripts/smoke.ps1` v1 (health + one non-streaming prompt). | compiles for ARM64 | smoke test; you can start it as soon as chunk 3 lands even without a token if the SDK channel doesn't need one |
-| 3 | **Non-streaming `/v1/chat/completions`.** Request DTOs + validation, `PromptTemplate`, pipeline (no cache yet: fresh context per request), usage estimate, error mapping, per-request log line, `--verbose`. | full test coverage via TestServer + FakeBackend | first real end-to-end on the NPU |
+| 1 | **Done.** **Skeleton.** Solution, Core/exe/tests, config precedence, Kestrel host, `/healthz`, `/v1/models`, `ILanguageModelBackend` + `FakeBackend`, service verbs, `packaging/AppxManifest.xml` + `scripts/identity.ps1`, `DECISIONS.md`/`FUTURE.md` seeded. | build, tests, config tests | `identity.ps1` registers, PFN printed, `/healthz` shows `package_identity:true` |
+| 2 | **Done.** **Phi Silica adapter (thin).** `PhiSilicaBackend`: WAR bootstrap, LAF unlock (optional token), ready-state, `CreateAsync`, `CreateContext(system)`, options mapping, status mapping, `GetUsablePromptLength`. `scripts/smoke.ps1` v1 (health + one non-streaming prompt). | compiles for ARM64 | smoke test; you can start it as soon as chunk 3 lands even without a token if the SDK channel doesn't need one |
+| 3 | **Done.** **Non-streaming `/v1/chat/completions`.** Request DTOs + validation, `PromptTemplate`, pipeline (no cache yet: fresh context per request), usage estimate, error mapping, per-request log line, `--verbose`. | full test coverage via TestServer + FakeBackend | first real end-to-end on the NPU |
 | 4 | **Streaming SSE.** Channel hand-off, chunk framing, `[DONE]`, mid-stream error event, disconnect → cancel + drain, keep-alive, `stream_options.include_usage`, `max_tokens`/`stop` client-side cut. | tests for framing, error, cancel timing | tok/s numbers, does `Cancel()` actually stop the NPU |
 | 5 | **Context cache + overflow.** LRU cache, prefix hashing, exclusive checkout, dispose-on-failure, `context_length_exceeded`, `--truncate-history` loop with preflight, pressure logging, header. | tests incl. leak counting on the fake | cache hit latency on real hardware |
 | 6 | **Aion adapter.** `FrameworkDependency` (from the sample), `AionBackend`, `nuget.config` + `nuget-local/` with the 1.0.0 nupkg, smoke script gains `-Backend aion`. | compiles for ARM64 | smoke test after `Bootstrap.ps1`-style framework install |

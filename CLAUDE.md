@@ -11,9 +11,11 @@ Two real backends behind one interface: **Phi Silica** (`Microsoft.Windows.AI.Te
 and **Aion Instruct Preview** (`AionInstructPreview.Text`, Microsoft's announced replacement), plus a
 **fake** backend for tests.
 
-Status: `docs/PLAN.md` is the signed-off design (read it first). Code lands in the chunk order listed
-there. `docs/DECISIONS.md` records why things are the way they are; `docs/FUTURE.md` holds deferred
-work. Update both whenever a chunk changes a choice or defers something.
+Status: `docs/PLAN.md` is the signed-off design (read it first). Chunks 1 to 3 of 8 are built and
+merged: skeleton, the Phi Silica adapter, and non-streaming `POST /v1/chat/completions` with the
+prompt template. Chunk 4 (streaming SSE) is next. Code lands in the chunk order listed there.
+`docs/DECISIONS.md` records why things are the way they are; `docs/FUTURE.md` holds deferred work.
+Update both whenever a chunk changes a choice or defers something.
 
 ## Machine reality
 
@@ -44,7 +46,7 @@ dotnet test --filter "DisplayName~Loading_backend"          # one test by name f
 dotnet run --project src/NpuBridge -- --backend fake --verbose   # run the exe (bin\Debug\...\win-arm64\NpuBridge.exe)
 .\scripts\identity.ps1 -Install                # sparse package identity for Phi Silica; installs the runtime dep; prints the PFN
 .\scripts\identity.ps1 -Status                 # is the package registered, which PFN
-.\scripts\smoke.ps1 -Backend phi-silica        # real NPU run: health, models, /debug/generate, (later) chat + tools
+.\scripts\smoke.ps1 -Backend phi-silica        # real NPU run: health, models, /debug/generate, chat (non-streaming); streaming/tools SKIP until their chunk
 NpuBridge.exe task install|status|uninstall    # logon task that starts Phi Silica with identity (install/uninstall elevated)
 NpuBridge.exe service install|start|stop|uninstall   # Windows service for aion/fake (elevated)
 ```
@@ -55,25 +57,36 @@ relaunch fails with "registered for <other folder>", that is why.
 Aion's SDK NuGet is not on nuget.org. It comes from the sample repo's GitHub release
 (`AionInstructPreview.Text.Framework.1.0.0.nupkg`) and lives in `nuget-local/`, wired by `nuget.config`.
 
+Chunk 3 introduced `--system-prompt-placement auto|native|prompt` (default `auto`, native when the
+backend advertises the capability) and made `POST /v1/chat/completions` real (non-streaming only;
+`stream: true` returns HTTP 400 until chunk 4).
+
 ## Architecture (see docs/PLAN.md §2 for the full version)
 
 Three projects, deliberately:
 
-- `src/NpuBridge.Core` (net10.0, AnyCPU, **no WinRT references**): everything with logic. OpenAI DTOs
-  and endpoint mapping (`FrameworkReference` to ASP.NET Core so `TestServer` covers HTTP framing),
-  message flattening + prompt template, context cache, generation scheduler, SSE writer, tool-call
-  emulation, `ILanguageModelBackend`, `FakeBackend`.
-- `src/NpuBridge` (net10.0-windows10.0.26100.0, ARM64 exe): `Program.cs`, config, service verbs,
-  `PhiSilicaBackend`, `AionBackend`, `FrameworkDependency`, packaging manifest.
+- `src/NpuBridge.Core` (net10.0, AnyCPU, **no WinRT references**): everything with logic. Built so
+  far: OpenAI DTOs and endpoint mapping (`FrameworkReference` to ASP.NET Core so `TestServer` covers
+  HTTP framing), message flattening + prompt template (`PromptTemplate`), `ILanguageModelBackend`,
+  `FakeBackend`. **Not built yet** — do not describe these as existing: context cache (chunk 5),
+  generation scheduler (chunk 8), SSE writer (chunk 4), tool-call emulation (chunk 7).
+- `src/NpuBridge` (net10.0-windows10.0.26100.0, ARM64 exe): `Program.cs`, config, service and task
+  verbs, `PhiSilicaBackend`, `PackageActivation`, packaging manifest. **Not built yet** — `AionBackend`
+  and `FrameworkDependency` are chunk 6.
 - `tests/NpuBridge.Tests` (xunit): runs against `FakeBackend` through `TestServer`.
 
 Keep logic out of the exe project; if it needs a test, it belongs in Core.
 
-### Request flow
+### Request flow (as of chunk 3)
 
-`HTTP → validate DTO → PromptTemplate (messages → system + transcript tail) → ContextCache lookup
-(prefix hash) → GenerationScheduler (single worker, bounded queue) → backend.GenerateAsync (Progress
-deltas via Channel) → tool-call parse (if tools) → response shaping (JSON or SSE) → usage estimate`.
+```text
+HTTP → validate DTO → backend readiness → PromptTemplate (messages → system + transcript tail)
+     → fresh context per request (backend.CreateContext, disposed in a finally)
+     → backend.GenerateAsync (Progress deltas) → JSON response shaping → usage estimate
+```
+
+No context cache (chunk 5), no scheduler (chunk 8), no streaming (chunk 4) and no tool-call parse
+(chunk 7) exist yet; every request gets its own context and nothing is queued.
 
 ### Backend contract facts that must not be "simplified" away
 
@@ -111,17 +124,58 @@ deltas via Channel) → tool-call parse (if tools) → response shaping (JSON or
   manifest lacks `systemAIModels`); `Progress` may deliver several tokens per callback.
 - `POST /debug/generate` sends one literal prompt straight into the backend and returns text + timing.
   Use it to check the model or the adapter without the prompt template; `scripts/smoke.ps1` relies on it.
+- **The model does follow a system prompt** when the transcript is rendered through `PromptTemplate`
+  (native `CreateContext(system)` or folded into the prompt body — both worked). Measured on this NPU:
+  system prompt "You are Ada. Always answer with exactly the two words: I am Ada." got "I am Ada."
+  under both placements. This reverses the chunk 2 belief that Phi Silica ignores system prompts —
+  that observation came from the bare `/debug/generate` path (still ignores its system prompt), not
+  from the model itself (D45).
+- **Token counts are estimated from characters, not progress callbacks, on both sides of `usage`.**
+  `completion_tokens = ceil(chars/4)`. Progress callbacks undercount: one measured generation had 29
+  callbacks for 367 characters (chars/4 = 92), a 3.17x undercount, because Phi Silica batches multiple
+  tokens per callback under speculative decoding (D44).
+- **A context is disposed on every path that creates one.** `/v1/chat/completions` creates its
+  context immediately before generating and disposes it in a `finally`, covering success, prompt
+  overflow, content filter, a backend `Error`/`Cancelled` status, a thrown exception, and a client
+  abort. Requests that fail before a context exists (bad JSON, validation failure, backend not ready,
+  a forced-placement conflict) never create one, so the guarantee is about paths that create a
+  context, not literally every request (D43).
+
+### Traps for the next chunks
+
+- **The rendered prompt is not a safe cache key.** Chunk 5 must not hash `PromptTemplate.Render`'s
+  output directly: turn markers like `[Assistant]` are not escaped, so a forged user turn can imitate
+  a real one; native placement leaves the system text out of the rendered prompt entirely, so two
+  conversations differing only in system prompt render identically; and the raw-passthrough branch (a
+  lone bare user message) has no markers at all, so a user message that happens to look like a
+  transcript collides with a real one. PLAN §2.5's key is `(system, turns)`, a different function from
+  what `Render` emits today — close that gap before caching lands.
+- **`ChatMessage` has no `tool_calls` field.** An assistant message with `content: null` and a
+  `tool_calls` array deserializes to an empty assistant turn today, silently dropping the tool call.
+  Chunk 7 needs the field to render the model its own protocol back; chunk 5's cache canonicalization
+  needs it so a client that re-serializes our tool-call output still hits the cache.
 
 ### Protocol rules
 
+Live today:
+
 - Errors use the OpenAI body `{"error":{"message","type","param","code"}}`. `PromptLargerThanContext`
-  is HTTP 400 with code `context_length_exceeded`; no silent truncation unless `--truncate-history`.
-- SSE: `chat.completion.chunk` per delta, `finish_reason` on the last real chunk, then `data: [DONE]`.
-  Mid-stream failures after headers emit a `data: {"error":...}` event, then `[DONE]`.
-- With `tools` present, the whole reply is buffered (keep-alive comments meanwhile) before deciding
-  between content and `tool_calls`. Tool-call JSON parsing is deliberately tolerant; the parser tests
-  are the main regression guard for this feature.
-- Token counts in `usage` are estimates (progress-callback count, chars/4 for prompts).
+  is HTTP 400 with code `context_length_exceeded`, and nothing is silently truncated.
+  `--truncate-history` is inert until chunk 5; when it lands it is the only switch that may drop turns
+  instead of returning that 400.
+- Token counts in `usage` are estimates: `ceil(chars/4)` on both `prompt_tokens` and
+  `completion_tokens` (D44).
+
+Agreed design for chunks that have not landed. These rules are what each chunk must implement; none of
+it is current behaviour, so do not describe it as working:
+
+- **Chunk 4 (SSE)** will emit one `chat.completion.chunk` per delta, `finish_reason` on the last real
+  chunk, then `data: [DONE]`. A mid-stream failure after the headers is to emit a `data: {"error":...}`
+  event, then `[DONE]`.
+- **Chunk 7 (tool-call emulation)** will buffer the whole reply when `tools` is present, sending
+  keep-alive comments meanwhile, before deciding between content and `tool_calls`. Tool-call JSON
+  parsing is to be deliberately tolerant, and its parser tests are meant to be the main regression
+  guard for the feature.
 
 ## Working method for this repo
 

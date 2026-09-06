@@ -85,7 +85,7 @@ public static class CommandLine
                                             context, or the top of the prompt text        [auto]
           --tool-emulation on|off           Emulated function calling          [on]
           --tool-schema compact|full        How tool schemas reach the prompt  [compact]
-          --context-window-hint <tokens>    Used only for pressure warnings    [4096]
+          --context-window-hint <tokens>    Declared context size; unused yet  [4096]
           --laf-token <token>               Phi Silica LAF token (prefer env NPU_BRIDGE_LAF_TOKEN)
           --laf-attestation <text>          Phi Silica LAF attestation (prefer env NPU_BRIDGE_LAF_ATTESTATION)
           --self-relaunch on|off            Relaunch via package activation when phi-silica lacks identity [on]
