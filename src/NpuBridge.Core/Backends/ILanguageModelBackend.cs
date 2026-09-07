@@ -11,6 +11,14 @@ namespace NpuBridge.Backends;
 ///   any other member, and may take minutes (first-run NPU compile).</item>
 ///   <item><see cref="GenerateAsync"/> invokes <c>onDelta</c> with the newest token only, on whatever
 ///   thread the runtime picks. Callers marshal; adapters never buffer.</item>
+///   <item><b><see cref="GenerationResult.Text"/> is the concatenation of the deltas delivered</b>, in
+///   order, for every status but <see cref="GenerationStatus.ContentFiltered"/> — where the runtime
+///   withheld the answer, the text is empty, and any deltas already delivered are the caller's problem
+///   rather than a contradiction. This is not a nicety: the client-side cut (D53) applies
+///   <c>max_tokens</c> and <c>stop</c> to the returned text on the non-streaming path and to the delta
+///   stream on the streaming one, and the two shapes only agree because those are the same characters.
+///   An adapter that summarised, re-tokenised or post-processed its text would make the same request
+///   answer differently depending on whether the client asked for a stream.</item>
 ///   <item>Cancellation is reported as <see cref="GenerationStatus.Cancelled"/> with the partial text.
 ///   Adapters catch the runtime's cancellation exception; they never let it escape.</item>
 ///   <item>Contexts are owned by the caller. A context whose generation ended in anything other than
@@ -101,7 +109,11 @@ public enum GenerationStatus
     Error,
 }
 
-/// <param name="Text">Accumulated text (partial when the status is not <see cref="GenerationStatus.Complete"/>).</param>
+/// <param name="Text">
+/// The deltas delivered to <c>onDelta</c>, concatenated in order — partial when the status is not
+/// <see cref="GenerationStatus.Complete"/>, empty when it is <see cref="GenerationStatus.ContentFiltered"/>.
+/// Callers rely on it being exactly those characters; see the contract on <see cref="ILanguageModelBackend"/>.
+/// </param>
 /// <param name="Status">Terminal status.</param>
 /// <param name="Detail">Backend-specific detail for logs and error bodies, e.g. the raw runtime status name.</param>
 public sealed record GenerationResult(string Text, GenerationStatus Status, string? Detail = null)

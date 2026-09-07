@@ -196,35 +196,39 @@ internal sealed class ChatCompletionsStreamEndpoint
                     new ChatCompletionDelta("assistant", string.Empty), finishReason: null), aborted).ConfigureAwait(false);
             }
 
+            // Content filtering is not a failure: the generation ran, and the client is told so with a
+            // finish reason rather than an error, exactly as on the JSON path — and, as there, it
+            // outranks the cut, so the two shapes label the same outcome the same way.
+            var filtered = result.Status is GenerationStatus.ContentFiltered or GenerationStatus.BlockedByPolicy;
+            var finishReason = filtered ? "content_filter" : cutter.FinishReason ?? "stop";
+
             // The held tail. The generation ended without a stop string forming, so the characters that
             // were withheld in case they were its first half are ordinary output after all and must go
             // out — losing them would silently truncate every reply whose last characters happened to
             // look like the start of a stop string. Empty when a limit fired: the text after a cut is
             // never sent, and empty as well when no stop string was configured, since nothing was held.
-            var tail = cutter.Flush();
+            //
+            // Not flushed at all when the runtime withheld the answer. The deltas already on the wire
+            // cannot be recalled, but these have not been written yet and the bridge now knows they were
+            // withheld: writing them here would be the one place a filtered reply gained text.
+            var tail = filtered ? string.Empty : cutter.Flush();
             if (tail.Length > 0)
             {
                 await sse.WriteChunkAsync(Chunk(requestId, created, model,
                     new ChatCompletionDelta(null, tail), finishReason: null), aborted).ConfigureAwait(false);
             }
 
-            // Content filtering is not a failure: the generation ran, and the client is told so with a
-            // finish reason rather than an error, exactly as on the JSON path — and, as there, it
-            // outranks the cut, so the two shapes label the same outcome the same way.
-            var finishReason = result.Status is GenerationStatus.ContentFiltered or GenerationStatus.BlockedByPolicy
-                ? "content_filter"
-                : cutter.FinishReason ?? "stop";
-
             // The last real chunk. Its delta is empty; it exists to carry finish_reason.
             await sse.WriteChunkAsync(Chunk(requestId, created, model,
                 new ChatCompletionDelta(null, null), finishReason), aborted).ConfigureAwait(false);
 
             // Usage, same chars/4 estimate on both sides as the non-streaming path (D44): the
-            // progress-callback count is not a token count. Once a limit has fired the backend's own
-            // text runs past the cut, so the count is of what the client was actually sent.
+            // progress-callback count is not a token count. Counted off the cutter rather than the
+            // backend's returned text, always: after a cut that text runs past what was sent, after a
+            // filtered reply it is empty while deltas did go out, and the cutter is the only thing that
+            // knows exactly how many characters reached the client.
             var promptTokens = ChatRequestMetrics.EstimateTokens(promptChars);
-            var completionTokens = ChatRequestMetrics.EstimateTokens(
-                cutter.IsCut ? cutter.ContentLength : result.Text.Length);
+            var completionTokens = ChatRequestMetrics.EstimateTokens(cutter.ContentLength);
 
             if (includeUsage)
             {

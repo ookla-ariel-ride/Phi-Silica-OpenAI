@@ -196,6 +196,46 @@ public class OutputCutTests
         Assert.Equal("length", capFirst.FinishReason);
     }
 
+    /// <summary>
+    /// The budget boundary falling inside a stop-string occurrence. <c>"abcd"</c> then <c>"EFGH"</c>
+    /// with <c>stop: "dEFG"</c> and a four-character budget: the stop string starts at character three,
+    /// one before the budget, and only completes four characters after it. A cap committed the moment
+    /// the budget was reached would answer <c>"abcd"</c> / <c>length</c> on the streaming path and
+    /// <c>"abc"</c> / <c>stop</c> on the JSON path — the two shapes disagreeing, and half a stop string
+    /// on the wire. The cap waits for the same lookahead the holdback waits for.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_stop_string_straddling_the_budget_boundary_wins_on_both_shapes(bool stream)
+    {
+        await using var host = await StartAsync(["abcd", "EFGH"]);
+
+        var completion = await CompleteAsync(host, stream, Body(stream, maxTokens: 1, stop: "dEFG"));
+
+        Assert.Equal("abc", completion.Content);
+        Assert.Equal("stop", completion.FinishReason);
+    }
+
+    /// <summary>
+    /// A reply that lands exactly on the budget was not truncated, so it finishes <c>stop</c>. The cap
+    /// fires when text is dropped, not when the budget is touched — and the streaming path cannot know
+    /// which of those happened until it has looked past the budget, which is the same wait.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_reply_landing_exactly_on_the_budget_finishes_with_stop(bool stream)
+    {
+        await using var host = await StartAsync(["abcd", "efgh"]);
+
+        var completion = await CompleteAsync(host, stream, Body(stream, maxTokens: 2));
+
+        Assert.Equal("abcdefgh", completion.Content);
+        Assert.Equal("stop", completion.FinishReason);
+        Assert.Equal(2, completion.CompletionTokens);
+    }
+
     /// <summary>An empty stop string would match at position 0 of everything; it is dropped, not honoured.</summary>
     [Theory]
     [InlineData(true)]
@@ -299,10 +339,12 @@ public class OutputCutTests
         Assert.Equal(8, completion.Content.Length);
         Assert.Equal("length", completion.FinishReason);
 
-        // Left to itself the responder yields 400 tokens over about two seconds. A handful get past the
-        // cut while the cancellation propagates; four hundred would mean it never propagated.
+        // Left to itself the responder yields 400 tokens over about two seconds. Some get past the cut
+        // while the cancellation propagates, and how many is thread-pool scheduling rather than
+        // behaviour, so the bound is loose on purpose: four hundred means it never propagated at all,
+        // which is the only thing this assertion is entitled to claim.
         var count = Volatile.Read(ref produced.Value);
-        Assert.True(count < 50, $"the generation produced {count} of 400 tokens; it was not cancelled");
+        Assert.True(count < 200, $"the generation produced {count} of 400 tokens; it was not cancelled");
 
         await WaitUntilAsync(() => fake.ActiveContexts == 0);
         Assert.Equal(1, fake.ContextsCreated);
@@ -322,6 +364,8 @@ public class OutputCutTests
         foreach (var body in new (int? Cap, object? Stop)[]
                  {
                      (2, null), (3, null), (100, null), (null, "world"), (null, "ZZZ"), (2, "world"), (100, "o, w"),
+                     // The budget boundary at character 12 lands inside "d! G", which starts at 11.
+                     (3, "d! G"),
                  })
         {
             var streamed = await CompleteAsync(host, stream: true, Body(true, maxTokens: body.Cap, stop: body.Stop));
@@ -389,6 +433,10 @@ public class OutputCutTests
     [InlineData(3, null)]
     [InlineData(3, "world")]
     [InlineData(1000, "world")]
+    // The budget boundary at character 12 lands inside "d! T", which starts at 11: the cap must wait
+    // for the stop string to prove itself rather than committing the moment the budget is reached.
+    [InlineData(3, "d! T")]
+    [InlineData(7, "d! T")]
     public void Every_split_of_the_same_text_cuts_to_the_same_place(int? cap, string? stop)
     {
         const string Text = "Hello, world! The END is nigh.";

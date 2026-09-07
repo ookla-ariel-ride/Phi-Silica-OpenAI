@@ -149,6 +149,21 @@ public sealed partial class FakeBackend : ILanguageModelBackend
             return new GenerationResult(string.Empty, GenerationStatus.PromptLargerThanContext, "fake: MaxPromptChars exceeded");
         }
 
+        // Held after the prompt verdict and before the first token, so a test can order events against
+        // the stream instead of against a clock: hold this until the response headers have been read and
+        // "the headers came before the first token" is an assertion rather than a stopwatch bound.
+        if (_options.FirstTokenGate is { } firstToken)
+        {
+            try
+            {
+                await firstToken.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return new GenerationResult(string.Empty, GenerationStatus.Cancelled, "fake: cancelled at the first-token gate");
+            }
+        }
+
         // While a CancellationGate is set and incomplete the token is not looked at: the generation keeps
         // producing and never returns Cancelled. That is what a runtime whose in-flight operation cannot
         // be stopped on demand looks like, and it is the case the caller's cancel-drain-dispose ordering
@@ -300,6 +315,14 @@ public sealed class FakeBackendOptions
     /// has already committed to a response shape — has no other way to arrange it.
     /// </summary>
     public TimeSpan StartDelay { get; set; }
+
+    /// <summary>
+    /// While set and incomplete, the generation waits after the prompt-length verdict and before its
+    /// first token. Unlike <see cref="FirstTokenDelay"/> it is released by the test rather than by a
+    /// clock, so an ordering ("the response headers were committed while no token existed yet") can be
+    /// asserted as an ordering instead of as a millisecond bound that a loaded machine will break.
+    /// </summary>
+    public TaskCompletionSource? FirstTokenGate { get; set; }
 
     /// <summary>
     /// While set and incomplete, the generation ignores the cancellation token entirely: it keeps

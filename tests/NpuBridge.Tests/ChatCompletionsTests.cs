@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -717,20 +718,35 @@ public class ChatCompletionsTests
         });
         await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture);
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(150));
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-            host.Client.PostAsJsonAsync(Path, Simple(), cts.Token));
+        using var cts = new CancellationTokenSource();
+        var post = host.Client.PostAsJsonAsync(Path, Simple(), cts.Token);
 
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (fake.ActiveContexts != 0 && DateTime.UtcNow < deadline)
-        {
-            await Task.Delay(20);
-        }
+        // Disconnect on an observed signal rather than after a fixed delay: on a loaded machine a
+        // stopwatch fires before the request has reached the handler, and then the test asserts nothing
+        // about a disconnect — it asserts that a request nobody started leaked no context. Waiting for
+        // the backend to have been called is the same thing the streaming disconnect tests do by
+        // reading a byte off the response first.
+        await WaitUntilAsync(() => fake.Calls.Count > 0);
+        await cts.CancelAsync();
 
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => post);
+
+        await WaitUntilAsync(() => fake.ActiveContexts == 0);
         Assert.Equal(fake.ContextsCreated, fake.ContextsDisposed);
         Assert.Equal(0, fake.ActiveContexts);
         Assert.Single(fake.Calls);
         Assert.DoesNotContain(capture.Records, r => r.Level >= LogLevel.Error);
+    }
+
+    /// <summary>Polls until the condition holds, or fails the test rather than hanging the suite.</summary>
+    private static async Task WaitUntilAsync(Func<bool> condition, [CallerArgumentExpression(nameof(condition))] string? description = null)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (!condition())
+        {
+            Assert.True(DateTime.UtcNow < deadline, $"timed out waiting for: {description}");
+            await Task.Delay(10);
+        }
     }
 
     private static BridgeOptions Options(SystemPromptPlacement placement) =>

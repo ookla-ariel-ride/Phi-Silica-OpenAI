@@ -124,6 +124,16 @@ internal readonly record struct CutResult(string Text, string? FinishReason);
 /// without a hit. Both failure modes of getting this wrong are worse than not having the feature: too
 /// little holdback leaks half a stop string, too much silently drops the end of an ordinary reply.
 ///
+/// <b>The cap waits on the same lookahead.</b> A stop string can straddle the budget boundary too —
+/// with <c>stop: "dEFG"</c> and a four-character budget, <c>"abcd"</c> then <c>"EFGH"</c> is a stop hit
+/// at character three, so the reply is <c>"abc"</c> and finishes <c>stop</c>, not <c>"abcd"</c>
+/// finishing <c>length</c>. Committing the cap the moment the budget is reached would decide that
+/// before the evidence arrived, and would disagree with the whole-text answer. So the cap is only
+/// committed once the text runs at least <see cref="OutputLimits.Holdback"/> characters past the
+/// budget, or the generation ends — the same rule, in the same place, as the holdback itself. It also
+/// means a reply that lands exactly on the budget finishes <c>stop</c>: the cap fires when text is
+/// dropped, not when the budget is touched.
+///
 /// Not thread-safe. The streaming path drives it from the single channel reader, never from the
 /// backend's callback thread; the non-streaming path locks its watcher instance.
 /// </summary>
@@ -159,12 +169,36 @@ internal sealed class OutputCutter
     public string Accept(string delta)
     {
         ArgumentNullException.ThrowIfNull(delta);
-        if (IsCut || delta.Length == 0)
+        return Consume(delta, final: false);
+    }
+
+    /// <summary>
+    /// The held tail, released because the generation ended without a stop string forming, or the last
+    /// piece before the cap when the reply stopped inside the lookahead window. Empty once a limit
+    /// fired — the text after a cut is deliberately never sent. Call once, after the last delta.
+    /// </summary>
+    public string Flush() => Consume(string.Empty, final: true);
+
+    /// <summary>
+    /// One decision point for both callers. <paramref name="final"/> says there is no more text coming,
+    /// which is the only thing that changes: every wait-for-more-evidence rule below is satisfied
+    /// immediately, because the evidence can no longer arrive.
+    /// </summary>
+    private string Consume(string incoming, bool final)
+    {
+        if (IsCut)
         {
             return string.Empty;
         }
 
-        _pending = _pending.Length == 0 ? delta : _pending + delta;
+        if (incoming.Length > 0)
+        {
+            _pending = _pending.Length == 0 ? incoming : _pending + incoming;
+        }
+        else if (!final && _pending.Length == 0)
+        {
+            return string.Empty;
+        }
 
         // Where the earliest stop string starts inside the pending window, relative to it. Everything
         // before the window was searched with the full lookahead already, which is precisely what the
@@ -181,29 +215,42 @@ internal sealed class OutputCutter
             }
         }
 
-        // The cap's cut point in the same relative coordinates. int.MaxValue stands in for "no cap":
-        // _pending can never be that long, so every comparison below falls the right way.
-        var capAt = _limits.MaxChars is { } max ? max - _emitted : int.MaxValue;
+        // The cap's cut point in the same relative coordinates; null when the request set no cap.
+        // Never negative: the release below never hands out more than capAt characters, so _emitted
+        // cannot pass the budget without a cut.
+        var capAt = _limits.MaxChars is { } max ? max - _emitted : (int?)null;
 
         int cutAt;
-        if (stopAt >= 0 && stopAt < capAt)
+        if (stopAt >= 0 && (capAt is null || stopAt < capAt))
         {
             // The stop string itself is excluded from the output, per the OpenAI contract.
             cutAt = stopAt;
             FinishReason = "stop";
         }
-        else if (_pending.Length >= capAt)
+        else if (capAt is { } cap && _pending.Length > cap && (final || _pending.Length - cap >= _limits.Holdback))
         {
-            // Cut exactly at the budget, so ceil(chars/4) lands on the cap rather than one above it. A
-            // stop string at exactly the budget is the same text either way, and is reported as the cap
-            // because the cap is what the text ran into first.
-            cutAt = capAt;
+            // Text was actually dropped (> cap, not >= cap) and no stop string can still turn out to
+            // start before the budget: a stop string beginning at cap-1 would end by cap-1+Holdback+1,
+            // so Holdback characters past the budget is exactly enough evidence to rule one out. Cutting
+            // at the budget itself makes ceil(chars/4) land on the cap rather than one above it.
+            cutAt = cap;
             FinishReason = "length";
+        }
+        else if (final)
+        {
+            // Nothing was cut and nothing more is coming, so the whole tail is ordinary output.
+            cutAt = _pending.Length;
         }
         else
         {
-            // No cut. Release everything that can no longer be the first half of a stop string.
+            // Release everything that can no longer be the first half of a stop string, and never more
+            // than the budget, which the branch above has not yet had the evidence to commit to.
             var safe = _pending.Length - _limits.Holdback;
+            if (capAt is { } room && safe > room)
+            {
+                safe = room;
+            }
+
             if (safe <= 0)
             {
                 return string.Empty;
@@ -219,22 +266,5 @@ internal sealed class OutputCutter
         _pending = string.Empty;
         _emitted += cutAt;
         return cut;
-    }
-
-    /// <summary>
-    /// The held tail, released because the generation ended without a stop string forming. Empty once a
-    /// limit fired — the text after the cut is deliberately never sent. Call once, after the last delta.
-    /// </summary>
-    public string Flush()
-    {
-        if (IsCut || _pending.Length == 0)
-        {
-            return string.Empty;
-        }
-
-        var rest = _pending;
-        _pending = string.Empty;
-        _emitted += rest.Length;
-        return rest;
     }
 }

@@ -602,36 +602,47 @@ public class ChatCompletionsStreamingTests
     /// The first comment is on a shorter clock than the ones after it, and for a different reason: the
     /// gap between comments is about proxy idle timeouts, but the wait before the *first* one is how long
     /// a client goes without response headers, and clients time that out sooner (httpx allows five
-    /// seconds by default). Here the first is due at 50 ms and the second not for another five seconds,
-    /// so a generation that stalls for 400 ms must produce exactly one — proving the two clocks are
-    /// separate and that the short one is the one that commits the headers.
+    /// seconds by default). Here the first is due at 50 ms and the second not for another thirty
+    /// seconds, so the headers must arrive while the generation still has no token to show — which is an
+    /// ordering, and is asserted as one. The backend is held at a gate this test releases only after it
+    /// has the headers in hand, so no wall-clock bound is involved: if the handler waited for the first
+    /// token instead of for the first keep-alive, the two would wait on each other and the send below
+    /// would never return. Its cancellation token is a deadlock guard, not a measurement.
     /// </summary>
     [Fact]
-    public async Task The_first_keep_alive_uses_its_own_shorter_delay_and_later_ones_use_the_interval()
+    public async Task The_first_keep_alive_commits_the_headers_before_the_first_token()
     {
+        var firstToken = new TaskCompletionSource();
         var fake = new FakeBackend(new FakeBackendOptions
         {
             Responder = _ => ["ok"],
-            StartDelay = TimeSpan.FromMilliseconds(400),
+            FirstTokenGate = firstToken,
         });
         await using var host = await BridgeTestHost.StartAsync(
             fake,
-            keepAliveInterval: TimeSpan.FromSeconds(5),
+            keepAliveInterval: TimeSpan.FromSeconds(30),
             firstKeepAliveDelay: TimeSpan.FromMilliseconds(50));
 
-        var started = Stopwatch.StartNew();
+        using var guard = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         using var request = new HttpRequestMessage(HttpMethod.Post, Path)
         {
             Content = JsonContent.Create(Body(model: "fake", stream: true)),
         };
-        var response = await host.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
-        var headers = started.Elapsed;
-        var body = await response.Content.ReadAsStringAsync();
+        var response = await host.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, guard.Token);
 
-        // The headers came back on the first keep-alive's clock, not on the generation's.
-        Assert.True(headers < TimeSpan.FromMilliseconds(350),
-            $"response headers took {headers.TotalMilliseconds:F0} ms while the first token was 400 ms away");
+        // Headers, and a backend that has produced nothing: the first keep-alive committed them, not the
+        // generation. The gate assertion guards this test's own construction — releasing it early would
+        // turn the ordering back into a race.
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("text/event-stream", response.Content.Headers.ContentType?.MediaType);
+        Assert.False(firstToken.Task.IsCompleted, "the first token was released before the headers were read");
 
+        firstToken.SetResult();
+        var body = await response.Content.ReadAsStringAsync(guard.Token);
+
+        // Exactly one: the interval is thirty seconds away, so only the shorter first delay can have
+        // produced a comment. The interval's own behaviour is covered by
+        // Keep_alive_comments_fill_the_wait_for_the_first_token_and_stop_once_it_arrives.
         Assert.Equal(1, body.Split('\n').Count(l => string.Equals(l, ": keep-alive", StringComparison.Ordinal)));
         Assert.EndsWith("data: [DONE]\n\n", body, StringComparison.Ordinal);
     }

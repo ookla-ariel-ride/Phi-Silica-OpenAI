@@ -353,13 +353,51 @@ that ends in `EN` while `END` is the stop string. One `OutputCutter` implements 
 runs the same class over the whole text in one call rather than a second implementation, so the two
 shapes cannot decide differently; a test asserts that across every split point of the same text.
 
+**The cap waits on that same lookahead**, which review caught and the first implementation got wrong. A
+stop string can straddle the budget boundary too: with `stop: "dEFG"` and a four-character budget,
+`"abcd"` then `"EFGH"` is a stop hit at character three, so the reply is `"abc"` finishing `stop`.
+Committing the cap the moment the budget was reached decided that before the evidence arrived — the
+streaming path answered `"abcd"` finishing `length`, disagreeing with the whole-text answer and putting
+half a stop string on the wire. The cap is now committed only once the text runs at least `Holdback`
+characters past the budget, or the generation ends: a stop string beginning one character before the
+budget ends by exactly `budget + Holdback`, so that is precisely enough to rule one out. The same
+deferral fixes a smaller wrong answer for free — **a reply landing exactly on the budget finishes
+`stop`, not `length`**, because the cap now fires when text is actually dropped rather than when the
+budget is touched, and the streaming path cannot tell those apart until it has looked past the budget.
+
+Two smaller consequences of the cut being a thing the bridge does rather than a thing the model does.
+The held tail is **not** flushed when the runtime reports the answer withheld: the deltas already on
+the wire cannot be recalled, but the held ones have not been written and the bridge now knows they were
+filtered, so writing them there would be the one place a filtered reply gained text. And streamed
+`usage` is counted off the cutter's content length unconditionally rather than off the backend's
+returned text, so it always describes what actually went out — after a cut that text runs past the wire,
+after a filtered reply it is empty while deltas did go out.
+
 One asymmetry survives, deliberately. The JSON path cuts the text the backend finally reports, while
 the streaming path cuts the concatenated deltas. Both adapters accumulate their deltas into exactly
 that text, so the two agree, but a future adapter whose reported text differs from its delta stream
-would make them differ too. The JSON path's early cancellation is therefore only an optimisation: the
+would make them differ too. That is now a **written requirement on `ILanguageModelBackend`** —
+`GenerationResult.Text` is the concatenation of the deltas delivered, `ContentFiltered` excepted —
+rather than an assumption two call sites happen to share, because chunk 6's Aion adapter has to inherit
+it and the interface is where its author will read it. The JSON path's early cancellation is therefore
+only an optimisation: the
 authoritative cut is applied afterwards to the final text, so the answer does not depend on which
 deltas the watcher happened to see before the cancellation landed. That cancellation is scheduled with
 `CancelAfter(TimeSpan.Zero)` rather than called outright, because it is raised on the backend's
 callback thread, and cancelling there can complete the generation's own `await` inline — re-entering
 the adapter while it is still inside the callback, where Phi Silica would spin for its five-second
 drain timeout waiting for a callback that cannot return until we do.
+
+**D54. Two tests were asserting on the clock; they assert on ordering now.** Review reproduced both
+failing under load, at roughly 8 in 10 and 6 in 10. The non-streaming client-disconnect test cancelled
+after a fixed 150 ms, which on a busy machine fires before the request reaches the handler — it then
+proved that a request nobody started leaked no context, and passed for the wrong reason or failed for
+one. It waits for the fake to have actually been called before disconnecting, which is what the
+streaming disconnect tests already did by reading a byte off the response first. The first-keep-alive
+test asserted that response headers arrived inside 350 ms while the first token was 400 ms away; the
+behaviour it is guarding is an ordering, not a duration, so `FakeBackendOptions` gains a
+`FirstTokenGate` (the third gate, after `InitGate` and `CancellationGate`) that holds the generation
+after the prompt-length verdict and before its first token. The test releases it only once it has the
+headers, so the ordering is a property of the arrangement; the send's cancellation token is a deadlock
+guard, not a measurement. Verified by running the whole suite twenty times in parallel, which pushed
+individual runs from 2 s to 18 s and stayed green.
