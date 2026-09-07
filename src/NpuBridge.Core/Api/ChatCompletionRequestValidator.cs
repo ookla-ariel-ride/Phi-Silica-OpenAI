@@ -97,9 +97,26 @@ public static class ChatCompletionRequestValidator
             return ChatCompletionValidationResult.Invalid("n greater than 1 is not supported.", param: "n");
         }
 
+        // A cap of zero or less asks for no completion at all. OpenAI rejects it rather than returning an
+        // empty reply with finish_reason "length", and so do we: a client that computed a negative budget
+        // has a bug, and answering it with an empty string hides that.
+        if (request.MaxTokens is { } maxTokens and <= 0)
+        {
+            return ChatCompletionValidationResult.Invalid(
+                $"max_tokens must be a positive integer; got {maxTokens}.", param: "max_tokens");
+        }
+
+        if (request.MaxCompletionTokens is { } maxCompletionTokens and <= 0)
+        {
+            return ChatCompletionValidationResult.Invalid(
+                $"max_completion_tokens must be a positive integer; got {maxCompletionTokens}.",
+                param: "max_completion_tokens");
+        }
+
         // `stream` is deliberately absent from every list here: chunk 4 implements it, so it is neither
         // an error (D46 recorded the rejection as temporary) nor an ignored parameter. `stream_options`
-        // rides with it and is likewise honoured, not ignored.
+        // rides with it and is likewise honoured, not ignored. So are `max_tokens`,
+        // `max_completion_tokens` and `stop` since chunk 4 task 4 (D53); OutputLimits applies them.
         return ChatCompletionValidationResult.Valid(CollectIgnoredParameters(request));
     }
 
@@ -118,9 +135,6 @@ public static class ChatCompletionRequestValidator
         AddIfPresent(request.Temperature is not null, "temperature");
         AddIfPresent(request.TopP is not null, "top_p");
         AddIfPresent(request.TopK is not null, "top_k");
-        AddIfPresent(request.MaxTokens is not null, "max_tokens");
-        AddIfPresent(request.MaxCompletionTokens is not null, "max_completion_tokens");
-        AddIfPresent(request.Stop is not null, "stop");
         AddIfPresent(request.Tools is not null, "tools");
         AddIfPresent(request.ToolChoice is not null, "tool_choice");
         AddIfPresent(request.Logprobs is not null, "logprobs");

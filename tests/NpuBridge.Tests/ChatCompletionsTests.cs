@@ -605,6 +605,10 @@ public class ChatCompletionsTests
         var body = new
         {
             model = "fake",
+            seed = 42,
+            user = "u-123",
+            // Implemented by the client-side cut since chunk 4 (D53), so they must not be warned about
+            // even though they sit right next to the two that still are.
             max_tokens = 64,
             stop = "END",
             messages = new[] { new { role = "user", content = "hi" } },
@@ -613,8 +617,10 @@ public class ChatCompletionsTests
         await host.Client.PostAsJsonAsync(Path, body);
 
         var warnings = capture.Records.Where(r => r.Level == LogLevel.Warning).ToList();
-        Assert.Single(warnings, w => w.Message.Contains("max_tokens", StringComparison.Ordinal));
-        Assert.Single(warnings, w => w.Message.Contains("stop", StringComparison.Ordinal));
+        Assert.Single(warnings, w => w.Message.Contains("seed", StringComparison.Ordinal));
+        Assert.Single(warnings, w => w.Message.Contains("user", StringComparison.Ordinal));
+        Assert.DoesNotContain(warnings, w => w.Message.Contains("max_tokens", StringComparison.Ordinal));
+        Assert.DoesNotContain(warnings, w => w.Message.Contains("stop", StringComparison.Ordinal));
         // temperature was never sent, so it is never warned about.
         Assert.DoesNotContain(warnings, w => w.Message.Contains("temperature", StringComparison.Ordinal));
     }

@@ -20,6 +20,7 @@ namespace NpuBridge.Api;
 /// <param name="Rendered">The prompt template's output, kept whole so callers can log the placement.</param>
 /// <param name="NativeSystem">System text to hand to <c>CreateContext</c>, or null when it was folded into the prompt.</param>
 /// <param name="Sampling">Already normalised: null when the backend cannot sample or the request set nothing.</param>
+/// <param name="Limits">The client-side cut: <c>max_tokens</c>/<c>max_completion_tokens</c> and <c>stop</c>.</param>
 /// <param name="PromptChars">Characters the model actually sees: the prompt, plus native system text.</param>
 internal sealed record PreparedChatRequest(
     string RequestId,
@@ -29,6 +30,7 @@ internal sealed record PreparedChatRequest(
     RenderedPrompt Rendered,
     string? NativeSystem,
     SamplingOptions? Sampling,
+    OutputLimits Limits,
     int PromptChars);
 
 /// <summary>
@@ -210,6 +212,7 @@ internal static class ChatRequestPreparer
                 Rendered: rendered,
                 NativeSystem: nativeSystem,
                 Sampling: sampling is null || sampling.IsEmpty ? null : sampling,
+                Limits: OutputLimits.From(request),
                 PromptChars: promptChars));
         }
         catch (Exception ex) when (ex is not OperationCanceledException)

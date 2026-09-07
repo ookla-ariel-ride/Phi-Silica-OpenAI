@@ -90,12 +90,24 @@ internal sealed class ChatCompletionsEndpoint
         var backend = prepared.Backend;
         var promptChars = prepared.PromptChars;
 
+        var limits = prepared.Limits;
+
+        // Cancelled either by the client going away or by the client-side cut deciding it has enough
+        // text. Only the latter needs a source of the handler's own; the former arrives through the link.
+        using var generationCts = CancellationTokenSource.CreateLinkedTokenSource(http.RequestAborted);
+
         IModelContext? context = null;
         try
         {
             var stopwatch = Stopwatch.StartNew();
             long firstTokenTicks = 0;
             var callbacks = 0;
+
+            // Watches the text as it arrives purely to decide when to stop the generation early; the
+            // authoritative cut is applied below to the text the backend finally reports, with the same
+            // OutputCutter, so the answer does not depend on which deltas the watcher happened to see.
+            // Null when the request set no limits, which is the ordinary case and costs nothing.
+            var watcher = limits.IsEmpty ? null : new OutputCutter(limits);
 
             // 7. A fresh context per request, disposed in the finally: D11 says a context whose generation
             // did not end Complete has indeterminate state, and there is no cache to return it to yet.
@@ -105,14 +117,42 @@ internal sealed class ChatCompletionsEndpoint
                 context,
                 prepared.Rendered.Prompt,
                 prepared.Sampling,
-                _ =>
+                delta =>
                 {
                     if (Interlocked.Increment(ref callbacks) == 1)
                     {
                         Interlocked.Exchange(ref firstTokenTicks, stopwatch.ElapsedTicks);
                     }
+
+                    if (watcher is null)
+                    {
+                        return;
+                    }
+
+                    bool cut;
+                    lock (watcher)
+                    {
+                        if (watcher.IsCut)
+                        {
+                            return;
+                        }
+
+                        watcher.Accept(delta);
+                        cut = watcher.IsCut;
+                    }
+
+                    if (cut)
+                    {
+                        // Deliberately not a straight Cancel(): this runs on the backend's callback
+                        // thread, and cancelling there can complete the generation's own await inline —
+                        // re-entering the adapter while it is still inside this callback (Phi Silica
+                        // then spins draining a callback that cannot finish until we return). Zero delay
+                        // moves the cancellation onto a timer thread, which costs a delta or two of
+                        // overshoot and nothing else: the cut itself is applied to the final text.
+                        generationCts.CancelAfter(TimeSpan.Zero);
+                    }
                 },
-                http.RequestAborted).ConfigureAwait(false);
+                generationCts.Token).ConfigureAwait(false);
 
             stopwatch.Stop();
             var totalMs = stopwatch.Elapsed.TotalMilliseconds;
@@ -134,16 +174,26 @@ internal sealed class ChatCompletionsEndpoint
                 return Results.Empty;
             }
 
-            if (GenerationFailure.FromStatus(result) is { } failure)
+            // 8a. The client-side cut, before the status mapping. A generation this handler cancelled
+            // because the cap or a stop string was reached comes back Cancelled, which is a 502 for any
+            // other reason; the cut is what tells the two apart, and it is decided by the text rather
+            // than by the status so that a cut which landed on the last delta reads the same either way.
+            var cut = limits.Cut(result.Text);
+
+            // Filtering outranks the cut: it is the one status that means "do not hand this text on",
+            // and a cut is not a licence to. Spelled out by name rather than as "not Complete", because
+            // Cancelled now reaches here legitimately whenever a limit fired.
+            var filtered = result.Status is GenerationStatus.ContentFiltered or GenerationStatus.BlockedByPolicy;
+
+            if (!filtered && cut.FinishReason is null && GenerationFailure.FromStatus(result) is { } failure)
             {
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
                     status: result.Status.ToString(), finish: "-", httpStatus: failure.StatusCode);
                 return failure.ToResult();
             }
 
-            var filtered = result.Status != GenerationStatus.Complete;
-            var content = filtered ? string.Empty : result.Text;
-            var finishReason = filtered ? "content_filter" : "stop";
+            var content = filtered ? string.Empty : cut.Text;
+            var finishReason = filtered ? "content_filter" : cut.FinishReason ?? "stop";
 
             // 9. Usage. Both numbers are chars/4 estimates, not a tokenizer's output; the progress
             // callback count is not usable (Phi Silica batches several tokens per callback).

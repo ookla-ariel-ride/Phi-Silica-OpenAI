@@ -72,6 +72,12 @@ internal sealed class ChatCompletionsStreamEndpoint
         var sse = new SseStream(http.Response);
         var stopwatch = Stopwatch.StartNew();
 
+        // The client-side cut. It runs here, on the single channel reader, and never on the backend's
+        // callback thread: it decides what goes on the wire, so it belongs on the side of the hand-off
+        // that owns the response. Holding text back is the whole difference from the JSON path — a
+        // stop string can straddle two deltas, and a delta already written cannot be recalled.
+        var cutter = new OutputCutter(prepared.Limits);
+
         // Not the same question as "has anything been written": a keep-alive comment starts the stream
         // without opening the assistant message, and a reply with no deltas at all still needs its role
         // chunk before the finish chunk.
@@ -127,8 +133,24 @@ internal sealed class ChatCompletionsStreamEndpoint
                 // so that `generation` is always reached and always drained below.
                 await foreach (var delta in channel.Reader.ReadAllAsync(CancellationToken.None).ConfigureAwait(false))
                 {
-                    await sse.WriteChunkAsync(Chunk(requestId, created, model,
-                        new ChatCompletionDelta(null, delta), finishReason: null), aborted).ConfigureAwait(false);
+                    // What the cutter releases, not the delta: with stop strings configured this lags
+                    // the backend by up to Holdback characters, and on the delta that trips a limit it
+                    // is the truncated prefix.
+                    var release = cutter.Accept(delta);
+                    if (release.Length > 0)
+                    {
+                        await sse.WriteChunkAsync(Chunk(requestId, created, model,
+                            new ChatCompletionDelta(null, release), finishReason: null), aborted).ConfigureAwait(false);
+                    }
+
+                    if (cutter.IsCut)
+                    {
+                        // Stop consuming and stop the model. Whatever is still queued is discarded; the
+                        // finally's cancel-drain-dispose then runs unchanged, so the context is still
+                        // disposed exactly once and only after the generation task has ended.
+                        await generationCts.CancelAsync().ConfigureAwait(false);
+                        break;
+                    }
                 }
             }
 
@@ -153,7 +175,10 @@ internal sealed class ChatCompletionsStreamEndpoint
                 return null;
             }
 
-            if (GenerationFailure.FromStatus(result) is { } failure)
+            // A generation this handler cancelled because a limit fired reports Cancelled, which is a
+            // 502 for every other reason. The cut is what tells those apart, so it is consulted first —
+            // as it is on the JSON path, in the same order, for the same reason.
+            if (!cutter.IsCut && GenerationFailure.FromStatus(result) is { } failure)
             {
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
                     status: result.Status.ToString(), finish: "-",
@@ -161,26 +186,45 @@ internal sealed class ChatCompletionsStreamEndpoint
                 return await FailAsync(sse, failure, logger, requestId, aborted).ConfigureAwait(false);
             }
 
-            // Content filtering is not a failure: the generation ran, and the client is told so with a
-            // finish reason rather than an error, exactly as on the JSON path.
-            var finishReason = result.Status == GenerationStatus.Complete ? "stop" : "content_filter";
-
             if (!roleSent)
             {
                 // Not one delta arrived — an empty reply, or a filtered one — so the role chunk has not
-                // gone out yet. It still has to: a client builds the assistant message from it.
+                // gone out yet. It still has to: a client builds the assistant message from it, and it
+                // has to precede the tail chunk below.
+                roleSent = true;
                 await sse.WriteChunkAsync(Chunk(requestId, created, model,
                     new ChatCompletionDelta("assistant", string.Empty), finishReason: null), aborted).ConfigureAwait(false);
             }
+
+            // The held tail. The generation ended without a stop string forming, so the characters that
+            // were withheld in case they were its first half are ordinary output after all and must go
+            // out — losing them would silently truncate every reply whose last characters happened to
+            // look like the start of a stop string. Empty when a limit fired: the text after a cut is
+            // never sent, and empty as well when no stop string was configured, since nothing was held.
+            var tail = cutter.Flush();
+            if (tail.Length > 0)
+            {
+                await sse.WriteChunkAsync(Chunk(requestId, created, model,
+                    new ChatCompletionDelta(null, tail), finishReason: null), aborted).ConfigureAwait(false);
+            }
+
+            // Content filtering is not a failure: the generation ran, and the client is told so with a
+            // finish reason rather than an error, exactly as on the JSON path — and, as there, it
+            // outranks the cut, so the two shapes label the same outcome the same way.
+            var finishReason = result.Status is GenerationStatus.ContentFiltered or GenerationStatus.BlockedByPolicy
+                ? "content_filter"
+                : cutter.FinishReason ?? "stop";
 
             // The last real chunk. Its delta is empty; it exists to carry finish_reason.
             await sse.WriteChunkAsync(Chunk(requestId, created, model,
                 new ChatCompletionDelta(null, null), finishReason), aborted).ConfigureAwait(false);
 
             // Usage, same chars/4 estimate on both sides as the non-streaming path (D44): the
-            // progress-callback count is not a token count.
+            // progress-callback count is not a token count. Once a limit has fired the backend's own
+            // text runs past the cut, so the count is of what the client was actually sent.
             var promptTokens = ChatRequestMetrics.EstimateTokens(promptChars);
-            var completionTokens = ChatRequestMetrics.EstimateTokens(result.Text.Length);
+            var completionTokens = ChatRequestMetrics.EstimateTokens(
+                cutter.IsCut ? cutter.ContentLength : result.Text.Length);
 
             if (includeUsage)
             {

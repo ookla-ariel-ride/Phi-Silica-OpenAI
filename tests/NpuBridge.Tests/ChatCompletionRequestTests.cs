@@ -273,11 +273,17 @@ public class ChatCompletionRequestTests
         Assert.Equal(
             new[]
             {
-                "temperature", "top_p", "top_k", "max_tokens", "max_completion_tokens", "stop",
+                "temperature", "top_p", "top_k",
                 "tools", "tool_choice", "logprobs", "response_format", "seed",
                 "presence_penalty", "frequency_penalty", "user",
             },
             result.IgnoredParameters);
+
+        // The body above still carries all three, and they are deliberately absent from the list: the
+        // client-side cut implements them (D53), so a request that sets one is not warned about it.
+        Assert.DoesNotContain("max_tokens", result.IgnoredParameters, StringComparer.Ordinal);
+        Assert.DoesNotContain("max_completion_tokens", result.IgnoredParameters, StringComparer.Ordinal);
+        Assert.DoesNotContain("stop", result.IgnoredParameters, StringComparer.Ordinal);
     }
 
     [Fact]

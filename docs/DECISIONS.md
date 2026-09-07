@@ -319,3 +319,47 @@ by the time this code runs, and the overflow check is expected to be cheap. A re
 this repository's own rule is to claim only what the smoke test showed, and no smoke step measures that
 latency yet. `scripts/smoke.ps1` gains one, and this entry gets the number when it exists. Until then,
 treat 1 second as provisional and do not lower it.
+
+**D53. `max_tokens`, `max_completion_tokens` and `stop` are cut client-side, and the cap is measured
+in characters.** Neither Windows runtime offers either feature: Phi Silica's `LanguageModelOptions`
+carries sampling knobs and nothing else, and Aion has no options object at all. So the bridge watches
+the text as it arrives and cuts it itself, on both response shapes. They leave D47's accepted-and-
+ignored list as of this chunk and no longer warn.
+
+Both are **best effort** in one specific sense worth being plain about: the model is not steered by
+them, it is interrupted by them. Every token up to the cut is generated either way, so a cap saves
+latency, not work the model already did, and a stop string is removed from the reply rather than never
+produced. A cut cancels the generation's own linked token, which is why `Cancelled` is no longer
+automatically the 502 of D51's exit path: the cut is consulted before the status mapping on both
+shapes, and content filtering still outranks both, because that status means "do not hand this text
+on" and a cut is not a licence to.
+
+The cap is a **character** budget, `cap * 4`, and not a count of progress callbacks. `usage` reports
+`ceil(chars/4)` (D44) and a callback is several tokens under speculative decoding, so a cap counted in
+callbacks would let a reply report roughly three times the completion tokens the client allowed — a
+response contradicting its own usage block. Cutting at exactly `cap * 4` characters makes
+`completion_tokens` land on the cap and never above it. A zero or negative cap is a 400 rather than an
+empty completion; when both fields are present the smaller wins; an empty stop string is dropped
+rather than honoured, since it matches at position 0 of everything.
+
+The streaming path has a problem the JSON path does not: text already written cannot be recalled, and
+a stop string can straddle two deltas — `"EN"` then `"D"` is a hit on `"END"` that neither delta
+contains. So the streamed reply is always **held back by the longest stop string's length minus one
+character**, and those characters are released only by further text proving no stop string starts
+inside them, or by a flush when the generation ends without a hit. Both ways of getting the size wrong
+are worse than not having the feature — too little leaks half a stop string to the client, too much
+silently drops the end of an ordinary reply — so both are tested directly, the second with a reply
+that ends in `EN` while `END` is the stop string. One `OutputCutter` implements it, and the JSON path
+runs the same class over the whole text in one call rather than a second implementation, so the two
+shapes cannot decide differently; a test asserts that across every split point of the same text.
+
+One asymmetry survives, deliberately. The JSON path cuts the text the backend finally reports, while
+the streaming path cuts the concatenated deltas. Both adapters accumulate their deltas into exactly
+that text, so the two agree, but a future adapter whose reported text differs from its delta stream
+would make them differ too. The JSON path's early cancellation is therefore only an optimisation: the
+authoritative cut is applied afterwards to the final text, so the answer does not depend on which
+deltas the watcher happened to see before the cancellation landed. That cancellation is scheduled with
+`CancelAfter(TimeSpan.Zero)` rather than called outright, because it is raised on the backend's
+callback thread, and cancelling there can complete the generation's own `await` inline — re-entering
+the adapter while it is still inside the callback, where Phi Silica would spin for its five-second
+drain timeout waiting for a callback that cannot return until we do.
