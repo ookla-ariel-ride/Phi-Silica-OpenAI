@@ -279,3 +279,32 @@ with the same error. Dormant on both shipping backends, which advertise the capa
 rejected all traffic in chunk 6, where Aion has no native system context at all. Verified after the
 fix that `auto` and `native` still deliver the system text through the native context and `prompt`
 still folds it into the prompt body.
+
+**D51. A streamed generation is cancelled, drained, and only then has its context disposed.** Found by
+review of the chunk 4 streaming path. A response write that throws — which is what a client disconnect
+looks like — unwound straight into the `finally` that disposes the model context while the generation
+task was still running against it. On the real backends that is a use-after-dispose on a live WinRT
+handle, not merely an unobserved task; D11 already says a context outlives nothing but its own
+operation. The exit is now ordered: cancel the generation's own linked token, await the task to
+completion however it ends, then dispose. Awaiting a cancelled operation is the drain the plan asks for
+in the scheduler ("still awaits the op to completion before picking the next job"), and it is why the
+generation gets a linked source of its own rather than the request's token. The fake backend grew a
+`CancellationGate` so a test can hold a generation open after the client has gone — a runtime whose
+in-flight operation cannot be stopped on demand is exactly the case this ordering exists for, and
+without it the fake stops so promptly that the window cannot be observed. Removing the drain makes that
+test fail; that was checked, not assumed.
+
+**D52. The stream's headers are committed by the first frame, not by the handler's first line.** Also
+found by review: an over-length prompt reached a streaming client as HTTP 200, an empty reply and
+`finish_reason: "stop"` — the model reported as having answered when it refused — while the JSON path
+correctly returned 400 `context_length_exceeded`. Writing the role chunk up front is what forced that:
+it spent the status line before the outcome was known. Nothing is written now until either the first
+delta arrives or the keep-alive interval elapses, so a failure discovered before the first token keeps
+the ordinary status and the ordinary body (`GenerationFailure` produces both forms, so the two response
+shapes cannot drift), and only a failure after the first byte travels as `data: {"error":...}` followed
+by `[DONE]`. `stop` is unreachable for a prompt that did not fit, on either side of that boundary.
+Content filtering is unchanged and is not an error: a successful response with a `content_filter`
+finish. The cost is that a client sees no response headers until the first token or the first
+keep-alive, which bounds the wait at the keep-alive interval — 15 seconds by default, and the reason
+that interval is a `StreamingOptions` singleton rather than a constant is that a test drives it in
+milliseconds instead of sleeping through it.

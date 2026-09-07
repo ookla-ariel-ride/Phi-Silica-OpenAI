@@ -18,8 +18,19 @@ public static class OpenAiError
     public const string RateLimit = "rate_limit_error";
     public const string Server = "server_error";
 
+    /// <summary>
+    /// The envelope on its own, without an HTTP status wrapped around it. The streaming path needs this:
+    /// once the headers are committed an error has to travel inside the stream as a <c>data:</c> frame,
+    /// and it has to be the same object the JSON path would have returned, not a lookalike.
+    /// </summary>
+    public static OpenAiErrorBody Body(string message, string type, string? code = null, string? param = null) =>
+        new(new OpenAiErrorDetail(message, type, param, code));
+
+    public static IResult Result(int statusCode, OpenAiErrorBody body) =>
+        Results.Json(body, JsonDefaults.Options, statusCode: statusCode);
+
     public static IResult Result(int statusCode, string message, string type, string? code = null, string? param = null) =>
-        Results.Json(new OpenAiErrorBody(new OpenAiErrorDetail(message, type, param, code)), JsonDefaults.Options, statusCode: statusCode);
+        Result(statusCode, Body(message, type, code, param));
 
     public static IResult BadRequest(string message, string? code = null, string? param = null) =>
         Result(StatusCodes.Status400BadRequest, message, InvalidRequest, code, param);

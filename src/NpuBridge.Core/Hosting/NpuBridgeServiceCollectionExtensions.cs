@@ -10,8 +10,9 @@ namespace NpuBridge.Hosting;
 public static class NpuBridgeServiceCollectionExtensions
 {
     /// <summary>
-    /// Registers everything the endpoints need. Register a custom <see cref="IProcessIdentity"/> or
-    /// <see cref="TimeProvider"/> <em>before</em> calling this to override the defaults.
+    /// Registers everything the endpoints need. Register a custom <see cref="IProcessIdentity"/>,
+    /// <see cref="TimeProvider"/> or <see cref="StreamingOptions"/> <em>before</em> calling this to
+    /// override the defaults.
     /// </summary>
     public static IServiceCollection AddNpuBridgeCore(
         this IServiceCollection services,
@@ -23,6 +24,10 @@ public static class NpuBridgeServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(backendFactory);
 
         services.AddSingleton(options);
+
+        // TryAdd, like TimeProvider: a caller (a test) that wants a keep-alive it can drive in
+        // milliseconds registers its own before calling this.
+        services.TryAddSingleton<StreamingOptions>();
         services.TryAddSingleton(TimeProvider.System);
         services.TryAddSingleton<IProcessIdentity>(NoProcessIdentity.Instance);
         services.TryAddSingleton<IgnoredParameterLog>();

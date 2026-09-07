@@ -129,10 +129,31 @@ public sealed partial class FakeBackend : ILanguageModelBackend
             _calls.Add(request);
         }
 
+        // Before any verdict, including whether the prompt fits: a real runtime answers that instantly,
+        // and a test that needs the answer to arrive late (after a caller has committed to a response)
+        // has no other way to arrange it.
+        if (_options.StartDelay > TimeSpan.Zero)
+        {
+            try
+            {
+                await Task.Delay(_options.StartDelay, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return new GenerationResult(string.Empty, GenerationStatus.Cancelled, "fake: cancelled before starting");
+            }
+        }
+
         if (_options.MaxPromptChars is { } max && fake.TotalChars + prompt.Length > max)
         {
             return new GenerationResult(string.Empty, GenerationStatus.PromptLargerThanContext, "fake: MaxPromptChars exceeded");
         }
+
+        // While a CancellationGate is set and incomplete the token is not looked at: the generation keeps
+        // producing and never returns Cancelled. That is what a runtime whose in-flight operation cannot
+        // be stopped on demand looks like, and it is the case the caller's cancel-drain-dispose ordering
+        // exists for -- disposing the context while this is still running is a use-after-dispose.
+        bool ObservesCancellation() => _options.CancellationGate?.Task.IsCompleted ?? true;
 
         var tokens = (_options.Responder ?? DefaultResponder)(request);
         var text = new StringBuilder();
@@ -140,7 +161,7 @@ public sealed partial class FakeBackend : ILanguageModelBackend
 
         foreach (var token in tokens)
         {
-            if (cancellationToken.IsCancellationRequested)
+            if (cancellationToken.IsCancellationRequested && ObservesCancellation())
             {
                 return new GenerationResult(text.ToString(), GenerationStatus.Cancelled, "fake: cancelled before token");
             }
@@ -160,7 +181,8 @@ public sealed partial class FakeBackend : ILanguageModelBackend
             {
                 try
                 {
-                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(delay, ObservesCancellation() ? cancellationToken : CancellationToken.None)
+                        .ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
@@ -271,6 +293,21 @@ public sealed class FakeBackendOptions
 
     /// <summary>Extra delay before the first token only (simulates prompt processing / slow TTFT).</summary>
     public TimeSpan FirstTokenDelay { get; set; }
+
+    /// <summary>
+    /// Delay before the generation decides anything at all, the prompt-length verdict included. Real
+    /// runtimes answer that instantly; a test that needs a slow verdict — one that lands after the caller
+    /// has already committed to a response shape — has no other way to arrange it.
+    /// </summary>
+    public TimeSpan StartDelay { get; set; }
+
+    /// <summary>
+    /// While set and incomplete, the generation ignores the cancellation token entirely: it keeps
+    /// producing deltas and never reports <see cref="GenerationStatus.Cancelled"/>. Models a runtime
+    /// whose in-flight operation cannot be stopped on demand, so that a test can hold a generation open
+    /// after its caller has given up and check that the context is not disposed underneath it.
+    /// </summary>
+    public TaskCompletionSource? CancellationGate { get; set; }
 
     /// <summary>
     /// Invoke <c>onDelta</c> on a thread-pool thread like the WinRT Progress callback does (default),

@@ -53,6 +53,7 @@ internal sealed class ChatCompletionsEndpoint
         HttpContext http,
         BackendLifecycle lifecycle,
         BridgeOptions options,
+        StreamingOptions streaming,
         IgnoredParameterLog ignoredLog,
         TimeProvider time,
         ILogger<ChatCompletionsEndpoint> logger,
@@ -74,13 +75,14 @@ internal sealed class ChatCompletionsEndpoint
 
         // The branch. Everything above ran identically for both shapes; everything below is the
         // single-JSON-object generation phase, whose SSE sibling lives in ChatCompletionsStreamEndpoint.
-        // The streaming phase writes the response itself, so the handler has nothing left to return.
+        // The streaming phase usually writes the response itself and leaves nothing to return; it
+        // returns a result only when it failed before writing a byte, and then the status line is still
+        // ours to set, so the client gets the ordinary error instead of a 200 stream that says "stop".
         if (prepared.Request.Stream == true)
         {
-            await ChatCompletionsStreamEndpoint
-                .StreamAsync(http, prepared, options, time, streamLogger)
-                .ConfigureAwait(false);
-            return Results.Empty;
+            return await ChatCompletionsStreamEndpoint
+                .StreamAsync(http, prepared, options, streaming, time, streamLogger)
+                .ConfigureAwait(false) ?? Results.Empty;
         }
 
         var requestId = prepared.RequestId;
@@ -122,41 +124,21 @@ internal sealed class ChatCompletionsEndpoint
                     requestId, result.Status, result.Text);
             }
 
-            // 8. Status → response or error.
-            switch (result.Status)
+            // 8. Status → response or error. The mapping itself lives in GenerationFailure, shared with
+            // the streaming path so the two shapes cannot describe the same condition differently.
+            if (result.Status == GenerationStatus.Cancelled && http.RequestAborted.IsCancellationRequested)
             {
-                case GenerationStatus.Complete:
-                case GenerationStatus.ContentFiltered:
-                case GenerationStatus.BlockedByPolicy:
-                    break;
+                // The client is gone; there is nobody to send a body to and this is not an error.
+                ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
+                    status: result.Status.ToString(), finish: "-", httpStatus: 0);
+                return Results.Empty;
+            }
 
-                case GenerationStatus.PromptLargerThanContext:
-                    ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
-                        status: result.Status.ToString(), finish: "-", httpStatus: StatusCodes.Status400BadRequest);
-                    return OpenAiError.BadRequest(
-                        $"The prompt is longer than the model's context window. {result.Detail}".Trim(),
-                        code: "context_length_exceeded");
-
-                case GenerationStatus.Cancelled:
-                    if (http.RequestAborted.IsCancellationRequested)
-                    {
-                        // The client is gone; there is nobody to send a body to and this is not an error.
-                        ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
-                            status: result.Status.ToString(), finish: "-", httpStatus: 0);
-                        return Results.Empty;
-                    }
-
-                    ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
-                        status: result.Status.ToString(), finish: "-", httpStatus: StatusCodes.Status502BadGateway);
-                    return OpenAiError.Result(StatusCodes.Status502BadGateway,
-                        $"Generation was cancelled by the backend. {result.Detail}".Trim(), OpenAiError.Server);
-
-                case GenerationStatus.Error:
-                default:
-                    ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
-                        status: result.Status.ToString(), finish: "-", httpStatus: StatusCodes.Status502BadGateway);
-                    return OpenAiError.Result(StatusCodes.Status502BadGateway,
-                        $"The model failed to generate a response. {result.Detail}".Trim(), OpenAiError.Server);
+            if (GenerationFailure.FromStatus(result) is { } failure)
+            {
+                ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
+                    status: result.Status.ToString(), finish: "-", httpStatus: failure.StatusCode);
+                return failure.ToResult();
             }
 
             var filtered = result.Status != GenerationStatus.Complete;
@@ -182,10 +164,10 @@ internal sealed class ChatCompletionsEndpoint
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            var failure = GenerationFailure.FromException(ex);
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs: 0, tokens: 0,
-                status: ex.GetType().Name, finish: "-", httpStatus: StatusCodes.Status502BadGateway);
-            return OpenAiError.Result(StatusCodes.Status502BadGateway,
-                $"Backend threw: {ex.GetType().Name}: {ex.Message}", OpenAiError.Server, code: "backend_error");
+                status: ex.GetType().Name, finish: "-", httpStatus: failure.StatusCode);
+            return failure.ToResult();
         }
         finally
         {
