@@ -34,9 +34,10 @@ public static class ChatCompletionsEndpoints
 }
 
 /// <summary>
-/// Non-streaming <c>POST /v1/chat/completions</c>. Phase one — body, validation, readiness, placement,
-/// rendering — belongs to <see cref="ChatRequestPreparer"/> and is shared with the streaming path;
-/// what is left here is phase two: run a single generation on a fresh context and shape the OpenAI
+/// <c>POST /v1/chat/completions</c>. Phase one — body, validation, readiness, placement, rendering —
+/// belongs to <see cref="ChatRequestPreparer"/> and is shared by both response shapes; this type then
+/// either hands a <c>stream: true</c> request to <see cref="ChatCompletionsStreamEndpoint"/> or runs
+/// the non-streaming phase two itself: a single generation on a fresh context, shaped into one OpenAI
 /// response. The context cache (chunk 5), tool emulation (chunk 7) and the request scheduler (chunk 8)
 /// are all deliberately absent: every request creates and disposes its own context.
 /// </summary>
@@ -54,18 +55,34 @@ internal sealed class ChatCompletionsEndpoint
         BridgeOptions options,
         IgnoredParameterLog ignoredLog,
         TimeProvider time,
-        ILogger<ChatCompletionsEndpoint> logger)
+        ILogger<ChatCompletionsEndpoint> logger,
+        ILogger<ChatCompletionsStreamEndpoint> streamLogger)
     {
         var preparation = await ChatRequestPreparer
             .PrepareAsync(http, lifecycle, options, ignoredLog, logger)
             .ConfigureAwait(false);
 
+        // Preparation is shared, and it fails before a single byte is written — so a streamed request
+        // that fails it still gets the ordinary JSON error with its ordinary status code. Only once the
+        // stream's headers are committed does error handling have to move into the stream.
         if (preparation.IsFailed)
         {
             return preparation.Failure;
         }
 
         var prepared = preparation.Prepared;
+
+        // The branch. Everything above ran identically for both shapes; everything below is the
+        // single-JSON-object generation phase, whose SSE sibling lives in ChatCompletionsStreamEndpoint.
+        // The streaming phase writes the response itself, so the handler has nothing left to return.
+        if (prepared.Request.Stream == true)
+        {
+            await ChatCompletionsStreamEndpoint
+                .StreamAsync(http, prepared, options, time, streamLogger)
+                .ConfigureAwait(false);
+            return Results.Empty;
+        }
+
         var requestId = prepared.RequestId;
         var backendName = prepared.BackendName;
         var backend = prepared.Backend;

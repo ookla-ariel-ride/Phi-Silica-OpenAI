@@ -455,25 +455,6 @@ public class ChatCompletionsTests
     }
 
     [Fact]
-    public async Task Streaming_is_400_until_chunk_4()
-    {
-        await using var host = await BridgeTestHost.StartAsync();
-
-        var response = await host.Client.PostAsJsonAsync(Path, new
-        {
-            model = "fake",
-            stream = true,
-            messages = new[] { new { role = "user", content = "hi" } },
-        });
-
-        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-        var error = (await ReadJson(response)).GetProperty("error");
-        Assert.Equal("invalid_request_error", error.GetProperty("type").GetString());
-        Assert.Contains("stream", error.GetProperty("message").GetString(), StringComparison.OrdinalIgnoreCase);
-        Assert.Empty(host.Fake.Calls);
-    }
-
-    [Fact]
     public async Task More_than_one_choice_is_400_with_param_n()
     {
         await using var host = await BridgeTestHost.StartAsync();
@@ -699,9 +680,13 @@ public class ChatCompletionsTests
         await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureStatus = GenerationStatus.ContentFiltered }, Simple(), expectedContexts: 1);
         await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureException = new InvalidOperationException("boom") }, Simple(), expectedContexts: 1);
 
+        // A streamed request reaches the backend like any other, so it creates one context and must
+        // dispose it too -- the response outliving the generation call is exactly what makes streaming
+        // the easy place to leak one.
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, new { model = "fake", stream = true, messages = new[] { new { role = "user", content = "hi" } } }, expectedContexts: 1);
+
         // Rejected before the backend is touched: zero created is the right expectation here.
         await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, new { model = "fake", n = 2, messages = new[] { new { role = "user", content = "hi" } } }, expectedContexts: 0);
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, new { model = "fake", stream = true, messages = new[] { new { role = "user", content = "hi" } } }, expectedContexts: 0);
         await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, new { model = "fake" }, expectedContexts: 0);
 
         static async Task AssertBalanced(FakeBackendOptions options, object body, int expectedContexts)

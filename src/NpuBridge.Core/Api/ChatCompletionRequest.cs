@@ -4,8 +4,9 @@ using System.Text.Json.Serialization;
 namespace NpuBridge.Api;
 
 /// <summary>
-/// Wire shape of a <c>POST /v1/chat/completions</c> request body. Only <see cref="Messages"/>,
-/// <see cref="N"/> and <see cref="Stream"/> are enforced in this chunk; everything else is accepted
+/// Wire shape of a <c>POST /v1/chat/completions</c> request body. <see cref="Messages"/> and
+/// <see cref="N"/> are validated; <see cref="Stream"/> and <see cref="StreamOptions"/> choose the
+/// server-sent-event response shape (chunk 4). Everything else is accepted
 /// so clients don't fail to deserialize, and reported back by
 /// <see cref="ChatCompletionRequestValidator"/> as ignored. <c>tools</c>, <c>tool_choice</c> and
 /// <c>response_format</c> are kept as raw <see cref="JsonElement"/> because chunk 7 defines their
@@ -29,7 +30,15 @@ public sealed record ChatCompletionRequest(
     long? Seed,
     float? PresencePenalty,
     float? FrequencyPenalty,
-    string? User);
+    string? User,
+    ChatStreamOptions? StreamOptions = null);
+
+/// <summary>
+/// OpenAI's <c>stream_options</c>. Only <c>include_usage</c> exists today: when true, a streamed reply
+/// ends with one extra chunk carrying <c>usage</c> and an empty <c>choices</c>. It is meaningless on
+/// the non-streaming path, which always reports usage, and is ignored there.
+/// </summary>
+public sealed record ChatStreamOptions(bool? IncludeUsage);
 
 /// <summary>
 /// One OpenAI chat message. <see cref="Content"/> may be a bare JSON string, an array of content

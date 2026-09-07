@@ -212,18 +212,35 @@ public class ChatCompletionRequestTests
         }
     }
 
+    /// <summary>
+    /// Chunk 4 implements streaming, so <c>stream</c> is valid whatever it says, and it is not an
+    /// ignored parameter either: it changes the response shape rather than being accepted and dropped.
+    /// </summary>
     [Theory]
-    [InlineData(null, true)]
-    [InlineData(false, true)]
-    [InlineData(true, false)]
-    public void Stream_true_fails_validation(bool? stream, bool expectedValid)
+    [InlineData(null)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Stream_is_valid_and_is_not_an_ignored_parameter(bool? stream)
     {
         var message = new ChatMessage("user", ChatMessageContent.FromText("hi"), null, null);
         var request = new ChatCompletionRequest(null, [message], stream, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
 
         var result = ChatCompletionRequestValidator.Validate(request);
 
-        Assert.Equal(expectedValid, result.IsValid);
+        Assert.True(result.IsValid);
+        Assert.DoesNotContain("stream", result.IgnoredParameters, StringComparer.Ordinal);
+    }
+
+    [Fact]
+    public void Stream_options_deserializes_and_is_not_an_ignored_parameter()
+    {
+        var json = """{"messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}""";
+
+        var request = JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!;
+
+        Assert.True(request.Stream);
+        Assert.True(request.StreamOptions!.IncludeUsage);
+        Assert.DoesNotContain("stream_options", ChatCompletionRequestValidator.Validate(request).IgnoredParameters, StringComparer.Ordinal);
     }
 
     [Fact]

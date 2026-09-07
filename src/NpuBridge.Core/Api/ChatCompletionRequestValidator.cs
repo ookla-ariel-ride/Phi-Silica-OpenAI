@@ -37,7 +37,7 @@ public sealed class ChatCompletionValidationResult
 /// <summary>
 /// Validates a <see cref="ChatCompletionRequest"/> against the rules for this chunk (see
 /// docs/PLAN.md / the chunk 3 constraints): non-empty <c>messages</c> with known roles and only
-/// <c>text</c> content parts, <c>n</c> at most 1, and no streaming yet. Does not log; the caller
+/// <c>text</c> content parts, and <c>n</c> at most 1. Does not log; the caller
 /// decides what to do with <see cref="ChatCompletionValidationResult.IgnoredParameters"/>.
 /// </summary>
 public static class ChatCompletionRequestValidator
@@ -97,12 +97,9 @@ public static class ChatCompletionRequestValidator
             return ChatCompletionValidationResult.Invalid("n greater than 1 is not supported.", param: "n");
         }
 
-        if (request.Stream == true)
-        {
-            return ChatCompletionValidationResult.Invalid(
-                "Streaming (stream: true) is not implemented yet.", param: null);
-        }
-
+        // `stream` is deliberately absent from every list here: chunk 4 implements it, so it is neither
+        // an error (D46 recorded the rejection as temporary) nor an ignored parameter. `stream_options`
+        // rides with it and is likewise honoured, not ignored.
         return ChatCompletionValidationResult.Valid(CollectIgnoredParameters(request));
     }
 
