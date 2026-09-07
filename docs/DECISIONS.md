@@ -309,7 +309,13 @@ keep-alive, so the keep-alive runs on **two clocks**: the first comment is due a
 after it at the 15-second interval. They answer different questions. The interval is about proxies
 calling a connection idle; the first delay is how long a client waits on response headers, and clients
 time that out sooner — httpx allows 5 seconds by default, so a single 15-second interval would have made
-a stalled generation look dead to an ordinary client. A second is also far longer than either runtime
-needs to report the prompt-too-long verdict this decision depends on, so the 400 is still the answer in
-practice. Both are `StreamingOptions` properties rather than constants because a test drives them in
-milliseconds instead of sleeping through them.
+a stalled generation look dead to an ordinary client. Both are `StreamingOptions` properties rather than
+constants because a test drives them in milliseconds instead of sleeping through them.
+
+The first delay also has to stay wider than the time a backend takes to report the prompt-too-long
+verdict, because once the keep-alive commits the headers that verdict can no longer be a 400. One
+second is a reasoned default, **not a measured one**: readiness gating means the model is already warm
+by the time this code runs, and the overflow check is expected to be cheap. A review pointed out that
+this repository's own rule is to claim only what the smoke test showed, and no smoke step measures that
+latency yet. `scripts/smoke.ps1` gains one, and this entry gets the number when it exists. Until then,
+treat 1 second as provisional and do not lower it.
