@@ -22,6 +22,30 @@ land here instead of widening the chunk. Each entry says where it came from and 
 - **LoRA adapters** (`LanguageModelOptions.LowRankAdapter`).
 - **Multiple model ids per process** (e.g. serve both backends at once, one model each).
 
+## Chunk 4 review deferrals
+
+- **The drain is unbounded and silent.** The streaming handler cancels the generation, awaits it to
+  completion, and only then disposes the context (D51). A runtime that never completes after being
+  cancelled therefore parks the request and its context forever, with nothing in the log to say so. The
+  fix is a **warning after N seconds still waiting**, naming the request id — not a timeout that gives
+  up and disposes anyway: disposing a context whose operation is still running is exactly the
+  use-after-dispose D51 removed, and a timeout would reinstate it under a different name. If the wait
+  ever has to be bounded, the context has to be leaked deliberately (handed to a reaper that disposes it
+  when the operation finally ends) rather than disposed on time. Unobserved so far: the fake always
+  completes, and neither runtime has been seen to hang after a cancel.
+- **Keep-alive covers only the wait for the first token.** Once deltas start flowing the comments stop,
+  so a long stall *between* tokens — a model that pauses mid-generation, or a machine under load — can
+  still trip a proxy's idle timeout even though the request is healthy. A keep-alive driven by "time
+  since the last byte written" rather than "waiting for the first delta" would cover both; it needs the
+  writer loop to hold a timer, which the current single-reader loop does not.
+- **Content filtering means different things on the two response shapes.** The non-streaming path blanks
+  the withheld text and returns an empty message with `finish_reason: content_filter`. The streaming path
+  cannot: by the time the filter verdict arrives, the deltas have already been written to the client, so
+  it sends the same finish reason after text the JSON path would have suppressed. Inherent to streaming
+  rather than a defect, and unavoidable without buffering the whole reply (which chunk 7 does, but only
+  when `tools` is present). Undocumented until now; a client that relies on the JSON path's blanking will
+  be surprised by the stream.
+
 ## Chunk 3 review deferrals
 
 - **Null fields are omitted rather than emitted as `null`, in error bodies *and* in responses.** The

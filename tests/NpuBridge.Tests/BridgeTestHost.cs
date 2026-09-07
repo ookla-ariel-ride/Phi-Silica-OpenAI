@@ -40,7 +40,8 @@ internal sealed class BridgeTestHost : IAsyncDisposable
         bool waitForReady = true,
         System.Net.IPAddress? remoteAddress = null,
         ILoggerProvider? loggerProvider = null,
-        TimeSpan? keepAliveInterval = null)
+        TimeSpan? keepAliveInterval = null,
+        TimeSpan? firstKeepAliveDelay = null)
     {
         remoteAddress ??= System.Net.IPAddress.Loopback;
         backend ??= new FakeBackend();
@@ -67,8 +68,13 @@ internal sealed class BridgeTestHost : IAsyncDisposable
         if (keepAliveInterval is { } interval)
         {
             // Registered before AddNpuBridgeCore, whose TryAddSingleton then leaves it alone: the SSE
-            // keep-alive is 15 seconds in production and a few milliseconds here.
-            builder.Services.AddSingleton(new StreamingOptions { KeepAliveInterval = interval });
+            // keep-alive is a second then every fifteen in production, and milliseconds here. The first
+            // delay defaults to the interval so a test that cares about neither says one number.
+            builder.Services.AddSingleton(new StreamingOptions
+            {
+                KeepAliveInterval = interval,
+                FirstKeepAliveDelay = firstKeepAliveDelay ?? interval,
+            });
         }
 
         builder.Services.AddNpuBridgeCore(options, _ => backend);

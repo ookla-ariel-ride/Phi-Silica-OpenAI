@@ -305,6 +305,11 @@ shapes cannot drift), and only a failure after the first byte travels as `data: 
 by `[DONE]`. `stop` is unreachable for a prompt that did not fit, on either side of that boundary.
 Content filtering is unchanged and is not an error: a successful response with a `content_filter`
 finish. The cost is that a client sees no response headers until the first token or the first
-keep-alive, which bounds the wait at the keep-alive interval — 15 seconds by default, and the reason
-that interval is a `StreamingOptions` singleton rather than a constant is that a test drives it in
-milliseconds instead of sleeping through it.
+keep-alive, so the keep-alive runs on **two clocks**: the first comment is due after 1 second, every one
+after it at the 15-second interval. They answer different questions. The interval is about proxies
+calling a connection idle; the first delay is how long a client waits on response headers, and clients
+time that out sooner — httpx allows 5 seconds by default, so a single 15-second interval would have made
+a stalled generation look dead to an ordinary client. A second is also far longer than either runtime
+needs to report the prompt-too-long verdict this decision depends on, so the 400 is still the answer in
+practice. Both are `StreamingOptions` properties rather than constants because a test drives them in
+milliseconds instead of sleeping through them.

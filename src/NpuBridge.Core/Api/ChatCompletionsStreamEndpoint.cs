@@ -112,9 +112,8 @@ internal sealed class ChatCompletionsStreamEndpoint
 
             // Nothing has been written yet, on purpose. Waiting here — rather than opening with the role
             // chunk — is what keeps the status line available for a failure that arrives before the
-            // first token. Keep-alive comments are the exception that commits the headers, and only
-            // after a full interval of silence.
-            var streamed = await WaitForFirstDeltaAsync(sse, channel.Reader, streaming.KeepAliveInterval, aborted)
+            // first token. The first keep-alive comment is what ends that window, about a second in.
+            var streamed = await WaitForFirstDeltaAsync(sse, channel.Reader, streaming, aborted)
                 .ConfigureAwait(false);
 
             if (streamed)
@@ -159,7 +158,7 @@ internal sealed class ChatCompletionsStreamEndpoint
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
                     status: result.Status.ToString(), finish: "-",
                     httpStatus: sse.Started ? StatusCodes.Status200OK : failure.StatusCode);
-                return await FailAsync(sse, failure, aborted).ConfigureAwait(false);
+                return await FailAsync(sse, failure, logger, requestId, aborted).ConfigureAwait(false);
             }
 
             // Content filtering is not a failure: the generation ran, and the client is told so with a
@@ -216,7 +215,7 @@ internal sealed class ChatCompletionsStreamEndpoint
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs: 0, tokens: 0,
                 status: ex.GetType().Name, finish: "-",
                 httpStatus: sse.Started ? StatusCodes.Status200OK : failure.StatusCode);
-            return await FailAsync(sse, failure, aborted).ConfigureAwait(false);
+            return await FailAsync(sse, failure, logger, requestId, aborted).ConfigureAwait(false);
         }
         finally
         {
@@ -247,9 +246,11 @@ internal sealed class ChatCompletionsStreamEndpoint
 
     /// <summary>
     /// Waits until either the first delta is queued (true) or the generation ended without producing one
-    /// (false), emitting a <c>: keep-alive</c> comment every interval meanwhile. The first such comment
-    /// is the first byte of the response and commits the headers, which is why the interval matters to
-    /// more than proxies: a failure that arrives before it can still be a real HTTP status.
+    /// (false), emitting <c>: keep-alive</c> comments meanwhile. The first comment is the first byte of
+    /// the response and commits the headers, so its delay answers a different question from the ones
+    /// after it: those keep a proxy from calling the connection idle, this one keeps a client from
+    /// waiting on headers — and it is also the window in which a failure can still be a real HTTP status.
+    /// Hence two intervals: about a second, then every fifteen.
     ///
     /// The wait itself is never cancelled. The channel is completed on every outcome of the generation,
     /// a cancelled one included, so this returns and the caller always reaches the drain. Only the
@@ -258,19 +259,23 @@ internal sealed class ChatCompletionsStreamEndpoint
     private static async Task<bool> WaitForFirstDeltaAsync(
         SseStream sse,
         ChannelReader<string> reader,
-        TimeSpan keepAliveInterval,
+        StreamingOptions streaming,
         CancellationToken cancellationToken)
     {
         var wait = reader.WaitToReadAsync(CancellationToken.None).AsTask();
-        if (keepAliveInterval <= TimeSpan.Zero)
+        if (streaming.KeepAliveInterval <= TimeSpan.Zero)
         {
             return await wait.ConfigureAwait(false);
         }
 
+        var next = streaming.FirstKeepAliveDelay > TimeSpan.Zero
+            ? streaming.FirstKeepAliveDelay
+            : streaming.KeepAliveInterval;
+
         while (true)
         {
             using var timer = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            var finished = await Task.WhenAny(wait, Task.Delay(keepAliveInterval, timer.Token)).ConfigureAwait(false);
+            var finished = await Task.WhenAny(wait, Task.Delay(next, timer.Token)).ConfigureAwait(false);
             if (ReferenceEquals(finished, wait))
             {
                 await timer.CancelAsync().ConfigureAwait(false);
@@ -281,6 +286,9 @@ internal sealed class ChatCompletionsStreamEndpoint
             cancellationToken.ThrowIfCancellationRequested();
 
             await sse.WriteAsync(KeepAliveFrame, cancellationToken).ConfigureAwait(false);
+
+            // The headers are out now, so every later comment is only about proxy idle timeouts.
+            next = streaming.KeepAliveInterval;
         }
     }
 
@@ -289,7 +297,12 @@ internal sealed class ChatCompletionsStreamEndpoint
     /// and body, returned to the caller; after it, the status line is spent, so the same body goes out as
     /// an SSE event followed by the done marker — a stream that ends badly still ends.
     /// </summary>
-    private static async Task<IResult?> FailAsync(SseStream sse, GenerationFailure failure, CancellationToken cancellationToken)
+    private static async Task<IResult?> FailAsync(
+        SseStream sse,
+        GenerationFailure failure,
+        ILogger logger,
+        string requestId,
+        CancellationToken cancellationToken)
     {
         if (!sse.Started)
         {
@@ -303,8 +316,21 @@ internal sealed class ChatCompletionsStreamEndpoint
             return null;
         }
 
-        await sse.WriteAsync(failure.ToEventFrame(), cancellationToken).ConfigureAwait(false);
-        await sse.WriteAsync(DoneFrame, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await sse.WriteAsync(failure.ToEventFrame(), cancellationToken).ConfigureAwait(false);
+            await sse.WriteAsync(DoneFrame, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // This is the last thing the handler does for the client, and it is already reporting a
+            // failure. A connection that dies between the check above and the write here would otherwise
+            // throw a second exception on the way out of a catch block, which reaches the host as an
+            // unhandled request exception and says nothing useful. The drain and the disposal in the
+            // caller's finally are unaffected either way.
+            logger.LogDebug(ex, "req={RequestId} could not write the stream's error event; the client is gone.", requestId);
+        }
+
         return null;
     }
 

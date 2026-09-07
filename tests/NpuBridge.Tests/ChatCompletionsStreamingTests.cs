@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Json;
@@ -595,6 +596,44 @@ public class ChatCompletionsStreamingTests
         Assert.Equal(2, chunks.Count);
         Assert.Equal("assistant", chunks[0].GetProperty("choices")[0].GetProperty("delta").GetProperty("role").GetString());
         Assert.Equal("stop", chunks[1].GetProperty("choices")[0].GetProperty("finish_reason").GetString());
+    }
+
+    /// <summary>
+    /// The first comment is on a shorter clock than the ones after it, and for a different reason: the
+    /// gap between comments is about proxy idle timeouts, but the wait before the *first* one is how long
+    /// a client goes without response headers, and clients time that out sooner (httpx allows five
+    /// seconds by default). Here the first is due at 50 ms and the second not for another five seconds,
+    /// so a generation that stalls for 400 ms must produce exactly one — proving the two clocks are
+    /// separate and that the short one is the one that commits the headers.
+    /// </summary>
+    [Fact]
+    public async Task The_first_keep_alive_uses_its_own_shorter_delay_and_later_ones_use_the_interval()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => ["ok"],
+            StartDelay = TimeSpan.FromMilliseconds(400),
+        });
+        await using var host = await BridgeTestHost.StartAsync(
+            fake,
+            keepAliveInterval: TimeSpan.FromSeconds(5),
+            firstKeepAliveDelay: TimeSpan.FromMilliseconds(50));
+
+        var started = Stopwatch.StartNew();
+        using var request = new HttpRequestMessage(HttpMethod.Post, Path)
+        {
+            Content = JsonContent.Create(Body(model: "fake", stream: true)),
+        };
+        var response = await host.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+        var headers = started.Elapsed;
+        var body = await response.Content.ReadAsStringAsync();
+
+        // The headers came back on the first keep-alive's clock, not on the generation's.
+        Assert.True(headers < TimeSpan.FromMilliseconds(350),
+            $"response headers took {headers.TotalMilliseconds:F0} ms while the first token was 400 ms away");
+
+        Assert.Equal(1, body.Split('\n').Count(l => string.Equals(l, ": keep-alive", StringComparison.Ordinal)));
+        Assert.EndsWith("data: [DONE]\n\n", body, StringComparison.Ordinal);
     }
 
     /// <summary>A first token that arrives before the interval elapses costs the client nothing extra.</summary>
