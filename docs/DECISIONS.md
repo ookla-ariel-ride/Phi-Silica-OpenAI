@@ -312,13 +312,32 @@ time that out sooner — httpx allows 5 seconds by default, so a single 15-secon
 a stalled generation look dead to an ordinary client. Both are `StreamingOptions` properties rather than
 constants because a test drives them in milliseconds instead of sleeping through them.
 
-The first delay also has to stay wider than the time a backend takes to report the prompt-too-long
-verdict, because once the keep-alive commits the headers that verdict can no longer be a 400. One
-second is a reasoned default, **not a measured one**: readiness gating means the model is already warm
-by the time this code runs, and the overflow check is expected to be cheap. A review pointed out that
-this repository's own rule is to claim only what the smoke test showed, and no smoke step measures that
-latency yet. `scripts/smoke.ps1` gains one, and this entry gets the number when it exists. Until then,
-treat 1 second as provisional and do not lower it.
+The first delay was reasoned as needing to stay wider than the time a backend takes to report the
+prompt-too-long verdict, because once the keep-alive commits the headers that verdict can no longer be
+a 400. `scripts/smoke.ps1` now measures it, and **the measurement overturns that reasoning on this
+hardware**. Phi Silica, given a 225,042-character prompt, does not report a prompt-too-long verdict at
+all: it returns a generic error after **26.5 seconds** (`Error: Unspecified error`; 502 on the JSON
+path). Against a 1-second first keep-alive that is not a close call — it is twenty-six times over, and
+no plausible delay would win that race. The streamed request emitted three keep-alive comments, then
+the role chunk, then `data: {"error":...}`, then `[DONE]`: the specified after-the-headers behaviour,
+working correctly. So the deferral does **not** buy a real 400 for an over-length prompt here, and this
+entry should never have implied it would.
+
+What the deferral does buy is the correct HTTP status for the failures that are decided *quickly*,
+which is most of them: a backend that is not ready or failed to initialize (503), an adapter that
+throws on the way in (502), and a backend that does report `PromptLargerThanContext` promptly (400
+`context_length_exceeded` — the fake does, and Aion is untested). Request validation is settled before
+this handler is reached at all and never depended on the deferral. Those all land in single-digit
+milliseconds, so the 1-second delay is generous for every one of them.
+
+**The 1-second default stands, for a different reason than the one written above.** It is not buying a
+race against a slow backend verdict — that race is unwinnable and does not need winning, because a
+failure after the headers correctly becomes an in-stream error frame. It is bounding how long a client
+waits on response headers, and 1 second against httpx's 5-second default read timeout is the whole
+justification. Do not lower it, and do not raise it in the hope of catching a slow verdict: 26 seconds
+of silence would break ordinary clients to salvage a status code for one error case that the stream
+already reports faithfully. The measured numbers behind this paragraph, and what they mean for chunk
+5, are in D55.
 
 **D53. `max_tokens`, `max_completion_tokens` and `stop` are cut client-side, and the cap is measured
 in characters.** Neither Windows runtime offers either feature: Phi Silica's `LanguageModelOptions`
@@ -401,3 +420,32 @@ after the prompt-length verdict and before its first token. The test releases it
 headers, so the ordering is a property of the arrangement; the send's cancellation token is a deadlock
 guard, not a measurement. Verified by running the whole suite twenty times in parallel, which pushed
 individual runs from 2 s to 18 s and stayed green.
+
+**D55. Phi Silica does not report an over-length prompt as over-length, and takes 26 s to say
+anything; chunk 5 must use the preflight instead.** Measured on this machine by `scripts/smoke.ps1
+-Backend phi-silica` with a 225,042-character prompt, and confirmed directly outside the script. Three
+facts, all from that run:
+
+- `GenerateAsync` ends in a **generic** `Error` — `The model failed to generate a response. Error:
+  Unspecified error` — not `PromptLargerThanContext`. The bridge maps that faithfully: 502 on the JSON
+  path, an in-stream `data: {"error":...}` frame on the streaming path.
+- It takes **26,512 ms** to reach that verdict. Nothing about the failure is cheap or early.
+- `GetUsablePromptLength` — the preflight — answered **13,429 of 225,042 characters usable**, up
+  front, and got it right.
+
+So the status enum is not a reliable overflow signal on this backend, and waiting for the generation
+to refuse costs half a minute per attempt. **Chunk 5, which owns overflow handling and the
+history-truncation loop, must drive both off the preflight**, not off a failed generation's status:
+ask `GetUsablePromptLength` before generating, and treat "usable < prompt" as the overflow condition.
+A truncation loop built on the generation's status would cost 26 s per iteration and could not tell an
+over-length prompt from any other backend fault.
+
+A consequence worth stating plainly, since chunk 3 shipped the mapping: **400 `context_length_exceeded`
+may be unreachable on Phi Silica** without a preflight check. `GenerationFailure` still maps
+`PromptLargerThanContext` to it, and the fake backend still produces it (the tests are real tests, of a
+real mapping), but no Phi Silica generation this project has observed has returned that status. Aion
+cannot even be asked: its API has no `GetUsablePromptLength`, so it carries no `PromptLengthPreflight`
+capability, and chunk 6 should expect a third behaviour rather than assume either of these two.
+
+This is also why D52's over-length reasoning was rewritten rather than annotated: the header deferral
+was justified partly by a race it cannot win on this hardware, and the honest version says so.

@@ -62,6 +62,14 @@ land here instead of widening the chunk. Each entry says where it came from and 
 - **Error messages escape apostrophes as `\u0027`.** Same shared serializer options, same reasoning.
   Raised by the implementer rather than a reviewer, which is the right instinct. Fix it alongside the
   entry above.
+- **Overflow detection must not wait for a generation to fail (chunk 5 blocker).** Measured in chunk
+  4's smoke run and recorded as D55: Phi Silica answers a 225,042-character prompt with a generic
+  `Error` after 26.5 s, never with `PromptLargerThanContext`, while `GetUsablePromptLength` says
+  13,429 of 225,042 characters fit, instantly and correctly. The truncation loop chunk 5 owns has to
+  key off the preflight; a loop that generates and reads the status would cost 26 s per iteration and
+  could not tell overflow from any other fault. Follows from this: 400 `context_length_exceeded` is
+  probably unreachable on Phi Silica until something calls the preflight, even though the mapping and
+  its tests are correct.
 - **The rendered prompt is not a usable conversation identity (chunk 5 blocker).** Distinct
   conversations can produce the same rendered string, so anything that treats that string as an identity
   will hand one cached context to two different conversations. Note what the cache key actually is:
