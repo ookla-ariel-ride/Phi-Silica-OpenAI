@@ -5,8 +5,15 @@
 .DESCRIPTION
   Starts NpuBridge.exe (or, with -NoStart, tests a server already listening), waits for /healthz to
   report ready (the first Phi Silica / Aion load can take minutes), then exercises /v1/models,
-  /debug/generate (raw model access, cancellation, prompt-length preflight) and, once chunk 3+ land,
-  /v1/chat/completions non-streaming, streaming, and a tool-call compliance probe.
+  /debug/generate (raw model access, cancellation, prompt-length preflight), /v1/chat/completions
+  non-streaming and streaming (the SSE wire contract and the client-side cut) and, once chunk 7 lands,
+  a tool-call compliance probe.
+
+  It also takes the measurements docs/DECISIONS.md cites: the token estimate against the progress
+  callbacks, which system-prompt placement this model obeys, whether cancelling a generation really
+  stops the accelerator, and how fast the prompt-too-long verdict is against the first keep-alive
+  (D52). Those report numbers and never fail the run: a surprising number is a finding, not a broken
+  bridge.
 
   For -Backend phi-silica the exe is started by path; it relaunches itself through package activation so
   the process has identity and supervises that instance (scripts/identity.ps1 -Install must have been run
@@ -87,6 +94,91 @@ function Get-Json([string] $path, [string] $method = 'GET', [string] $body = $nu
     $r = Invoke-WebRequest @request
     if ($expect -notcontains [int]$r.StatusCode) { throw "HTTP $($r.StatusCode) for $method $path : $($r.Content)" }
     return ($r.Content | ConvertFrom-Json -Depth 20)
+}
+
+# Reads a server-sent-event response frame by frame rather than buffering it, because two of the things
+# this script has to report are only visible while the stream is open: when the response headers arrive
+# (the window in which a failure is still an ordinary HTTP status, D52) and when the first chunk does.
+# A reply that is not a stream -- a 400 for an over-length prompt, say -- is returned whole in Body,
+# because that is a JSON error and not a stream at all.
+function Invoke-Sse([string] $path, [string] $body, [int] $timeoutSec = 300) {
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.UseProxy = $false
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds($timeoutSec)
+    $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, "$base$path")
+    $request.Content = [System.Net.Http.StringContent]::new($body, [System.Text.Encoding]::UTF8, 'application/json')
+
+    $chunks = [System.Collections.Generic.List[object]]::new()
+    $frames = [System.Collections.Generic.List[string]]::new()
+    $keepAlives = 0
+    $done = $false
+    $firstChunkMs = $null
+    $text = ''
+    $reader = $null
+    $response = $null
+    try {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        $headerMs = $sw.Elapsed.TotalMilliseconds
+        $status = [int]$response.StatusCode
+        $contentType = $response.Content.Headers.ContentType.MediaType
+
+        if ($status -ne 200 -or $contentType -ne 'text/event-stream') {
+            $text = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        }
+        else {
+            $reader = [System.IO.StreamReader]::new($response.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
+            while ($null -ne ($line = $reader.ReadLine())) {
+                if ($line.Length -eq 0) { continue }                       # the blank line between frames
+                if ($line.StartsWith(':')) { $keepAlives++; continue }     # ': keep-alive', a comment
+                if (-not $line.StartsWith('data: ')) { throw "unexpected SSE line: '$line'" }
+                $payload = $line.Substring(6)
+                if ($payload -eq '[DONE]') { $done = $true; continue }
+                if ($null -eq $firstChunkMs) { $firstChunkMs = $sw.Elapsed.TotalMilliseconds }
+                $frames.Add($payload)
+                $chunks.Add(($payload | ConvertFrom-Json -Depth 20))
+            }
+        }
+        $sw.Stop()
+
+        $parsed = $chunks.ToArray()
+        # The reply as the client sees it: every content delta, in order. The usage chunk contributes
+        # nothing, having no choices at all.
+        $content = -join ($parsed | ForEach-Object { $_.choices } | ForEach-Object { $_.delta.content })
+        $ttft = if ($null -ne $firstChunkMs) { [Math]::Round($firstChunkMs, 1) } else { $null }
+
+        [pscustomobject]@{
+            StatusCode   = $status
+            ContentType  = $contentType
+            Body         = $text
+            Chunks       = $parsed
+            Frames       = $frames.ToArray()
+            Content      = $content
+            KeepAlives   = $keepAlives
+            Done         = $done
+            HeaderMs     = [Math]::Round($headerMs, 1)
+            FirstChunkMs = $ttft
+            TotalMs      = [Math]::Round($sw.Elapsed.TotalMilliseconds, 1)
+        }
+    }
+    finally {
+        if ($reader) { $reader.Dispose() }
+        if ($response) { $response.Dispose() }
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
+# The finish reasons carried by a stream's chunks, in order. Not simply choices[0] on every chunk: the
+# usage chunk carries an empty choices array by design. The leading comma keeps the result an array
+# when there is exactly one -- PowerShell would otherwise unroll it to a bare string, whose .Count is
+# also 1 and whose [0] is its first character, so the callers' checks would read 's' for 'stop'.
+function Get-FinishReasons($chunks) {
+    $reasons = @($chunks |
+        Where-Object { $_.choices.Count -gt 0 -and $_.choices[0].finish_reason } |
+        ForEach-Object { $_.choices[0].finish_reason })
+    return , $reasons
 }
 
 function Test-PortListening([int] $p) {
@@ -208,9 +300,10 @@ try {
         "aborted request drained; next request completed in $($sw.ElapsedMilliseconds)ms"
     }
 
-    # --- chat completions (chunk 3) ------------------------------------------
-    # One gate per feature: non-streaming is built now; streaming (chunk 4) and tool calls (chunk 7)
-    # are not, and must report SKIP, not FAIL, so a clean chunk-3 run stays "All steps passed".
+    # --- chat completions (chunks 3 and 4) -----------------------------------
+    # One gate per feature: non-streaming (chunk 3) and streaming with the client-side cut (chunk 4)
+    # are built now; tool calls (chunk 7) are not, and must report SKIP, not FAIL, so a clean run
+    # stays "All steps passed".
     Step 'POST /v1/chat/completions rejects an empty body' {
         $c = Get-Json '/v1/chat/completions' 'POST' '{}' @(400)
         if ($c.error.type -ne 'invalid_request_error') { throw "error.type=$($c.error.type): $($c | ConvertTo-Json -Compress)" }
@@ -250,7 +343,120 @@ try {
     }
 
     Step 'POST /v1/chat/completions (streaming SSE)' {
-        Skip 'streaming arrives in chunk 4; stream: true deliberately returns 400 in chunk 3'
+        $body = @{
+            model          = $Backend
+            stream         = $true
+            stream_options = @{ include_usage = $true }
+            messages       = @(
+                @{ role = 'system'; content = 'You are a terse assistant.' }
+                @{ role = 'user'; content = 'Reply with exactly the word PONG.' }
+            )
+        } | ConvertTo-Json -Depth 5
+
+        $s = Invoke-Sse '/v1/chat/completions' $body
+        if ($s.StatusCode -ne 200) { throw "HTTP $($s.StatusCode): $($s.Body)" }
+        if ($s.ContentType -ne 'text/event-stream') { throw "Content-Type=$($s.ContentType)" }
+        if (-not $s.Done) { throw "stream did not end with the done marker: $($s.Frames -join ' | ')" }
+        if ($s.Chunks.Count -lt 2) { throw "only $($s.Chunks.Count) chunk(s): $($s.Frames -join ' | ')" }
+
+        # The role chunk opens the assistant message; OpenAI clients build the message from it.
+        $first = $s.Chunks[0]
+        if ($first.choices[0].delta.role -ne 'assistant') { throw "first chunk is not the role chunk: $($s.Frames[0])" }
+        if ($first.id -notlike 'chatcmpl-*') { throw "id=$($first.id) does not start with chatcmpl-" }
+
+        # One reply, one identity: a client stitching the chunks together must see the id, created and
+        # model a non-streamed reply would have carried, on every chunk including the usage one.
+        foreach ($c in $s.Chunks) {
+            if ($c.object -ne 'chat.completion.chunk') { throw "object=$($c.object)" }
+            if ($c.id -ne $first.id -or $c.created -ne $first.created -or $c.model -ne $first.model) {
+                throw "identity drifted: id=$($c.id) created=$($c.created) model=$($c.model) vs first id=$($first.id) created=$($first.created) model=$($first.model)"
+            }
+        }
+
+        if (-not $s.Content) { throw 'the content deltas concatenate to nothing' }
+
+        $finishes = Get-FinishReasons $s.Chunks
+        if ($finishes.Count -ne 1) { throw "$($finishes.Count) chunks carry a finish_reason, expected 1: $($finishes -join ',')" }
+        if ($finishes[0] -ne 'stop') { throw "finish_reason=$($finishes[0])" }
+
+        # stream_options.include_usage: exactly one usage chunk, last before the done marker, with an
+        # empty choices array so a client indexing choices[0] on every chunk sees no phantom delta.
+        $withUsage = @($s.Chunks | Where-Object { $null -ne $_.usage })
+        if ($withUsage.Count -ne 1) { throw "$($withUsage.Count) usage chunks, expected exactly 1" }
+        $last = $s.Chunks[-1]
+        if ($null -eq $last.usage) { throw 'the usage chunk is not the last chunk before the done marker' }
+        if ($last.choices.Count -ne 0) { throw "the usage chunk carries $($last.choices.Count) choice(s), expected none" }
+        $u = $last.usage
+        if (-not ($u.prompt_tokens -gt 0 -and $u.completion_tokens -gt 0 -and $u.total_tokens -eq ($u.prompt_tokens + $u.completion_tokens))) {
+            throw "usage=$($u | ConvertTo-Json -Compress)"
+        }
+
+        # Streaming is the only place time-to-first-token is directly observable client-side. headers is
+        # the D52 number: nothing is written until the first delta or the first keep-alive, so this is
+        # how long a client waits on a status line.
+        $preview = $s.Content.Trim()
+        "chunks=$($s.Chunks.Count) ttft=$($s.FirstChunkMs)ms total=$($s.TotalMs)ms headers=$($s.HeaderMs)ms keep-alives=$($s.KeepAlives) usage=$($u | ConvertTo-Json -Compress) text='$($preview.Substring(0, [Math]::Min(80, $preview.Length)))'"
+    }
+
+    Step 'streaming client-side cut (max_tokens and stop)' {
+        # D53: the cap is a character budget of max_tokens * 4, so usage.completion_tokens -- ceil of
+        # chars/4 -- lands on the cap and never above it. Streaming is where the cut is hardest: text
+        # already written cannot be recalled.
+        $cap = 8
+        $capChars = $cap * 4
+        $capBody = @{
+            model          = $Backend
+            stream         = $true
+            max_tokens     = $cap
+            stream_options = @{ include_usage = $true }
+            messages       = @(@{ role = 'user'; content = 'Write a detailed essay of at least 400 words about the history of computing.' })
+        } | ConvertTo-Json -Depth 5
+
+        $capped = Invoke-Sse '/v1/chat/completions' $capBody
+        if ($capped.StatusCode -ne 200) { throw "max_tokens: HTTP $($capped.StatusCode): $($capped.Body)" }
+        if (-not $capped.Done) { throw 'max_tokens: stream did not end with the done marker' }
+        $capFinishes = Get-FinishReasons $capped.Chunks
+        if ($capFinishes.Count -ne 1 -or $capFinishes[0] -ne 'length') {
+            throw "max_tokens: finish_reason=$($capFinishes -join ',') expected exactly one 'length' (the model may have stopped on its own before the cap)"
+        }
+        if (-not $capped.Content) { throw 'max_tokens: no content before the cut' }
+        if ($capped.Content.Length -gt $capChars) { throw "max_tokens: $($capped.Content.Length) chars streamed > budget of $capChars" }
+        $capUsage = @($capped.Chunks | Where-Object { $null -ne $_.usage })[0].usage
+        if ($null -eq $capUsage) { throw 'max_tokens: no usage chunk, though stream_options.include_usage was set' }
+        if ($capUsage.completion_tokens -gt $cap) { throw "max_tokens: usage.completion_tokens=$($capUsage.completion_tokens) > max_tokens=$cap" }
+
+        # The stop string is removed from the reply rather than never produced (D53), and the streaming
+        # path has to hold text back to catch one that straddles two deltas.
+        $stop = 'charlie'
+        $ask = 'Reply with exactly this line and nothing else: alpha bravo charlie delta'
+        $stopBody = @{
+            model    = $Backend
+            stream   = $true
+            stop     = $stop
+            messages = @(@{ role = 'user'; content = $ask })
+        } | ConvertTo-Json -Depth 5
+
+        $cut = Invoke-Sse '/v1/chat/completions' $stopBody
+        if ($cut.StatusCode -ne 200) { throw "stop: HTTP $($cut.StatusCode): $($cut.Body)" }
+        if (-not $cut.Done) { throw 'stop: stream did not end with the done marker' }
+        $cutFinishes = Get-FinishReasons $cut.Chunks
+        if ($cutFinishes.Count -ne 1 -or $cutFinishes[0] -ne 'stop') { throw "stop: finish_reason=$($cutFinishes -join ',') expected exactly one 'stop'" }
+        if ($cut.Content.Contains($stop)) { throw "stop: the stop string reached the client: '$($cut.Content)'" }
+
+        # A control run of the same prompt without the cut, so the detail can say whether there was
+        # anything to truncate. A model that never emits the stop string would satisfy the assertion
+        # above without the feature doing any work, and that is worth knowing rather than assuming.
+        $controlBody = @{ model = $Backend; stream = $true; messages = @(@{ role = 'user'; content = $ask }) } | ConvertTo-Json -Depth 5
+        $control = Invoke-Sse '/v1/chat/completions' $controlBody
+        $confirmed = $control.StatusCode -eq 200 -and $control.Content.Contains($stop)
+        $evidence = if ($confirmed) {
+            "confirmed against a control run: without 'stop' the same prompt produced the string ($($control.Content.Length) chars, cut to $($cut.Content.Length))"
+        }
+        else {
+            "not confirmed: the control run did not contain '$stop' either, so nothing needed truncating this time"
+        }
+
+        "max_tokens=$cap -> finish=length, $($capped.Content.Length) chars <= $capChars budget, completion_tokens=$($capUsage.completion_tokens); stop='$stop' -> finish=stop, absent from the reply, $evidence"
     }
 
     if ($ToolProbeRuns -gt 0) {
@@ -337,6 +543,128 @@ not a recollection.
         }
 
         $lines.Add('verdict: compare the two "obeyed" lines above. Phi Silica has twice been observed ignoring a natively delivered system prompt (docs/DECISIONS.md); this is that check run on real hardware for this build.')
+        $lines -join "`n"
+    }
+
+    # --- measurement 3: does cancelling a generation actually stop the accelerator? ----------------
+    InfoStep 'measurement: does the client-side cut stop the NPU, or only the client?' {
+        # The open question since the research phase: the WinRT cancel is advisory, and nobody has
+        # established whether the device stops mid-generation or runs to completion regardless. The cut
+        # makes it measurable, because it cancels a real generation partway through -- and because the
+        # handler does not return until that generation has actually ended (cancel, drain, dispose,
+        # D51), the wall clock below is the device's time and not merely the client's.
+        $prompt = 'Write a detailed essay of at least 400 words about the history of computing.'
+        $cap = 8
+        $uncappedBody = @{ model = $Backend; stream = $true; messages = @(@{ role = 'user'; content = $prompt }) } | ConvertTo-Json -Depth 5
+        $cappedBody = @{ model = $Backend; stream = $true; max_tokens = $cap; messages = @(@{ role = 'user'; content = $prompt }) } | ConvertTo-Json -Depth 5
+
+        $uncapped = Invoke-Sse '/v1/chat/completions' $uncappedBody
+        if ($uncapped.StatusCode -ne 200) { throw "uncapped: HTTP $($uncapped.StatusCode): $($uncapped.Body)" }
+        $capped = Invoke-Sse '/v1/chat/completions' $cappedBody
+        if ($capped.StatusCode -ne 200) { throw "capped: HTTP $($capped.StatusCode): $($capped.Body)" }
+
+        $fullMs = $uncapped.TotalMs
+        $cutMs = $capped.TotalMs
+        $ratio = if ($fullMs -gt 0) { [Math]::Round($cutMs / $fullMs, 2) } else { $null }
+
+        # Prompt processing cannot be cancelled: the capped request can never beat its own time to first
+        # token. So the decode phase -- everything after it -- is where a working cancel shows up, and
+        # that ratio is the one the verdict is read off when both are measurable.
+        $fullDecode = if ($null -ne $uncapped.FirstChunkMs) { $fullMs - $uncapped.FirstChunkMs } else { $null }
+        $cutDecode = if ($null -ne $capped.FirstChunkMs) { $cutMs - $capped.FirstChunkMs } else { $null }
+        $decodeRatio = if ($null -ne $fullDecode -and $null -ne $cutDecode -and $fullDecode -gt 0) {
+            [Math]::Round($cutDecode / $fullDecode, 2)
+        }
+        else { $null }
+
+        $judged = if ($null -ne $decodeRatio) { $decodeRatio } else { $ratio }
+        $verdict = if ($null -eq $judged) {
+            'inconclusive: neither request took measurable time, so there is nothing to compare.'
+        }
+        elseif ($judged -le 0.5) {
+            "cancellation really does stop the device. The cut request finished in a small fraction of the uncapped one, and the request is not answered until the generation has ended, so the work stopped -- the NPU was not left running to completion behind a returned response."
+        }
+        elseif ($judged -ge 0.8) {
+            "cancellation is advisory only. The two requests took about the same time, so the accelerator ran the generation to completion regardless of the cut; the cap saves the client's time and its token count, not the device's work."
+        }
+        else {
+            'inconclusive: the cut request was faster but not decisively so. The device may be stopping at the next token boundary rather than at once; re-run before quoting this.'
+        }
+
+        $caveat = if ($Backend -eq 'fake') {
+            "caveat: this is the fake backend, which generates with no per-token delay; the numbers exercise the measurement, they do not answer the hardware question."
+        }
+        else { $null }
+
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add("asked: the same prompt twice on the streaming path ($($prompt.Length) chars), once uncapped and once with max_tokens=$cap")
+        $lines.Add("uncapped: $fullMs ms total, ttft $($uncapped.FirstChunkMs) ms, $($uncapped.Content.Length) chars, finish=$((Get-FinishReasons $uncapped.Chunks) -join ',')")
+        $lines.Add("capped:   $cutMs ms total, ttft $($capped.FirstChunkMs) ms, $($capped.Content.Length) chars, finish=$((Get-FinishReasons $capped.Chunks) -join ',')")
+        $decodeText = if ($null -ne $decodeRatio) { "$decodeRatio of it counting only the decode phase after the first token" } else { 'decode phase not separately measurable' }
+        $lines.Add("ratio: the capped request took $ratio of the uncapped one end to end, $decodeText")
+        $lines.Add("verdict: $verdict")
+        if ($caveat) { $lines.Add($caveat) }
+        $lines -join "`n"
+    }
+
+    # --- measurement 4: how fast is the prompt-too-long verdict, against the first keep-alive? -----
+    InfoStep 'measurement: prompt-too-long verdict latency vs the first keep-alive (D52)' {
+        # StreamingOptions.DefaultFirstKeepAliveDelay. Not settable from the command line, so this is
+        # the number shipped code uses. D52 depends on the verdict arriving first: the streaming path
+        # writes nothing until the first token or the first keep-alive, and once a keep-alive commits
+        # the headers an over-length prompt can no longer come back as a real 400.
+        $firstKeepAliveMs = 1000
+
+        # As big as is cheap to build rather than marginal, so the verdict is unambiguous. The last line
+        # is short on purpose: the fake backend echoes it, and a backend with no context window would
+        # otherwise answer with a megabyte of JSON.
+        $filler = 'The quick brown fox jumps over the lazy dog. ' * 5000
+        $prompt = "$filler`nSummarize the text above in one sentence."
+        $body = @{ model = $Backend; stream = $true; messages = @(@{ role = 'user'; content = $prompt }) } | ConvertTo-Json -Depth 5
+
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add("asked: one user message of $($prompt.Length) chars on the streaming path, timed from request to response headers")
+
+        $s = Invoke-Sse '/v1/chat/completions' $body
+        $verdictMs = $s.HeaderMs
+
+        if ($s.StatusCode -eq 400) {
+            $err = ($s.Body | ConvertFrom-Json).error
+            $lines.Add("streaming: HTTP 400 code=$($err.code) after $verdictMs ms -- the verdict beat the first keep-alive, so the status line was still the server's to set")
+            $margin = if ($verdictMs -lt ($firstKeepAliveMs * 0.2)) {
+                "comfortable: the verdict lands in under a fifth of the ${firstKeepAliveMs} ms first keep-alive, so 1 s is not close to the edge"
+            }
+            elseif ($verdictMs -lt ($firstKeepAliveMs * 0.5)) {
+                "adequate but not generous: the verdict uses more than a fifth of the ${firstKeepAliveMs} ms first keep-alive; do not lower that default"
+            }
+            elseif ($verdictMs -lt $firstKeepAliveMs) {
+                "uncomfortable: the verdict uses more than half of the ${firstKeepAliveMs} ms first keep-alive, so a slower run would commit the headers and lose the 400; raise the default"
+            }
+            else {
+                "exceeded: the verdict took longer than the ${firstKeepAliveMs} ms first keep-alive -- see the status above for what the client actually got"
+            }
+            $lines.Add("margin: $margin")
+        }
+        elseif ($s.StatusCode -eq 200) {
+            $finishes = (Get-FinishReasons $s.Chunks) -join ','
+            $lines.Add("streaming: HTTP 200 after $verdictMs ms, finish=$finishes, $($s.Content.Length) chars -- this backend accepted the prompt, so it has no context window to overflow and there is no verdict latency to measure here")
+        }
+        else {
+            $lines.Add("streaming: HTTP $($s.StatusCode) after $verdictMs ms: $($s.Body)")
+        }
+
+        # Cross-check without the HTTP round trip: /debug/generate reports the server-side elapsed time
+        # for the same prompt. It also calls the prompt-length preflight, which the chat path does not,
+        # so it is an upper bound on the backend's own verdict rather than the same number.
+        try {
+            $g = Get-Json '/debug/generate' 'POST' (@{ prompt = $prompt } | ConvertTo-Json)
+            $lines.Add("cross-check (/debug/generate, server-side clock, preflight included): status=$($g.status) total=$($g.total_ms)ms usable_prompt_chars=$($g.usable_prompt_chars) of $($g.prompt_chars)")
+        }
+        catch {
+            $lines.Add("cross-check (/debug/generate): $($_.Exception.Message)")
+        }
+
+        $lines.Add("verdict: D52 shipped a ${firstKeepAliveMs} ms first keep-alive as a reasoned default and said this script owed the measurement. The numbers above are it; record them in D52.")
         $lines -join "`n"
     }
 } finally {
