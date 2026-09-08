@@ -4,20 +4,18 @@ An OpenAI-compatible HTTP endpoint for the on-device language model on a Copilot
 NPU). Point OpenCode, Hermes, `curl` or the Python `openai` client at `http://127.0.0.1:5273/v1` and
 use the NPU model as a provider: local, offline, free.
 
-The model is small, roughly 3 billion parameters with a 4K context window, running near 10 tokens per
-second. Short conversations work well. Long agent loops with a dozen tools will not, and this bridge
-reports that in OpenAI's error format rather than hiding it.
+The model is small: Microsoft documents a context window of about 3.5K tokens, and on a Snapdragon X
+Elite roughly 13,400 characters of prompt fit, generating near 10 tokens per second. Short
+conversations work well. Long agent loops with a dozen tools will not, and this bridge reports that in
+OpenAI's error format rather than hiding it.
+
+## Backends
 
 | Backend | API | State |
 |---|---|---|
 | `phi-silica` | `Microsoft.Windows.AI.Text` (Windows App SDK) | works |
-| `aion` | `AionInstructPreview.Text` (Microsoft's replacement, from November 2026) | adapter not written |
 | `fake` | in-process, deterministic | for tests and dry runs |
-
-**Status, 2026-09-07.** Chat completions, streaming, health, model listing and the diagnostic endpoint
-all work against the real NPU. A context cache, tool calling and `/v1/completions` are not built yet;
-`docs/PLAN.md` has the order they arrive in. 372 tests pass and `scripts/smoke.ps1` is green on
-hardware.
+| `aion` | `AionInstructPreview.Text` (Microsoft's replacement, from November 2026) | not implemented — the bridge starts, but the backend never reports ready |
 
 ## Requirements
 
@@ -100,15 +98,11 @@ Anything else under `/v1` returns an OpenAI-shaped 404, or a 405 with `Allow` wh
 but the method is wrong. Errors use the `{"error":{"message","type","param","code"}}` body, and nothing
 is ever silently truncated.
 
-An over-length prompt is worth a warning. The bridge maps a backend's prompt-too-long verdict to a 400
-with code `context_length_exceeded`, but Phi Silica does not report one: it fails generically after
-about 26 seconds, so you get a 502, or an error frame mid-stream once headers are already committed.
-The preflight knows the real limit immediately, and the context cache chunk will use it. See
-`docs/DECISIONS.md` D55.
+## Request parameters
 
-`temperature`, `top_p` and `top_k` reach Phi Silica. `max_tokens`, `max_completion_tokens` and
-`stop` are enforced by the bridge, since neither Windows API offers them: output is cut at the limit and
-the generation cancelled, which really does stop the accelerator rather than only the client. The tool
+`temperature`, `top_p` and `top_k` reach Phi Silica. `max_tokens`, `max_completion_tokens` and `stop`
+are enforced by the bridge, since neither Windows API offers them: output is cut at the limit and the
+generation cancelled, which really does stop the accelerator rather than only the client. The tool
 parameters and a few others are accepted and ignored with one warning each per process. `n` above 1 is
 a 400.
 
@@ -130,8 +124,9 @@ everything.
 | `--laf-token`, `--laf-attestation` | none | unused on the experimental channel; prefer the settings file |
 | `--service-name`, `--task-name` | `NpuBridge`, `npu-bridge` | names for the service and logon task |
 
-Flags also exist for the context cache, history truncation, tool emulation and the request queue.
-Those features are not built, so setting them changes nothing today.
+`--queue-capacity`, `--context-cache-size`, `--truncate-history`, `--tool-emulation`, `--tool-schema`
+and `--context-window-hint` are accepted and range-checked, but nothing reads them; setting one changes
+no behaviour.
 
 Secrets belong in `appsettings.local.json`, which is gitignored. A gitleaks pre-commit hook and a
 GitHub Actions workflow scan for them; enable the hook with `git config core.hooksPath .githooks`.
@@ -148,11 +143,16 @@ never reaches the child and is dropped with a warning.
 Phi Silica uses a logon task (`NpuBridge.exe task install`, elevated); aion and fake use a service
 (`NpuBridge.exe service install`).
 
+**An over-length prompt does not come back as one.** The bridge maps a backend's prompt-too-long
+verdict to a 400 with code `context_length_exceeded`, but Phi Silica never reports one: it fails
+generically after about 26 seconds, so you get a 502, or an error frame mid-stream once headers are
+already committed. See `docs/DECISIONS.md` D55.
+
 **Token counts are estimates**, characters over four on both sides, not a tokenizer's output. Progress
 callbacks would undercount by about three times on this hardware.
 
 **One request at a time is intent, not enforcement.** Nothing serializes concurrent generations against
-the single model handle yet, and concurrent requests on hardware are untested.
+the single model handle, and concurrent requests on hardware are untested.
 
 **System prompts work, but the rendering is why.** A bare prompt through `/debug/generate` gets
 ignored; the same instruction inside the rendered transcript is obeyed. A finding from the diagnostic
@@ -169,5 +169,9 @@ docs/, memory-bank/     plan, decisions, deferred work, session handoff, project
 ```
 
 `NpuBridge.Core` has no WinRT references, so the tests run without the NPU. Start with `docs/PLAN.md`
-for the design, `docs/DECISIONS.md` for why things are the way they are, and `docs/FUTURE.md` for
-what is deliberately not done.
+for the design and the order remaining work lands in, `docs/DECISIONS.md` for why things are the way
+they are, and `docs/FUTURE.md` for what is deliberately not done.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
