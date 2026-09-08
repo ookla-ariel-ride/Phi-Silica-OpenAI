@@ -1,97 +1,103 @@
-# Session handoff — 2026-09-05
+# Session handoff — 2026-09-07
 
-Supersedes the 2026-09-03 handoff (in git history). Everything below was verified at write time.
+Supersedes the 2026-09-05 handoff (in git history). Everything below was verified at write time.
 
 ## TL;DR
 
-- **Chunks 1, 2 and 3 of 8 are done**, on `main`, pushed to
-  `https://github.com/ookla-ariel-ride/Phi-Silica-OpenAI` (private).
-- `POST /v1/chat/completions` works non-streaming, on the real NPU. Next is **chunk 4** (streaming SSE).
-- Chunk 4 has a named opening task: extract the request pipeline before writing the streaming path.
+- Chunks 1 to 3 are merged on `main`. **Chunk 4 (streaming) is code-complete on branch
+  `chunk-4-streaming` and is NOT merged.** One gate remains: the whole-branch review.
+- 372 tests pass. `scripts/smoke.ps1 -Backend phi-silica` passes every step in about 142 seconds.
+- Two long-open questions were answered on hardware this session. Both changed what later chunks
+  should do.
 
-## Verified at write time (2026-09-05)
+## State at write time
 
 | Check | Result |
 |---|---|
 | `dotnet build` | clean, 0 warnings |
-| `dotnet test` | **279 passed**, 0 failed |
-| `scripts/smoke.ps1 -Backend fake` | exits 0: all passed, 3 skipped, 2 informational |
-| `scripts/smoke.ps1 -Backend phi-silica` | **all steps passed**, 2 skipped, 2 informational |
-| `git status` | clean, `main` in sync with `origin/main` |
+| `dotnet test` | **372 passed**, 0 failed |
+| 8 suites in parallel | all green (a flaky pair was found and fixed this session) |
+| `smoke.ps1 -Backend fake` | exits 0 |
+| `smoke.ps1 -Backend phi-silica` | **all steps passed**, 1 skipped, 4 informational, 142 s |
+| `main` | at `d67a5af`, in sync with origin |
+| `chunk-4-streaming` | 10 commits ahead of `main`, unmerged |
 
-Real-NPU numbers from the final run: cold model load 23.6 s (it varies: 15.7 s earlier the same day,
-~10 s after chunk 2), `/debug/generate` 11 callbacks for 178 chars with 1.66 s to first token, and
-`/v1/chat/completions` returning a short reply in 899 ms.
+## What chunk 4 built
 
-## What chunk 3 settled, and how
+`POST /v1/chat/completions` now streams. The chunk ran as five reviewed tasks:
 
-Built as four subagent tasks, each with its own spec-and-quality review, plus a Codex adversarial
-review and a whole-branch review. Two fix rounds, both verified against the running exe.
+1. **Extract the preparation phase.** A pure refactor, demanded by chunk 3's whole-branch review, so
+   the two response shapes share parsing, validation, readiness, warnings, placement and rendering
+   instead of drifting. Done first on purpose: it was an extension, and would have been a rewrite later.
+2. **The streaming happy path.** Deltas cross from the WinRT callback thread to the request through a
+   `Channel<string>`; nothing writes to the response from that callback.
+3. **The failure paths.** Mid-stream error frame, client-disconnect handling, keep-alive comments, and
+   two defects a review found: a context disposed while generation was still running against it, and an
+   over-length prompt reported to the client as a successful `stop`.
+4. **The client-side cut.** `max_tokens`, `max_completion_tokens` and `stop`, on both shapes, since
+   neither Windows API offers them.
+5. **Smoke steps and measurements.** The streaming step is no longer skipped, and three measurements
+   were added.
 
-- **The model does obey system prompts** (D45). Both placements returned "I am Ada." exactly as
-  instructed, while the same run shows `/debug/generate` still answering "AI Assistant". The chunk 2
-  observation belonged to the bare diagnostic path, not the model. This matters for chunk 6: Aion has
-  no native system context, and the folded placement is now known to work.
-- **Callbacks undercount tokens by ~3x** (D44). One generation: 29 callbacks, 367 chars.
-  `completion_tokens` is `ceil(chars/4)`.
-- **Codex found a crash the other reviews missed**: `{"messages":[null]}` returned HTTP 500 (D49).
-- **The final review found a latent chunk 6 bug**: forcing native placement rejected every request,
-  even ones with no system message (D50).
+Decisions D51 to D55 record the choices. `docs/FUTURE.md` has a chunk 4 deferrals section.
 
-Decisions D43-D50 in `docs/DECISIONS.md`. Deferrals in the chunk 3 section of `docs/FUTURE.md`.
+## The two hardware findings that matter for later chunks
 
-## Chunk 4 (next): streaming SSE
+**Cancelling really does stop the NPU (D54).** Open since the research phase, because the WinRT cancel
+is advisory and nobody had established whether the device stops or runs to completion. Measured on the
+streaming path with the client-side cut: an early cut took 0.34 of the control end to end and 0.09 of
+the decode phase, and a request is not answered until its generation ends. The device stopped.
 
-**Do this first**, per the whole-branch review: the request handler is one long method owning parse,
-validate, readiness, warn, placement, render, generate, shape and log. The streaming path needs
-everything up to generation and nothing after it. Extract that prepared-request shape **before**
-writing the streaming path, or the two paths will drift on readiness, placement and usage. It is an
-extension if done first and a rewrite if done later.
+**Phi Silica does not report an over-length prompt as over-length (D55).** A 225,042-character prompt
+gives a *generic* error after 26.5 seconds, while `GetUsablePromptLength` answers 13,429 usable
+immediately and correctly. Consequences, both real:
 
-Then: the SSE writer, the `Channel` hand-off from the WinRT callback thread (never write to the
-response from that thread), `chat.completion.chunk` framing, `finish_reason` on the last real chunk,
-`data: [DONE]`, the mid-stream error event, disconnect-cancel-drain, keep-alive comments,
-`stream_options.include_usage`, and the `max_tokens`/`stop` client-side cut that chunk 3 accepted and
-ignored. Chunk 4 also removes the `stream: true` 400 (D46) and un-skips the smoke test's streaming step.
+- `400 context_length_exceeded` is likely unreachable on this backend without a preflight. The mapping
+  still exists and is still tested against the fake, but no observed Phi Silica generation has returned
+  that status.
+- **Chunk 5 must drive overflow detection and the truncation loop off the preflight**, not off a failed
+  generation's status. Waiting for the generation to refuse costs about 26 seconds per attempt and
+  cannot tell overflow from any other backend fault.
+- Aion has no `GetUsablePromptLength` at all, so chunk 6 should expect a third behaviour rather than
+  assume either of these.
 
-## Two things chunk 5 must not get wrong
+## Do this next
 
-Both are in `docs/FUTURE.md` with the reasoning:
-
-1. The prompt template does not escape its own turn markers, **and** the rendered prompt omits the
-   system text under native placement, **and** a bare single user message bypasses the markers
-   entirely. PLAN 2.5's cache key is a canonical rendering of `(system, turns)`, which is a different
-   function from what `PromptTemplate` returns. Do not hash the rendered prompt.
-2. `ChatMessage` has no `tool_calls` field, so assistant tool history is dropped on deserialization.
-   Chunk 5's canonicalization and chunk 7 both need it.
+1. **Run the whole-branch review of `chunk-4-streaming`** against `main..HEAD`. It is the one gate the
+   chunk has not passed. Chunk 3's equivalent review found a latent bug that would have rejected all
+   traffic once the Aion adapter arrived, so it is not a formality.
+2. Fix what it finds, then fast-forward merge to `main` and push.
+3. Then chunk 5, the context cache, which has two blockers waiting in `docs/FUTURE.md`:
+   - The prompt template's output is **not** a safe cache key. Turn markers are unescaped, the system
+     text is omitted from the rendered prompt under native placement, and a lone user message is passed
+     through raw with no markers at all. The plan's cache key is a canonical rendering of the system
+     text plus the turns, which is a different function. Do not hash `PromptTemplate.Render`'s output.
+   - `ChatMessage` has no `tool_calls` field, so an assistant message that made a tool call
+     deserializes to an empty turn. Chunk 5 needs it for canonicalization; chunk 7 needs it outright.
 
 ## Machine facts (do not re-discover)
 
 - This PC is the Copilot+ target: Galaxy Book4 Edge, Snapdragon X Elite, Windows 11 ARM64 build 29648.
   Git Bash reports `AMD64` under emulation; trust PowerShell.
-- .NET SDK 10.0.400 arm64. Sparse package registered, PFN `NpuBridge_jtas4mnxdyzpe`, cert expires
+- .NET SDK 10.0.400 arm64. Sparse package registered, PFN `NpuBridge_jtas4mnxdyzpe`, certificate expires
   2031-09-01. Windows App Runtime 2.4.1-experimental is what the exe binds to.
 - The Aion framework MSIX is still not installed; that is chunk 6.
 - gitleaks pre-commit hook active (`git config core.hooksPath .githooks`).
+- Measured 2026-09-07: cold model load 15 to 26 s (it varies), first token roughly 0.7 to 3 s, a short
+  streamed reply end to end in about 1 s, roughly 10 tokens per second.
+
+## Settled, do not re-raise
+
+- Agent skill files are untracked and gitignored; the scaffold `SKILL.md` was deleted.
+- The LAF token is deliberately not being pursued; the experimental channel is the choice, not a
+  pending task.
+- Work happens on a branch and fast-forward merges when verified.
 
 ## Resume checklist
 
 ```powershell
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\Phi-Silica-OpenAI
-git status; git log --oneline | Select-Object -First 3   # expect a clean tree, main in sync
-dotnet build; dotnet test                                # expect 279 passed
-.\scripts\smoke.ps1 -Backend phi-silica -Port 5298       # expect all passed, 2 skipped, 2 informational
+git status; git log --oneline main..HEAD    # expect 10 unmerged commits on chunk-4-streaming
+dotnet build; dotnet test                   # expect 372 passed
+.\scripts\smoke.ps1 -Backend phi-silica -Port 5298   # expect all passed, 1 skipped, 4 informational
 ```
-
-## Owner decisions, settled 2026-09-06
-
-All three long-standing items are closed. Do not re-raise them.
-
-1. **Agent skill files: untracked.** The `powershell-master` files under `.agents/` and `.claude/`, and
-   `skills-lock.json`, are a local tool install rather than part of this project. They are out of git,
-   still on disk, and now gitignored. The scaffold `SKILL.md` in the repo root was deleted.
-2. **LAF token: not being pursued.** Staying on the experimental Windows App SDK channel is a
-   deliberate choice, not a pending task. The switch back to stable remains cheap if a token ever
-   arrives (two version strings and one manifest line, per D31), but nobody is waiting on it.
-3. **Chunk 4: go given.** Work happens on a branch and fast-forward merges when the chunk is verified,
-   the same as chunk 3.
