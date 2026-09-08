@@ -185,7 +185,14 @@ internal sealed class ChatCompletionsEndpoint
             // Cancelled now reaches here legitimately whenever a limit fired.
             var filtered = result.Status is GenerationStatus.ContentFiltered or GenerationStatus.BlockedByPolicy;
 
-            if (!filtered && cut.FinishReason is null && GenerationFailure.FromStatus(result) is { } failure)
+            // Only a Cancelled may be attributed to the cut. Gating the whole mapping on "a cut fired"
+            // suppressed every failure status, which is a regression against main: an Error that used to
+            // be a 502 became HTTP 200 with truncated text and finish_reason "length". Worse here than
+            // on the stream, because the whole-text cut can report a cap the watcher never cancelled
+            // for, so the suppression did not even need a cancellation to have happened.
+            var selfCancelled = cut.FinishReason is not null && result.Status is GenerationStatus.Cancelled;
+
+            if (!filtered && !selfCancelled && GenerationFailure.FromStatus(result) is { } failure)
             {
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
                     status: result.Status.ToString(), finish: "-", httpStatus: failure.StatusCode);

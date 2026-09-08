@@ -809,6 +809,63 @@ public class ChatCompletionsStreamingTests
             .Select(l => l["data: ".Length..])
             .ToList();
 
+    /// <summary>
+    /// The context is disposed even when cancelling the generation throws. The cancel that opens the
+    /// finally was the one statement in the handler outside a <c>try</c>, and it stands immediately
+    /// before the drain and the dispose: a throw there skipped both, leaking the live WinRT handle D43
+    /// guarantees is released. Worse than the D51 defect it sits next to, which disposed too early
+    /// rather than never.
+    /// </summary>
+    [Fact]
+    public async Task A_throwing_cancellation_registration_still_drains_and_disposes_the_context()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => ["Hello", " world"],
+            ThrowFromCancellationRegistration = true,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await PostStreamAsync(host);
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Contains("[DONE]", body, StringComparison.Ordinal);
+
+        await WaitUntilAsync(() => fake.ActiveContexts == 0);
+        Assert.Equal(1, fake.ContextsCreated);
+        Assert.Equal(1, fake.ContextsDisposed);
+    }
+
+    /// <summary>
+    /// A cancellation that is not the client's. Excluding <see cref="OperationCanceledException"/> from
+    /// the second catch left the case "cancelled, but <c>RequestAborted</c> is not set" matching neither
+    /// filter, so it escaped as an unhandled request exception mid-stream instead of being reported —
+    /// which is what an adapter breaking the contract about swallowing the runtime's own cancellation
+    /// produces, and the cut's linked token makes that reachable without the client going anywhere.
+    /// </summary>
+    [Fact]
+    public async Task A_cancellation_that_is_not_the_clients_is_reported_rather_than_escaping()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => ["Hello", " world"],
+            FailAfterTokens = 1,
+            FailureException = new OperationCanceledException("adapter let the runtime's cancellation escape"),
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await PostStreamAsync(host);
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Contains("\"error\"", body, StringComparison.Ordinal);
+        Assert.Contains("[DONE]", body, StringComparison.Ordinal);
+
+        await WaitUntilAsync(() => fake.ActiveContexts == 0);
+        Assert.Equal(1, fake.ContextsDisposed);
+    }
+
     private static object Body(string? model, bool? stream, bool? includeUsage = null) => new
     {
         model,

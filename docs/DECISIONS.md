@@ -449,3 +449,69 @@ capability, and chunk 6 should expect a third behaviour rather than assume eithe
 
 This is also why D52's over-length reasoning was rewritten rather than annotated: the header deferral
 was justified partly by a race it cannot win on this hardware, and the honest version says so.
+
+## 2026-09-07 — Chunk 4 whole-branch review
+
+Four independent reviewers over `main..HEAD` — three Claude passes (streaming races and `IDisposable`
+lifetime; OpenAI wire conformance; correctness and untested branches) and one Codex pass. Three of the
+findings below were reported by three or four of them independently, which is the reason they are fixes
+rather than deferrals. Everything they raised that is not fixed here is in `docs/FUTURE.md` under the
+chunk 4 deferrals; the chunk was not widened to absorb it.
+
+Two things the review confirmed rather than changed, both worth recording because they were the reasons
+this pass existed: the D51 cancel-drain-dispose fix is genuinely complete (every path that creates a
+context was enumerated and each disposes exactly once, after the generation ends), and the extraction
+of `ChatRequestPreparation` is behaviour-preserving (compared statement by statement against main's
+endpoint by two reviewers, including the D50 ordering and the `Retry-After` rule).
+
+**D56. A cut may reinterpret `Cancelled` and nothing else.** Both shapes gated the whole of
+`GenerationFailure.FromStatus` on "a cut fired", which suppressed every failure status rather than the
+self-inflicted cancellation it was written for. A backend `Error` arriving alongside a cut was answered
+with HTTP 200, truncated text and `finish_reason: "stop"` — the client had no way to know the
+generation faulted. On the JSON path this was a **regression against main**, which always answered 502,
+and it did not even need a cancellation to have happened: the whole-text cut can report a cap the
+watcher never cancelled for, because with a long stop string the watcher is still waiting for lookahead
+when the generation ends. It matters most on this hardware, since D55 established that a real Phi Silica
+prompt overflow surfaces as exactly that generic `Error`. The guard is now
+`cut && status is Cancelled`. On the stream, `IsCut` is deliberately still read *before* the flush: a cut
+committed while streaming is the only kind that could have caused the cancellation.
+
+**D57. The finish reason is read after the flush, not before.** `Flush()` can be the call that commits
+the cap — it is deferred until the text runs `Holdback` past the budget (D53), so a reply ending inside
+that window is only cut at the end. Reading `FinishReason` first labelled such a request `stop` while
+the JSON path, which reads it after its own flush, called the same generation `length`. A client that
+resumes on `length` stopped silently instead. This is the drift the shared-cutter design exists to
+prevent, and it survived four earlier task reviews because every existing cross-shape case had the reply
+overrun the budget by more than `Holdback`, skipping the disagreement region entirely.
+
+**D58. Neither the holdback nor the budget may slice a surrogate pair.** Both are character counts with
+no relationship to character boundaries, so both could land between the halves of an astral character.
+That does not delay the character, it destroys it: each slice is serialized as its own JSON string and
+`System.Text.Json` writes a lone surrogate as U+FFFD, so an emoji split across two SSE frames reaches
+the client as two replacement characters no client can reassemble. Slice indexes now step back one when
+they would split a pair, which on a cap also keeps `ceil(chars/4)` under the budget rather than over it.
+No test in the suite used a non-BMP character, so nothing could have caught it.
+
+**D59. A stop match is committed only once no longer stop string starting earlier can still form.** With
+`stop: ["abcd", "b"]`, `"ab"` + `"cd"` cut at index 1 while the same text as one delta cut at 0 — the
+reply depended on how the runtime happened to batch its callbacks, which is precisely what the holdback
+exists to prevent. The holdback was being applied to the *release* but not to the *cut*. A match is
+settled when `_pending.Length - stopAt >= Holdback`, which is the same evidence rule in the same place.
+
+**D60. The dispose guarantee is not allowed to depend on the cancel succeeding.**
+`await generationCts.CancelAsync()` was the one statement in the streaming handler outside a `try`, and
+it stands immediately before the drain and `context.Dispose()`. `CancelAsync` faults when a registration
+on the token throws, and CsWinRT registers one that calls `IAsyncInfo.Cancel()` on the live WinRT
+operation — a COM call that can fail rather than no-op. A throw there skipped both the drain and the
+disposal, leaking the handle D43 guarantees is released: worse than the D51 defect it sits beside, which
+disposed too early rather than never. Now guarded. Relatedly, the second `catch` no longer excludes
+`OperationCanceledException`, so the two clauses really are exhaustive and "no unhandled exception
+escapes" is unconditional rather than nearly always true — the gap was "cancelled, but not by the
+client", which an adapter that lets the runtime's cancellation escape produces through the cut's own
+linked token.
+
+**D61. A test that fails one run in 65 is a broken test.** `Streaming_never_leaks_a_stop_string_split
+_across_deltas` asserted `DoesNotContain("EN")` over the whole wire body, but the chunk id is repeated
+on every frame and is Crockford base32 — an alphabet containing both E and N. Measured over 200,000
+generated ids, 1.54% contain `EN`. The ids are stripped before the assertion now; the claim is about the
+text the bridge wrote, not the identifier it drew.

@@ -178,7 +178,18 @@ internal sealed class ChatCompletionsStreamEndpoint
             // A generation this handler cancelled because a limit fired reports Cancelled, which is a
             // 502 for every other reason. The cut is what tells those apart, so it is consulted first —
             // as it is on the JSON path, in the same order, for the same reason.
-            if (!cutter.IsCut && GenerationFailure.FromStatus(result) is { } failure)
+            //
+            // Only Cancelled, though. "A cut fired" is not a licence to discard every other status: a
+            // backend that reports Error after the cut has still failed, and on this hardware that is
+            // not hypothetical -- D55 established that a real prompt overflow surfaces as exactly that
+            // generic Error. Suppressing it hands the client HTTP 200, a truncated reply and
+            // finish_reason "stop", with nothing to say the generation faulted.
+            //
+            // IsCut is read before the flush deliberately: a cut this handler committed while streaming
+            // is the only kind that could have caused the cancellation, and one established later by
+            // Flush() cannot have, because nothing cancelled for it.
+            var selfCancelled = cutter.IsCut && result.Status is GenerationStatus.Cancelled;
+            if (!selfCancelled && GenerationFailure.FromStatus(result) is { } failure)
             {
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
                     status: result.Status.ToString(), finish: "-",
@@ -200,7 +211,6 @@ internal sealed class ChatCompletionsStreamEndpoint
             // finish reason rather than an error, exactly as on the JSON path — and, as there, it
             // outranks the cut, so the two shapes label the same outcome the same way.
             var filtered = result.Status is GenerationStatus.ContentFiltered or GenerationStatus.BlockedByPolicy;
-            var finishReason = filtered ? "content_filter" : cutter.FinishReason ?? "stop";
 
             // The held tail. The generation ended without a stop string forming, so the characters that
             // were withheld in case they were its first half are ordinary output after all and must go
@@ -212,6 +222,14 @@ internal sealed class ChatCompletionsStreamEndpoint
             // cannot be recalled, but these have not been written yet and the bridge now knows they were
             // withheld: writing them here would be the one place a filtered reply gained text.
             var tail = filtered ? string.Empty : cutter.Flush();
+
+            // Read after the flush, never before. Flush() can be the call that commits the cap: it is
+            // deliberately deferred until the text runs Holdback past the budget, so a reply that ends
+            // inside that window is only cut here. Reading FinishReason first labelled such a request
+            // "stop" on this shape while the JSON path -- which reads it after its own flush -- called
+            // the very same generation "length", and a client that resumes on "length" stopped instead.
+            var finishReason = filtered ? "content_filter" : cutter.FinishReason ?? "stop";
+
             if (tail.Length > 0)
             {
                 await sse.WriteChunkAsync(Chunk(requestId, created, model,
@@ -257,7 +275,13 @@ internal sealed class ChatCompletionsStreamEndpoint
                 finish: "-", httpStatus: 0);
             return null;
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        // Unfiltered, so that the two clauses together really are exhaustive. Excluding
+        // OperationCanceledException here left the case "cancelled, but not by the client" uncaught: an
+        // adapter that breaks the ILanguageModelBackend rule about swallowing the runtime's cancellation
+        // lets one out of the cut's own linked token, RequestAborted is not set, neither filter matches,
+        // and the request dies as an unhandled exception mid-stream instead of emitting its finish chunk.
+        // A cancellation that reaches here is a generation that failed, and is reported as one.
+        catch (Exception ex)
         {
             var failure = GenerationFailure.FromException(ex);
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs: 0, tokens: 0,
@@ -271,7 +295,21 @@ internal sealed class ChatCompletionsStreamEndpoint
             // live WinRT handle that the generation task may still be generating against; disposing it
             // while that task runs is a use-after-dispose, not merely an unobserved task. Cancelling
             // first is what keeps the wait short; awaiting is what makes the disposal safe.
-            await generationCts.CancelAsync().ConfigureAwait(false);
+            // Guarded because this was the one statement in the method outside a try, and it stands
+            // between a failure and the disposal below. CancelAsync faults when a registration on the
+            // token throws, and CsWinRT registers one that calls IAsyncInfo.Cancel() on the live WinRT
+            // operation -- a COM call that can fail rather than no-op. Letting it escape would skip both
+            // the drain and Dispose(), leaking exactly the handle D43 guarantees is released: worse than
+            // the D51 defect, which disposed too early rather than never.
+            try
+            {
+                await generationCts.CancelAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                logger.LogDebug(ex, "req={RequestId} cancelling the generation threw; draining and disposing anyway.",
+                    requestId);
+            }
 
             if (generation is not null)
             {

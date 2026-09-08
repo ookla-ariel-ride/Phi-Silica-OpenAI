@@ -46,6 +46,71 @@ land here instead of widening the chunk. Each entry says where it came from and 
   when `tools` is present). Undocumented until now; a client that relies on the JSON path's blanking will
   be surprised by the stream.
 
+### From the whole-branch review
+
+- **A cut against a backend that ignores cancellation stalls the stream.** After the cut the handler
+  breaks out of the reader loop and waits on the generation before writing the finish chunk and
+  `[DONE]`, and keep-alives cover only the wait for the *first* delta — so that window is silent. Not
+  currently reachable on Phi Silica: D54 measured that cancelling really does stop the NPU. It becomes
+  real for a backend that does not, which is what chunk 6 brings — Aion's WinRT surface has no cancel at
+  all. The client would sit through the rest of a generation whose answer it already has, and a 30 s read
+  timeout would abort it. Part of the same fix: `BackendCapabilities.Cancellation` is declared on both
+  adapters and **read by nothing**, so the cut assumes cancellation works and has no degraded path.
+- **Late deltas may be dropped from a stream while the JSON path keeps them.** `PhiSilicaBackend`
+  deliberately discards callbacks arriving after its completion barrier but can still return their text
+  in `result.Text`. The streaming path sees only delivered callbacks, so a delta that loses that race is
+  absent from the stream and present in the non-streaming reply for the same generation, with `usage`
+  under-reporting to match. Unverified on hardware — the timing comes from the adapter's own comments,
+  not an observed run — and it needs a real NPU test before it is fixed or dismissed. Chunk 4 newly makes
+  "`Text` is the concatenation of the deltas" load-bearing for the cut, so the adapter is the right place
+  to enforce it: assert `Partial()` against `result.Text` on `Complete`, or return `Partial()` always.
+- **`finish_reason` and `usage` are omitted rather than sent as `null`.** Real OpenAI emits
+  `"finish_reason": null` on every content chunk and `"usage": null` on all but the last under
+  `include_usage`; the bridge omits both keys. The Python client and the Vercel AI SDK survive it, but a
+  strictly generated client — an OpenAPI-derived Java or C# SDK where `finish_reason` is a declared
+  property — can reject the frame. The same mechanism would let the error envelope carry its `param` and
+  `code` keys explicitly instead of dropping them, which a client branching on `err.code` cannot read.
+- **Validation is more permissive than OpenAI in three places.** `stop` is unbounded where OpenAI caps it
+  at 4 — and an enormous stop string makes the holdback, and so the stream's latency, client-controlled;
+  `n: 0` is accepted and answered with one choice where OpenAI requires `n >= 1`; and `stream_options`
+  sent without `stream: true` is silently ignored where OpenAI returns a 400, so the bridge hides that
+  client bug instead of surfacing it.
+- **The chars/4 estimate is wrong by roughly 4x for non-Latin output.** D44 owns the estimate, but not
+  this consequence: for CJK, Cyrillic or heavy-emoji text the real ratio is nearer one token per
+  character, so `max_tokens: 100` permits about 400 real tokens and `usage` under-reports by the same
+  factor. An agent loop keeping its own context ledger from `usage` — Hermes and OpenCode both do —
+  overflows the window several turns before it expects to. Not fixable without a tokenizer.
+- **`usage` disagrees between the shapes on a filtered reply.** Extends the content asymmetry above: the
+  stream counts what it actually sent (`cutter.ContentLength`) while the JSON path counts the blanked
+  content, so the same filtered generation reports N completion tokens streamed and 0 as JSON. No test
+  asserts either number, so the divergence is unpinned.
+- **A client that disconnects while uploading its body throws an unhandled `OperationCanceledException`.**
+  `ChatRequestPreparation` guards `ReadFromJsonAsync` for `JsonException` and `InvalidOperationException`
+  only. Pre-existing and identical on main — the extraction merely moved it — but the streaming path now
+  shares it.
+- **The non-streaming callback can touch a disposed `CancellationTokenSource`.** `CancelAfter` runs on
+  the backend's progress thread, and `PhiSilicaBackend.DrainCallbacks()` bounds its wait for in-flight
+  callbacks at 5 s then continues anyway; a straggler past that bound calls `CancelAfter` on a source the
+  request has already disposed. Harmless today only because the adapter wraps `onDelta` in a try/catch
+  whose result is by then never read. The streaming path is immune by construction — its sink touches
+  only `Interlocked` and a channel writer.
+- **No backpressure on a slow client.** The delta channel is unbounded, which is right for keeping the
+  WinRT thread non-blocking, but a client that is slow rather than gone stalls the writer while the
+  backend keeps generating into memory, and nothing signals the backend to slow down. Bounded by the
+  reply length today; with no default cap and a runaway model, bounded by nothing the bridge controls.
+- **Keep-alive comment frames are a superset of OpenAI's wire output.** `: keep-alive` is valid SSE and
+  is ignored correctly by the Python client and by `eventsource-parser`, but OpenAI itself never sends
+  comments, so a hand-rolled reader assuming every line is `data:` or blank can mis-frame. Worth stating
+  in the client-compatibility notes chunk 8 owns.
+- **Coverage gaps the review named and this pass did not close.** The keep-alive-disabled branch
+  (`KeepAliveInterval <= 0`, whose documented consequence is that a late failure keeps a real HTTP
+  status) is never exercised; a client disconnecting *before the first token* — the keep-alive wait and
+  both client-gone branches of `FailAsync` — is untested, because both disconnect tests read a real chunk
+  first; and content filtering with zero deltas, where the role chunk itself commits the 200, is never
+  hit. Separately, `A_cut_cancels_the_generation_and_still_disposes_the_context_once` asserts
+  `count < 200` against a 400-token responder, which would still pass if cancellation took a full second
+  to propagate.
+
 ## Chunk 3 review deferrals
 
 - **Null fields are omitted rather than emitted as `null`, in error bodies *and* in responses.** The

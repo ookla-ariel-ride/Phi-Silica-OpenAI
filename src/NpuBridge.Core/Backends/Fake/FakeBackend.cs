@@ -170,6 +170,13 @@ public sealed partial class FakeBackend : ILanguageModelBackend
         // exists for -- disposing the context while this is still running is a use-after-dispose.
         bool ObservesCancellation() => _options.CancellationGate?.Task.IsCompleted ?? true;
 
+        if (_options.ThrowFromCancellationRegistration)
+        {
+            // Not disposed on purpose -- see the option's own documentation. It has to still be attached
+            // when the caller cancels in its finally.
+            cancellationToken.Register(static () => throw new InvalidOperationException("fake: cancellation registration failed"));
+        }
+
         var tokens = (_options.Responder ?? DefaultResponder)(request);
         var text = new StringBuilder();
         var emitted = 0;
@@ -358,6 +365,16 @@ public sealed class FakeBackendOptions
 
     /// <summary>Simulated context window in characters (context history + prompt). Null = unlimited.</summary>
     public int? MaxPromptChars { get; set; }
+
+    /// <summary>
+    /// Leaves a callback on the caller's cancellation token that throws when the token is cancelled.
+    /// <see cref="CancellationTokenSource.CancelAsync"/> collects such a throw and faults the task it
+    /// returns, which is how a real CsWinRT registration behaves when the <c>IAsyncInfo.Cancel()</c> it
+    /// makes on the live WinRT operation fails rather than no-ops. The registration is deliberately not
+    /// disposed, so it outlives the generation and it is the caller's own cancel — the one in its
+    /// finally, standing immediately before the context is disposed — that trips it.
+    /// </summary>
+    public bool ThrowFromCancellationRegistration { get; set; }
 }
 
 /// <summary>What the fake backend saw for one generation.</summary>

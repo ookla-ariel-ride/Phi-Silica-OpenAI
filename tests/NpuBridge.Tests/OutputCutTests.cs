@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using NpuBridge.Api;
+using NpuBridge.Backends;
 using NpuBridge.Backends.Fake;
 
 namespace NpuBridge.Tests;
@@ -268,7 +269,13 @@ public class OutputCutTests
         var body = await response.Content.ReadAsStringAsync();
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        Assert.DoesNotContain("EN", body, StringComparison.Ordinal);
+
+        // The chunk id is repeated on every frame and is Crockford base32, an alphabet that contains
+        // both E and N -- about 1.5% of generated ids contain "EN" somewhere, which made this assertion
+        // fail roughly one run in 65 for a reason that has nothing to do with the stop string. Strip the
+        // ids: the claim is about the text the bridge wrote, not the identifier it happened to draw.
+        var wire = System.Text.RegularExpressions.Regex.Replace(body, "chatcmpl-[0-9A-Za-z]+", "chatcmpl-");
+        Assert.DoesNotContain("EN", wire, StringComparison.Ordinal);
 
         var completion = Reduce(body);
         Assert.Equal("Hello ", completion.Content);
@@ -377,6 +384,94 @@ public class OutputCutTests
         }
     }
 
+    /// <summary>
+    /// The cap can be committed by the flush rather than by a delta: it is deliberately deferred until
+    /// the text runs <c>Holdback</c> past the budget, so a reply that ends inside that window is only cut
+    /// at the very end. Reading the finish reason before the flush labelled such a request <c>stop</c> on
+    /// the stream while the JSON path — which reads it after its own flush — called the same generation
+    /// <c>length</c>, and a client that resumes on <c>length</c> silently stopped instead.
+    /// </summary>
+    [Fact]
+    public async Task A_cap_committed_by_the_flush_is_length_on_both_shapes()
+    {
+        await using var host = await StartAsync(["123456789"]);
+
+        var streamed = await CompleteAsync(host, stream: true, Body(true, maxTokens: 2, stop: "```"));
+        var json = await CompleteAsync(host, stream: false, Body(false, maxTokens: 2, stop: "```"));
+
+        Assert.Equal("12345678", json.Content);
+        Assert.Equal("length", json.FinishReason);
+        Assert.Equal(json.Content, streamed.Content);
+        Assert.Equal(json.FinishReason, streamed.FinishReason);
+    }
+
+    /// <summary>
+    /// A cut is a licence to reinterpret <see cref="GenerationStatus.Cancelled"/> — the status this
+    /// handler's own cancellation produces — and nothing else. The whole-text cut on the JSON path can
+    /// report a cap the watcher never cancelled for, because with a long stop string it is still waiting
+    /// for lookahead when the generation ends; gating the entire failure mapping on "a cut fired" then
+    /// turned a backend <c>Error</c> into HTTP 200 with truncated text and <c>finish_reason: "length"</c>.
+    /// That is a regression against main, which always answered 502, and it is the case that matters on
+    /// this hardware: D55 established that a real prompt overflow surfaces as exactly this generic Error.
+    /// </summary>
+    [Fact]
+    public async Task A_backend_error_is_not_suppressed_by_a_cut_that_did_not_cancel_it()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => ["abcd", "efgh"],
+            FailAfterTokens = 2,
+            FailureStatus = GenerationStatus.Error,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        // Holdback 9 against a budget of 4: the eight generated characters never run far enough past the
+        // budget for the watcher to commit, so no cancellation happens and the cut is the flush's alone.
+        var response = await host.Client.PostAsJsonAsync(Path, Body(false, maxTokens: 1, stop: "ZZZZZZZZZZ"));
+
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        var error = JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement.GetProperty("error");
+        Assert.Equal("server_error", error.GetProperty("type").GetString());
+    }
+
+    /// <summary>
+    /// The other half of the same discrimination, and a path no endpoint test covered on either shape:
+    /// a <see cref="GenerationStatus.Cancelled"/> the backend reports on its own, with the client still
+    /// there and no limit set. It is a 502, not a truncated success — the cut is what distinguishes it
+    /// from the cancellation this handler asks for, and that distinction is load-bearing now.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_backend_cancelled_with_a_live_client_is_a_failure(bool stream)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => Reply,
+            FailAfterTokens = 1,
+            FailureStatus = GenerationStatus.Cancelled,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync(Path, Body(stream));
+        var body = await response.Content.ReadAsStringAsync();
+
+        if (stream)
+        {
+            // Headers are already committed, so the failure arrives as an error event and then [DONE].
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Contains("\"error\"", body, StringComparison.Ordinal);
+            Assert.DoesNotContain("\"finish_reason\":\"stop\"", body, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        }
+
+        await WaitUntilAsync(() => fake.ActiveContexts == 0);
+        Assert.Equal(fake.ContextsCreated, fake.ContextsDisposed);
+    }
+
     // ------------------------------------------------------------- the cutter itself
 
     [Fact]
@@ -452,6 +547,70 @@ public class OutputCutTests
             Assert.Equal(whole.FinishReason, cutter.FinishReason);
             Assert.Equal(whole.Text.Length, cutter.ContentLength);
         }
+    }
+
+    /// <summary>
+    /// A shorter stop string sitting inside a longer one. <c>b</c> matches at 1 while <c>abcd</c> is
+    /// still forming at 0, and committing the shorter match the moment it appeared made the reply depend
+    /// on where the runtime happened to split its callbacks: <c>"ab"</c> + <c>"cd"</c> cut at 1 and
+    /// emitted <c>a</c>, while the identical text in one delta cut at 0 and emitted nothing. A match is
+    /// only settled once no longer stop string starting earlier can still form.
+    /// </summary>
+    [Fact]
+    public void Every_split_agrees_when_a_shorter_stop_string_sits_inside_a_longer_one()
+    {
+        const string Text = "abcd";
+        var limits = Limits(null, "abcd", "b");
+        var whole = limits.Cut(Text);
+
+        Assert.Equal(string.Empty, whole.Text);
+        Assert.Equal("stop", whole.FinishReason);
+
+        for (var split = 0; split <= Text.Length; split++)
+        {
+            var cutter = new OutputCutter(limits);
+            var emitted = cutter.Accept(Text[..split]) + cutter.Accept(Text[split..]) + cutter.Flush();
+
+            Assert.Equal(whole.Text, emitted);
+            Assert.Equal(whole.FinishReason, cutter.FinishReason);
+        }
+    }
+
+    /// <summary>
+    /// Neither the holdback nor the character budget respects character boundaries, so both can slice
+    /// between the halves of a surrogate pair. That does not merely delay the character: each slice is
+    /// serialized as its own JSON string and <c>System.Text.Json</c> writes a lone surrogate as U+FFFD,
+    /// so an emoji split across two SSE frames reaches the client as two replacement characters no
+    /// client can reassemble. Asserted piece by piece, because the concatenation hides the damage.
+    /// </summary>
+    [Fact]
+    public void No_piece_of_a_release_ends_inside_a_surrogate_pair()
+    {
+        // Holdback 3 puts the release boundary on the low half of the emoji.
+        var cutter = new OutputCutter(Limits(null, "ZZZZ"));
+
+        var first = cutter.Accept("ab\U0001F600cd");
+        var tail = cutter.Flush();
+
+        Assert.Equal("ab\U0001F600cd", first + tail);
+        foreach (var piece in new[] { first, tail })
+        {
+            Assert.False(piece.Length > 0 && char.IsHighSurrogate(piece[^1]), $"'{piece}' ends on a high surrogate");
+            Assert.False(piece.Length > 0 && char.IsLowSurrogate(piece[0]), $"'{piece}' starts on a low surrogate");
+        }
+    }
+
+    /// <summary>
+    /// The same for the cap, where stepping back is also what keeps ceil(chars/4) under the budget: the
+    /// fourth character of the budget is the low half of the emoji, so the cut takes three.
+    /// </summary>
+    [Fact]
+    public void A_cap_landing_inside_a_surrogate_pair_cuts_before_it()
+    {
+        var cut = Limits(1).Cut("abc\U0001F600d");
+
+        Assert.Equal("abc", cut.Text);
+        Assert.Equal("length", cut.FinishReason);
     }
 
     [Fact]

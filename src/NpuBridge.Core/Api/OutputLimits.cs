@@ -220,8 +220,19 @@ internal sealed class OutputCutter
         // cannot pass the budget without a cut.
         var capAt = _limits.MaxChars is { } max ? max - _emitted : (int?)null;
 
+        // A match is committed only once no *longer* stop string starting earlier can still form. One
+        // beginning at q < stopAt is unresolved while q + longest > _pending.Length, so the unresolved
+        // range is non-empty exactly when _pending.Length - stopAt < Holdback. That is the same
+        // lookahead the release below buys, applied to the cut itself rather than only to the emit:
+        // without it, stop ["abcd", "b"] cuts "ab" + "cd" at 1 but the identical text as one delta at
+        // 0, and the reply depends on where the runtime happened to split its callbacks.
+        //
+        // The release cannot run ahead of an unsettled match either: safe is _pending.Length - Holdback,
+        // and unsettled means _pending.Length - Holdback < stopAt, so it stays strictly behind it.
+        var stopSettled = stopAt >= 0 && (final || _pending.Length - stopAt >= _limits.Holdback);
+
         int cutAt;
-        if (stopAt >= 0 && (capAt is null || stopAt < capAt))
+        if (stopSettled && (capAt is null || stopAt < capAt))
         {
             // The stop string itself is excluded from the output, per the OpenAI contract.
             cutAt = stopAt;
@@ -251,6 +262,7 @@ internal sealed class OutputCutter
                 safe = room;
             }
 
+            safe = NotSplittingASurrogatePair(_pending, safe);
             if (safe <= 0)
             {
                 return string.Empty;
@@ -262,9 +274,26 @@ internal sealed class OutputCutter
             return release;
         }
 
+        cutAt = NotSplittingASurrogatePair(_pending, cutAt);
         var cut = _pending[..cutAt];
         _pending = string.Empty;
         _emitted += cutAt;
         return cut;
     }
+
+    /// <summary>
+    /// Steps an index back one when it would fall between the two halves of a surrogate pair. Neither
+    /// <see cref="OutputLimits.Holdback"/> (longest stop minus one) nor <see cref="OutputLimits.MaxChars"/>
+    /// (tokens times four) has any relationship to character boundaries, so both can land mid-pair.
+    ///
+    /// Stepping back matters because the halves do not merely arrive late, they are destroyed: each
+    /// slice is serialized as its own JSON string, and <c>System.Text.Json</c> writes a lone surrogate
+    /// as U+FFFD, so an emoji split across two SSE frames reaches the client as two replacement
+    /// characters that no client can reassemble. It is always safe: on a release the low half stays
+    /// pending for the next one, and on a cap it leaves ceil(chars/4) under the budget, never over.
+    /// </summary>
+    private static int NotSplittingASurrogatePair(string text, int index) =>
+        index > 0 && index < text.Length && char.IsLowSurrogate(text[index]) && char.IsHighSurrogate(text[index - 1])
+            ? index - 1
+            : index;
 }
