@@ -33,9 +33,11 @@ so those tools can run fully local, offline, and free.
 - Default listener `http://127.0.0.1:5273`; default backend `phi-silica`.
 - Model ids: `phi-silica` and `fake` today; `aion-instruct` is planned for chunk 6, when the Aion
   adapter lands — no backend emits it yet.
-- `POST /v1/chat/completions` works end to end, **non-streaming only**: a client gets a correct
-  OpenAI-shaped response with message content, `finish_reason` and a `usage` block. `stream: true`
-  is rejected with HTTP 400 until chunk 4 lands SSE, rather than returning a body the client can't parse.
+- `POST /v1/chat/completions` works end to end on both response shapes: a non-streaming client gets a
+  correct OpenAI-shaped response with message content, `finish_reason` and a `usage` block; `stream:
+  true` gets server-sent events (one `chat.completion.chunk` per delta, keep-alive comments while the
+  first token is pending, an optional `usage` chunk, then `data: [DONE]`). `max_tokens`,
+  `max_completion_tokens` and `stop` are enforced by the bridge on both shapes (D53).
 - A system message is delivered to the model by default (`--system-prompt-placement auto`, native
   context when the backend supports one), and the model does follow it under both placements (D45).
   `max_tokens`,

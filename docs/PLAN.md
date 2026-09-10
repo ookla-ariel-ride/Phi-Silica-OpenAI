@@ -1,7 +1,7 @@
 # npu-bridge — Plan
 
 OpenAI-compatible HTTP endpoint over the Copilot+ PC on-device language model (Phi Silica today,
-Aion Instruct Preview next). Status: **signed off (§4); chunks 1 to 3 of 8 built and merged; chunk 4
+Aion Instruct Preview next). Status: **signed off (§4); chunks 1 to 4 of 8 built and merged; chunk 5
 next.** This document is the historical design record and is not updated to match the code as it
 ships — current state lives in `memory-bank/progress.md`, and decisions made since sign-off are in
 `docs/DECISIONS.md`.
@@ -388,7 +388,7 @@ build + tests green, an adversarial review pass, and updates to `DECISIONS.md` /
 | 1 | **Done.** **Skeleton.** Solution, Core/exe/tests, config precedence, Kestrel host, `/healthz`, `/v1/models`, `ILanguageModelBackend` + `FakeBackend`, service verbs, `packaging/AppxManifest.xml` + `scripts/identity.ps1`, `DECISIONS.md`/`FUTURE.md` seeded. | build, tests, config tests | `identity.ps1` registers, PFN printed, `/healthz` shows `package_identity:true` |
 | 2 | **Done.** **Phi Silica adapter (thin).** `PhiSilicaBackend`: WAR bootstrap, LAF unlock (optional token), ready-state, `CreateAsync`, `CreateContext(system)`, options mapping, status mapping, `GetUsablePromptLength`. `scripts/smoke.ps1` v1 (health + one non-streaming prompt). | compiles for ARM64 | smoke test; you can start it as soon as chunk 3 lands even without a token if the SDK channel doesn't need one |
 | 3 | **Done.** **Non-streaming `/v1/chat/completions`.** Request DTOs + validation, `PromptTemplate`, pipeline (no cache yet: fresh context per request), usage estimate, error mapping, per-request log line, `--verbose`. | full test coverage via TestServer + FakeBackend | first real end-to-end on the NPU |
-| 4 | **Streaming SSE.** Channel hand-off, chunk framing, `[DONE]`, mid-stream error event, disconnect → cancel + drain, keep-alive, `stream_options.include_usage`, `max_tokens`/`stop` client-side cut. | tests for framing, error, cancel timing | tok/s numbers, does `Cancel()` actually stop the NPU |
+| 4 | **Done.** **Streaming SSE.** Channel hand-off, chunk framing, `[DONE]`, mid-stream error event, disconnect → cancel + drain, keep-alive, `stream_options.include_usage`, `max_tokens`/`stop` client-side cut. | tests for framing, error, cancel timing | tok/s numbers, does `Cancel()` actually stop the NPU |
 | 5 | **Context cache + overflow.** LRU cache, prefix hashing, exclusive checkout, dispose-on-failure, `context_length_exceeded`, `--truncate-history` loop with preflight, pressure logging, header. | tests incl. leak counting on the fake | cache hit latency on real hardware |
 | 6 | **Aion adapter.** `FrameworkDependency` (from the sample), `AionBackend`, `nuget.config` + `nuget-local/` with the 1.0.0 nupkg, smoke script gains `-Backend aion`. | compiles for ARM64 | smoke test after `Bootstrap.ps1`-style framework install |
 | 7 | **Tool emulation.** Injection, compact schema renderer, tolerant parser, response shaping, tool-result rendering, streaming buffering. Largest test file in the repo. | adversarial parser tests, end-to-end via scripted fake outputs | compliance probe in `smoke.ps1` |

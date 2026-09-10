@@ -111,6 +111,25 @@ land here instead of widening the chunk. Each entry says where it came from and 
   `count < 200` against a 400-token responder, which would still pass if cancellation took a full second
   to propagate.
 
+## 2026-09-10 whole-project review notes
+
+Found by a read of the merged tree after chunk 4, none load-bearing, none fixed in that session:
+
+- **The JSON path lets a non-client cancellation escape as a bare 500.** `ChatCompletionsEndpoint`'s
+  catch excludes `OperationCanceledException`, while its streaming sibling deliberately catches one
+  (with a test) for the case where an adapter breaks the contract and lets the cut's own cancellation
+  out while the client is still connected. On the JSON path the same event is an unhandled exception:
+  HTTP 500 with no OpenAI envelope. The fake obeys the contract, so it is unreachable today; fix by
+  catching it when `http.RequestAborted` is not set and mapping it through `GenerationFailure`.
+- **`SseStream.Started` flips before the first write has succeeded.** If that write throws for a
+  reason other than the client leaving, the failure path believes the status line is spent and tries
+  to write an error frame instead of returning a plain HTTP error. `HttpResponse.HasStarted` answers
+  the actual question. Only reachable on a write failure with the client still present.
+- **`identity.ps1 -Install` removes the old registration before adding the new one.** A failing
+  `Add-AppxPackage` leaves no package registered, and the next `--backend phi-silica` start fails with
+  "no package is registered". Register first and remove the previous full name afterwards, or remove
+  only after a successful add. Not observed; every install so far has succeeded.
+
 ## Chunk 3 review deferrals
 
 - **Null fields are omitted rather than emitted as `null`, in error bodies *and* in responses.** The

@@ -3,7 +3,7 @@
 ## Works today (verified)
 | Area | Status | Evidence |
 |---|---|---|
-| Solution, build, tests | ✅ | `dotnet build` clean, 279 xunit tests green (chunk 3, 2026-09-05) |
+| Solution, build, tests | ✅ | `dotnet build` clean, 381 xunit tests green (chunk 4 merged; re-verified 2026-09-10) |
 | `/healthz`, `/v1/models`, `/v1` fallback | ✅ | TestServer tests + live curl on the exe |
 | Config precedence json < local < env < CLI | ✅ | real-file test + live probes |
 | CLI verbs `run`, `service`, `task`, `help`, `version` | ✅ | tests + live exit codes |
@@ -11,15 +11,18 @@
 | Sparse package identity (`identity.ps1`) | ✅ | registered; PFN `NpuBridge_jtas4mnxdyzpe` |
 | Self-relaunch via package activation + supervision | ✅ | child had identity, saw shell env, died with the parent |
 | Phi Silica adapter (experimental SDK) | ✅ | smoke: generate, preflight, system prompt, disconnect drain |
-| `/v1/chat/completions` non-streaming | ✅ | 279 tests; smoke on the real NPU: 677 ms–899 ms across runs, correct shape and usage |
+| `/v1/chat/completions` non-streaming | ✅ | `ChatCompletionsTests`; smoke on the real NPU: 677 ms–899 ms across runs, correct shape and usage |
+| `/v1/chat/completions` streaming (SSE) | ✅ | `ChatCompletionsStreamingTests` (framing, error event, keep-alive, disconnect drain); smoke streaming step on the NPU |
+| Client-side cut: `max_tokens`, `max_completion_tokens`, `stop` | ✅ | `OutputCutTests` on both shapes; smoke shows the cut cancels the NPU (D53) |
 | PromptTemplate (message flattening) | ✅ | exact-string tests; both system-prompt placements measured on hardware |
 | Prompt overflow → HTTP 400 `context_length_exceeded` | ✅ | `ChatCompletionsTests`, `FakeBackendTests` via backend `PromptLengthPreflight`; not yet exercised against the real NPU's own limit |
 | Logon task install/status/run/uninstall | ✅ | live, elevated (pre-supervisor build; `/End` path covered by kill-parent probe) |
 | Windows service verbs | ⚠️ | commands verified by tests and emulation; not exercised against the SCM |
 | gitleaks hook + CI | ✅ | planted secrets blocked |
+| Build + test CI (`.github/workflows/build.yml`, windows-latest) | ⚠️ | added 2026-09-10; passes locally, first Actions run not yet observed |
 
 ## Not built yet
-- `/v1/chat/completions` streaming (SSE), `/v1/completions` — chunks 4, 8
+- `/v1/completions` — chunk 8
 - Context cache, `--truncate-history` — chunk 5 (prompt-overflow → HTTP 400 `context_length_exceeded`
   already works, via each backend's preflight capability, not the cache)
 - Aion adapter — chunk 6
@@ -51,3 +54,13 @@
   advertise native support, but would have rejected all Aion traffic (D50). Two fix rounds addressed
   both findings; the rest of each review's findings were deferred to `docs/FUTURE.md`'s chunk 3 section.
   Commits `796252b`, `2c4bdc5`, `d6236e9`, `8f533fe`, `91383f4`, `030d49c`.
+- Chunk 4: five reviewed tasks (preparation-phase extraction, streaming happy path, failure paths,
+  client-side cut, smoke steps + measurements), each with its own review round (D51 to D55). The
+  whole-branch review found four defects, all fixed in `7817044`: a cut suppressed every failure
+  status rather than only `Cancelled` (D56); the stream read its finish reason before the flush that
+  could commit the cap (D57); the holdback and the budget could slice a surrogate pair (D58); a stop
+  match was committed before a longer stop string starting earlier had been ruled out (D59). The rest
+  went to `docs/FUTURE.md`'s chunk 4 section. Fast-forward merged to `main` on 2026-09-07.
+- 2026-09-10 whole-project review: the state docs (`CLAUDE.md`, `PLAN.md`, the handoff, this folder)
+  still described chunk 4 as unmerged; fixed. Added the build-and-test workflow. Three low-severity
+  code notes were filed in `docs/FUTURE.md` rather than fixed.
