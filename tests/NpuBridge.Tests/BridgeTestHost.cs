@@ -318,9 +318,9 @@ internal static class Sse
 }
 
 /// <summary>
-/// The request body that says nothing beyond "one user message": the shape most tests want, because
-/// what they are about is the reply, the backend's inputs or the failure, not the request. A test that
-/// needs another field (<c>stream</c>, a budget, a whole conversation) builds its own body rather than
+/// The request body that says nothing beyond "one user message", which is what most tests want: their
+/// subject is the reply or the failure, and the request is only how they get one. A test that needs
+/// another field (<c>stream</c>, a budget, a whole conversation) builds its own body rather than
 /// growing this one, so the default stays the body a reader can skip over.
 /// </summary>
 internal static class ChatBody

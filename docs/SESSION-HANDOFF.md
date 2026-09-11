@@ -1,22 +1,25 @@
-# Session handoff, 2026-09-11, after the D80 merge
+# Session handoff, 2026-09-11, after the D81 merge
 
-Supersedes the handoff written after the D79 merge earlier today (in git history). Everything
+Supersedes the handoff written after the D80 merge earlier today (in git history). Everything
 below was verified at write time.
 
 ## Where things stand
 
-- `main` is at or after `a83fc6a`, tree clean, in sync with origin. The repository is
+- `main` is at or after `9c646ec`, tree clean, in sync with origin. The repository is
   `ookla-ariel-ride/npu-bridge` (renamed today; the old `Phi-Silica-OpenAI` URL redirects). The local
   folder keeps its old name on purpose: package identity is registered against the build path, and
   renaming it means `identity.ps1 -Install` again.
 - Chunks 1 to 6 are merged. Chunk 5 (context cache and overflow, D71 to D76), the OpenAI
   conformance pass (D77), D78 (issue #12 closed without a change), D79 (test hardening from the
-  coverage audit) and D80 (real token counts, issue #13) all landed today. Chunk 6 stays
-  code-verified only (D70; issue #2 open).
-- 632 tests pass. `smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648 on the
-  final `main` code: four teardown rows, and the D80 tokenizer step at 3581 / 3543 / 3581 tokens.
-- Open issues: #2, #3, #4, #9, #10, #11, #14, #15, #16. Closed today: #1, #12, #13. Progress on #14
-  and #15 is recorded in comments on each.
+  coverage audit), D80 (real token counts, issue #13) and D81 (one post-generation pipeline for both
+  response shapes, issue #9) all landed today. Chunk 6 stays code-verified only (D70; issue #2 open).
+- 655 tests pass. `smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648 on the
+  final `main` code: four teardown rows, and the D80 numbers unchanged by the D81 refactor
+  (`prompt_tokens` 41 / `completion_tokens` 2 on both shapes, 3581 tokens at the fox and CJK
+  preflight boundaries, the eight-token cut streaming 31 characters with `finish=length`, a cache
+  hit on the continuation, `text_mismatches=0`, `late_deltas=0`).
+- Open issues: #2, #3, #4, #10, #11, #14, #15, #16, #17. Closed today: #1, #9, #12, #13. Progress on
+  #14 and #15 is recorded in comments on each.
 
 ## What this session did, in order
 
@@ -78,6 +81,21 @@ below was verified at write time.
    pass also filed the runtime RPC fault in `docs/FUTURE.md` as work (recreate the model, or at
    least fail `/healthz`, when a generation dies with an RPC-class HRESULT). No issue for it yet;
    that is the owner's call.
+10. D81 on the branch `chore/issue-9-post-generation-pipeline`, issue #9: the post-generation
+    pipeline written once. `Api/GenerationPipeline.cs` holds `DeltaSink`, `CutWatcher`,
+    `CancelGuardedAsync` and the raw-output log; `GenerationOutcome` beside `GenerationFailure`
+    decides failure / filtered / content for both shapes, so the D56 and D57 drifts cannot recur.
+    The smaller items from the same review went with it (`GenerationFailure.FromException` for the
+    hand-built 502, `CompletionUsage.For`, `roleSent` gone, the chars-per-token ratio spelled once,
+    shared test helpers in `BridgeTestHost.cs`). `FakeBackendOptions.StartDelay` is deleted and
+    `StartGate` takes its slot, which ends the last three wall-clock races. No client-visible
+    behaviour changed. Two adversarial reviews plus a whole-branch pass: no demonstrable defect, but
+    Codex found that the rewritten first-delta wait preferred a stale timeout over a delta that had
+    just landed, which on a preflight-less backend would turn a 400 refusal into an SSE error event;
+    fixed. The NPU run reproduced D80's numbers. `BackendCapabilities.Cancellation`, advertised and
+    read by nobody, went out as #17; the missing unit tests for `DeltaSink` and `CutWatcher` went on
+    #14. Fast-forward merged, #9 closed from the commit, then `CLAUDE.md`, `docs/PLAN.md`, this file
+    and the memory bank.
 
 ## Decisions the owner made today
 
@@ -88,7 +106,8 @@ below was verified at write time.
 - The Phi-3 tokenizer is adopted for real token counts (issue #13), on the condition that the
   measurement in that issue agrees with the preflight; `tokenizer.model` is vendored in the repo.
   The condition was met (D80) and the tokenizer is in.
-- Work order: issue #13, then issue #9, then chunk 7 (issue #3). #13 is done.
+- Work order: issue #13, then issue #9, then chunk 7 (issue #3). #13 and #9 are both done, so the
+  order now starts at chunk 7.
 - The repository was renamed to `npu-bridge` with a description and topics.
 - The suffix lookup for truncated conversations (issue #12) was approved on a premise I gave the
   owner that turned out to be wrong; the test written first showed the follow-up turn already hits.
@@ -96,19 +115,27 @@ below was verified at write time.
 
 ## Do this next
 
-1. Issue #9, the work order's next item. Both endpoints grew a retry loop in chunk 5, a null-usage
-   flag in D77 and counter-based usage plus `StopRequested` handling in D80, so the duplicated
-   post-generation pipeline is larger than when the issue was filed. Consolidate before chunk 7 adds
-   buffered tool detection to both. The issue names the paired code and a suggested shape, and its
-   "smaller items" checklist (the hand-built 502 envelope, duplicated test helpers, the fake's
-   four single-purpose knobs) is worth doing alongside.
-2. Chunk 7 (issue #3). `ChatMessage.ToolCalls` is carried and keyed; rendering the model its own
-   protocol, computing the stored key from the parsed calls, and buffering with keep-alives are the
-   chunk's job. Structured JSON output (2.4.x stable) is the design option on the issue.
+1. Chunk 7 (issue #3), the work order's next item. `ChatMessage.ToolCalls` is carried and keyed;
+   rendering the model its own protocol, computing the stored key from the parsed calls, and
+   buffering with keep-alives are the chunk's job. Structured JSON output (2.4.x stable) is the
+   design option on the issue. Three things D81 leaves for it: the buffered path calls
+   `GenerationOutcome.Classify(result, cancelledByCut)` instead of telling failure, filtered and
+   content apart for itself; it supplies the cut's post-flush verdict as an argument, because the
+   classifier deliberately reads no cutter (when that verdict is legible differs by shape, D57); and
+   `DeltaSink`'s destination is a `ChannelWriter<string>` or a `CutWatcher`, never a delegate, so a
+   buffering path cannot smuggle the response onto the backend's callback thread. A path that wants
+   both destinations adds a third factory and decides their order there.
+2. Issue #10 if a small item is wanted before the chunk: the three low-severity notes from the
+   2026-09-10 review (the JSON path's escaping non-client cancellation, `SseStream.Started` flipping
+   before the first write succeeds, `identity.ps1 -Install` deregistering before it registers). Two
+   of the three land in `ChatCompletionsEndpoint` and `ChatCompletionsStreamEndpoint`, the files D81
+   just rewrote, so they are cheaper now than after chunk 7 grows them again.
 3. Issues #14 and #15 whenever there is an hour to spend: #14's items 7 to 12 plus its "move into
    Core", "make injectable" and "delete or mark" sections, #15's items 4 to 9 and the manual
    checklist. Each issue carries a comment saying exactly what landed and what each test does and
-   does not pin.
+   does not pin; #14's newest comment is the D81 gap, `DeltaSink` and `CutWatcher` hoisted into Core
+   without unit tests of their own. #17 is the same size and needs a choice first: report
+   `BackendCapabilities.Cancellation` on `/healthz`, read it in the fake, or drop it.
 4. When a Windows build with Aion Instruct behind the Phi Silica API arrives: `smoke.ps1 -Backend
    phi-silica` under the registry key, re-check D31, decide the fate of the preview adapter. Run the
    tokenizer step before trusting the Phi-3 counter for that model. When any Aion generation runs,
@@ -154,6 +181,20 @@ below was verified at write time.
   tokens of one character all carry that character's offsets.
 - The scratch console app for tokenizer probes lives in this session's scratchpad only
   (`TokCount/`); rebuild it from `Microsoft.ML.Tokenizers` 2.0.0 and the vendored model if needed.
+- `Task.WhenAny(wait, delay)` settles a tie by argument order; `wait.WaitAsync(timeout)` settles it
+  by which fired first. Replacing one with the other silently changes which arm wins when both
+  become ready in the same gap, and on the first-delta wait that decides whether a preflight-less
+  backend's over-length refusal stays a 400 or becomes an SSE error event. Spell the preference out
+  rather than inherit it from an overload. Two related framework facts: `WaitAsync` does release its
+  timer and unregister on the timeout path, and a cancellation ready at the same moment as the
+  timeout can be reported either way round, so the explicit `ThrowIfCancellationRequested` stays.
+- A gate only orders what happens after it, so check where one sits before reusing it.
+  `FirstTokenGate` is held behind the prompt-length verdict and cannot hold a test at "the verdict
+  has not landed yet"; that needed a new `StartGate` in front of the verdict.
+- Deduplicating test helpers surfaced an expectation that had been passing on a coincidence: the
+  cache's `prompt_tokens` test counted `"sys" + prompt` as one string, while the bridge counts the
+  prompt and the native system text separately, and chars/4 makes those agree unless the prompt's
+  length is 1 modulo 4.
 
 ## Machine facts (do not re-discover)
 
@@ -179,6 +220,11 @@ below was verified at write time.
   once a generation is attempted and never on the refusal (D76); sampling parameters are not in the
   key; no suffix lookup (D78).
 - `model` is required and served-only (D77).
+- The post-generation pipeline is shared, and `GenerationOutcome` reads no cutter: the cut's verdict
+  is a caller argument because when it is legible differs by shape (D57, D81). The
+  `IAsyncEnumerable<string>` responder redesign issue #9 sketched for `FakeBackend` was deliberately
+  not built — each knob models a distinct runtime behaviour, and replacing them churns every test
+  that sets `Responder`.
 - Work happens on a branch and fast-forward merges after a review; after the merge, update this
   file, `CLAUDE.md`, `docs/PLAN.md` and `memory-bank/` in the same session.
 
@@ -186,8 +232,8 @@ below was verified at write time.
 
 ```powershell
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\Phi-Silica-OpenAI
-git status; git log --oneline -3                          # expect main at or after a83fc6a, tree clean
-dotnet build; dotnet test                                 # expect 632 passed
+git status; git log --oneline -3                          # expect main at or after 9c646ec, tree clean
+dotnet build; dotnet test                                 # expect 655 passed
 .\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 1 skipped, 5 informational
-gh issue list                                             # #2, #3, #4, #9, #10, #11, #14, #15, #16 open
+gh issue list                                             # #2, #3, #4, #10, #11, #14, #15, #16, #17 open
 ```

@@ -4,7 +4,8 @@
 ```
 NpuBridge (exe, ARM64)          NpuBridge.Core (net10.0, no WinRT)          NpuBridge.Tests
   Program.cs (CLI, host)  --->    Api/        endpoints (JSON + SSE shapes, shared   TestServer + FakeBackend
-  Backends/PhiSilica*                          preparer), OpenAI DTOs, errors, cut
+  Backends/PhiSilica*                          preparer and post-generation
+                                               pipeline), OpenAI DTOs, errors, cut
   Backends/Aion* (AION_SDK)        Backends/   ILanguageModelBackend, Lifecycle, Fake,
   Backends/PackageDependency                   DeltaAccumulator (shared by both adapters)
   PackageActivation.cs             Configuration/ options, binder, CLI, sources
@@ -21,7 +22,7 @@ rather than in a `Context/` folder; `Tools/` (tool-call emulation, chunk 7) does
 streaming lives in `Api/ChatCompletionsStreamEndpoint` beside the JSON shape, not in a separate folder. `AionBackend`
 compiles only when `nuget-local/` holds the Aion nupkg (`AionSdkAvailable`, D66); CI builds without it.
 
-## Request flow (as built through chunk 5, 2026-09-11)
+## Request flow (as built through chunk 5 and D81, 2026-09-11)
 `ChatRequestPreparer` does the shared part for both shapes, in order: parse the JSON body (malformed
 body → 400, no context created) → validate the DTO against what the deserializer can actually produce,
 not just what the type declares (400 on failure, no context created) → check the backend is `Ready`
@@ -33,11 +34,18 @@ choose the system-prompt placement → render the prompt (`PromptTemplate`) → 
 checks that context out and renders only the tail (`PromptTemplate.RenderTail`), a miss creates a
 context and renders everything; where the backend has a preflight, `GetUsablePromptLength` decides
 overflow before anything is generated, and `--truncate-history` drops the oldest exchange and retries
-(D73). Then it generates on the lease, watching deltas for the cut → settles the lease exactly once
-on every path: `Keep` after a `Complete`, uncut generation puts the context back under the new key,
+(D73). Then it generates on the lease, watching deltas for the cut through the shared `DeltaSink`
+(a `ChannelWriter<string>` on the stream, a `CutWatcher` on the JSON shape, never a delegate, so the
+backend's callback cannot reach the response) → `GenerationOutcome.Classify(result, cancelledByCut)`,
+the one place failure, filtered and content are told apart, with the cut's verdict passed in because
+when it is legible differs by shape (D57, D81) → settles the lease exactly once on every path:
+`Keep` after a `Complete`, uncut generation puts the context back under the new key,
 anything else disposes it in the `finally` (the stream cancels → drains → settles, D51; D72) → shapes
 the OpenAI response → logs the outcome with `cache=`, `tail_turns=` and `truncated_turns=`. Two
-concurrent requests for one conversation never share a context: the second misses.
+concurrent requests for one conversation never share a context: the second misses. What differs
+between the shapes after the classifier is only what they write: `completion_tokens` is
+`TokensCovering` over the text the cutter released on the stream and over the content about to be
+written on the JSON shape (D80), so each assembles its own usage through `CompletionUsage.For`.
 
 ## Conventions this chunk established
 - **Validate what the deserializer can produce, not just what the type says.** `System.Text.Json` will
@@ -107,11 +115,21 @@ concurrent requests for one conversation never share a context: the second misse
 (`MaxPromptChars`), and full call recording (`Calls`, per-context `History`). Tests that pass against
 it should not pass vacuously on the NPU.
 
-## Test conventions (D43, D54, D79)
-- Never assert on wall-clock timing. Order events with `FirstTokenGate` (held after the prompt
-  verdict, before the first token) and `InitGate`, and assert on what had or had not happened when
-  the gate opened. The keep-alive waits still run on `Task.Delay`, so two keep-alive tests can pin
-  less than they would with a fake `TimeProvider` (`docs/FUTURE.md`).
+## Test conventions (D43, D54, D79, D81)
+- Never assert on wall-clock timing. Order events with the fake's gates and assert on what had or had
+  not happened when the gate opened. Which gate depends on where the hold must be: `StartGate` before
+  the generation decides anything at all, the prompt-length verdict included; `FirstTokenGate` after
+  that verdict and before the first token; `InitGate` during model load. They are not
+  interchangeable — the three tests that need "the verdict lands after a keep-alive has already
+  committed the headers" cannot use `FirstTokenGate`, which is held too late, and they raced a
+  millisecond delay against a millisecond keep-alive interval until `StartGate` replaced
+  `StartDelay` (D81). The keep-alive wait's timeout is `Task.WaitAsync`'s, read off the wall clock
+  rather than the injected `TimeProvider`, so two keep-alive tests still lean on real time and pin
+  less than their names suggest (`docs/FUTURE.md`); their summaries say so.
+- Shared helpers live in `BridgeTestHost.cs`, not in whichever class needed them first:
+  `TestWait.UntilAsync` for a polled condition, `Sse.Payloads`/`Sse.Chunks` for an SSE body,
+  `ChatBody.User` for the minimal request. Tests that are *about* the raw SSE framing still read raw
+  lines, since parsing through the shared helper would assume what they check.
 - Count contexts on every new generation path: `BridgeTestHost.AssertNoLeak` checks created equals
   disposed plus cached, and cached equals the fake's active contexts. A context is in the cache or
   disposed, never both, never neither.
@@ -195,7 +213,7 @@ whole-branch review → fast-forward merge to `main` → update `CLAUDE.md`, `do
 commit. Chunk 6 was built by a forked subagent and reviewed by the parent session; hardware
 verification is part of an adapter chunk's definition of done and, when the machine cannot provide it,
 the chunk merges labelled code-verified only with the issue left open (chunk 6, D70). Work between
-chunks (D77 to D79) follows the same loop on its own branch; a partial pass over an issue (D79 over
+chunks (D77 to D81) follows the same loop on its own branch; a partial pass over an issue (D79 over
 #14 and #15) leaves the issue open with a comment saying what landed, what each test pins and does
 not, and what remains. The smoke run is repeated on the final code of a branch that touched the
 script or the exe, and a first-generation RPC fault is re-run once before it counts as a failure.

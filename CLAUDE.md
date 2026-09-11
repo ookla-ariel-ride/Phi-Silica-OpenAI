@@ -35,16 +35,20 @@ teardown proves the activated child exited and every auxiliary server gets a tea
 first six tests landed) and D80 (issue #13, closed: `usage` and the `max_tokens` budget are Phi-3
 tokens on Phi Silica because the runtime's tokenizer was measured to be Phi-3.5-mini's, the preflight's
 answer is read as the UTF-8 bytes it is, chars/4 stays on Aion and the fake, `POST /debug/tokenize`
-and a smoke step repeat the measurement per build; 632 tests). Issues #14 and #15 stay open for
-their remaining items. Next is issue #9 (consolidate the duplicated post-generation pipeline), then
-chunk 7 (tool-call emulation, issue #3). The repository is
+and a smoke step repeat the measurement per build) and D81 (issue #9, closed: the post-generation
+pipeline is written once — `Api/GenerationPipeline.cs` holds the shared `DeltaSink`, `CutWatcher`,
+guarded cancel and raw-output log, and `GenerationOutcome` beside `GenerationFailure` decides
+failure/filtered/content for both shapes, so the D56 and D57 drifts cannot recur;
+`FakeBackendOptions.StartGate` replaced `StartDelay` and the last three wall-clock races with it;
+655 tests, and the smoke run reproduced D80's numbers exactly). Issues #14, #15 and #17 stay open for
+their remaining items. Next is chunk 7 (tool-call emulation, issue #3). The repository is
 `ookla-ariel-ride/npu-bridge`; the local folder keeps its old name because package identity is
 registered against the build path.
 All four defects from the 2026-09-10 code review (#5 to #8) are fixed and merged (D62 to D65). The
 Insider flight to build 29661 broke Phi Silica and was rolled back to 29648; if it is offered again,
 expect the same (workload packages fail to register, model `NotReady`). An empty
 `Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'` listing is not proof of breakage on 29648;
-`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D80 so
+`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D81 so
 far); `docs/FUTURE.md` holds deferred work. Update both whenever a chunk changes a choice or defers
 something.
 
@@ -108,7 +112,9 @@ Three projects, deliberately:
   HTTP framing), message flattening + prompt template (`PromptTemplate`), the shared preparation
   phase (`ChatRequestPreparer`), the JSON and SSE generation phases (`ChatCompletionsEndpoint`,
   `ChatCompletionsStreamEndpoint`), the client-side cut (`OutputLimits`/`OutputCutter`), one failure
-  mapping for both shapes (`GenerationFailure`), `ILanguageModelBackend`, `FakeBackend`, the
+  mapping and one outcome classifier for both shapes (`GenerationFailure`, `GenerationOutcome`), the
+  rest of the post-generation pipeline both shapes share (`GenerationPipeline.cs`: `DeltaSink`,
+  `CutWatcher`, the guarded cancel and the raw-output log, D81), `ILanguageModelBackend`, `FakeBackend`, the
   conversation key and the context cache (`ConversationKey`, `ContextCache`), the session that
   drives lookup, tail rendering and overflow handling for both shapes (`ConversationSession`,
   `ContextLease`), and the token counters (`Tokenizers/`: `ITokenCounter`, `CharEstimateTokenCounter`,
@@ -126,9 +132,13 @@ Three projects, deliberately:
 
 Keep logic out of the exe project; if it needs a test, it belongs in Core.
 
-Writing tests: never assert on wall-clock timing; gate the fake with `FirstTokenGate`/`InitGate` and
-assert on ordering (D54). `FakeBackend` delivers deltas on the thread pool by default, like WinRT, so
-non-thread-safe state in a delta callback fails in the suite rather than on the NPU. Count contexts
+Writing tests: never assert on wall-clock timing; gate the fake and assert on ordering (D54). Which
+gate depends on where the hold has to be — `StartGate` before the generation decides anything at all,
+the prompt-length verdict included; `FirstTokenGate` after that verdict and before the first token;
+`InitGate` during model load (D81). `FakeBackend` delivers deltas on the thread pool by default, like
+WinRT, so non-thread-safe state in a delta callback fails in the suite rather than on the NPU.
+`BridgeTestHost.cs` holds the shared helpers: `TestWait.UntilAsync` for a polled condition,
+`Sse.Payloads`/`Sse.Chunks` for an SSE body, `ChatBody.User` for the minimal request. Count contexts
 created against disposed plus cached on every new generation path (`BridgeTestHost.AssertNoLeak`): a
 context is in the cache or disposed, never both, never neither.
 
@@ -239,6 +249,14 @@ concurrent requests for one conversation each get their own context (the second 
   generation task has ended `Complete` with the client-visible text equal to the backend's text;
   everything else disposes. Chunk 8's scheduler may let the second concurrent request for one
   conversation wait for the first's context instead of missing.
+- **The post-generation pipeline is shared now, so a third caller uses it rather than copying it
+  (D81).** `GenerationOutcome.Classify(result, cancelledByCut)` is the one place failure, filtered and
+  content are told apart, and both shapes agree only because neither decides for itself. Chunk 7's
+  buffer-when-tools-present path calls it too, and supplies the cut's post-flush verdict as an
+  argument the way the other two do — the classifier reads no cutter, deliberately, because when that
+  verdict is legible differs by shape (D57). `DeltaSink` takes a `ChannelWriter<string>` or a
+  `CutWatcher` and never a delegate, so the callback provably cannot reach the response; a path that
+  needs both destinations adds a factory and decides their order there.
 - **Aion Instruct ships as a model swap behind the Phi Silica API, not as a new SDK.** Microsoft's
   Phi Silica page (updated 2026-07-24) says: a standalone sideloadable package early October 2026;
   Insider rollout in October with Phi Silica still present, the active model chosen by a Controlled

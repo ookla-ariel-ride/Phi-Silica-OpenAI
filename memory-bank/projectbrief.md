@@ -67,9 +67,10 @@ LoRA adapters, Microsoft Store publication. Tracked in `docs/FUTURE.md`.
 8. Concurrency/queueing, `/v1/completions`, client docs.
 
 Between chunks 6 and 7 (all 2026-09-11): the OpenAI conformance pass (D77), D78 (issue #12 closed
-by evidence), the test hardening from the coverage audit (D79; issues #14 and #15 part-done) and
-real token counts (D80; issue #13 closed). Before chunk 7: issue #9 (consolidate the duplicated
-post-generation pipeline).
+by evidence), the test hardening from the coverage audit (D79; issues #14 and #15 part-done), real
+token counts (D80; issue #13 closed) and one post-generation pipeline for both response shapes
+(D81; issue #9 closed), which was done before chunk 7 rather than during it so the buffered
+tool-detection path would be a caller of it and not a third copy.
 
 ## Repository
 `https://github.com/ookla-ariel-ride/npu-bridge` (renamed from `Phi-Silica-OpenAI` on 2026-09-11; the

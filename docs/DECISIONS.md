@@ -1147,9 +1147,8 @@ on the other. Chunk 7's buffer-the-whole-reply path would have been the third co
 steps were lifted out before it rather than during it.
 
 **What moved.** `src/NpuBridge.Core/Api/GenerationPipeline.cs` now holds `DeltaSink` (it was private
-to the streaming endpoint; its channel writer is optional, so the non-streaming path takes its
-first-token timing from the same type instead of an inline lambda that was character-for-character
-`OnDelta`), `CutWatcher` (the non-streaming path's early stop — the `OutputCutter` under a lock plus the
+to the streaming endpoint; the non-streaming path now takes its first-token timing from the same type
+instead of an inline lambda that was character-for-character `OnDelta`), `CutWatcher` (the non-streaming path's early stop — the `OutputCutter` under a lock plus the
 `TaskCompletionSource` that is deliberately completed *on* the backend's callback thread, carrying
 `RunContinuationsAsynchronously` so that the continuation which cancels the generation is what stays
 off it), and
@@ -1177,19 +1176,18 @@ than a third fact.
 equal to `streamed` at its only read, so `streamed` is hoisted out of the retry loop and `roleSent` is
 gone. `WaitForFirstDeltaAsync` is `wait.WaitAsync(next, ct)` with a `TimeoutException` catch instead
 of a linked source and `Task.WhenAny` against a `Task.Delay`; the `ThrowIfCancellationRequested`
-before the write stays, because a cancel landing in the same instant as the timeout is reported as the
-timeout. `ChatRequestMetrics.CharsPerToken`/`EstimateTokens` are deleted: the ratio is spelled in
+before the write stays, because a cancel and a timeout that become ready together can be reported
+either way round. `ChatRequestMetrics.CharsPerToken`/`EstimateTokens` are deleted: the ratio is spelled in
 `CharEstimateTokenCounter` and the one caller left is the `--context-window-hint` pressure warning,
 which still compares characters rather than the backend's tokens — deliberately, since an operator's
 hint is not worth tokenizing the whole transcript a second time for, and the preflight is the real
 measurement.
 
-**One thing did change.** Nothing a client can observe — same statuses to the same bodies, finish
-reasons, cache decisions, usage numbers, SSE framing and HTTP statuses on both shapes — but the
-non-streaming path's Debug line for a cancel that threw now reads "draining and disposing anyway"
-with a `{Where}` property, because it is the streaming path's line and there is only one of them now.
-So the claim is no *client-visible* behaviour change, not no behaviour change at all. The suite could
-not have caught it: the test asserts a substring that survived.
+**One thing did change.** The non-streaming path's Debug line for a cancel that threw now reads
+"draining and disposing anyway" and carries a `{Where}` property, because it is the streaming path's
+line and there is only one of them now. Everything a client can observe is unchanged: the same
+statuses reach the same bodies, finish reasons, cache decisions and usage numbers on both shapes. The
+suite could not have caught the log line, since the test asserts a substring that survived it.
 
 **Tests.** `GenerationOutcomeTests` states the classification rules once rather than through two
 endpoints: every status crossed with the handler's own cancel, the finish-reason labels, and the
@@ -1204,7 +1202,7 @@ holds the system text in the context, outside the prompt string). The two agree 
 prompt's length is not 1 modulo 4, so the test had been passing on the length that conversation
 happens to render. It now mirrors the bridge.
 
-**The last three clocks in the suite are gone.** `FakeBackendOptions.StartDelay` existed so a test
+**The last three `StartDelay` races are gone.** `FakeBackendOptions.StartDelay` existed so a test
 could arrange "the prompt-length verdict lands after a keep-alive comment has already committed the
 headers", and its three users each did that by racing a 300 ms or 100 ms delay against a 20 ms or
 10 ms keep-alive interval — the style D54 replaced everywhere else. `StartDelay` is deleted and
@@ -1219,7 +1217,10 @@ was checked. The knob count did not grow: four before, four after, and `StartGat
 `FirstTokenGate` now share one `WaitAtGateAsync` while each keeps its own status detail.
 `InitializeAsync`'s gate is deliberately left out of it — it has no `GenerationResult` to report and
 lets the cancellation throw — and `CancellationGate` is a predicate read inside the token loop rather
-than a wait at all.
+than a wait at all. Two clocks remain in the suite on purpose: `FakeBackendTests` bounds a
+`FirstTokenDelay` whose delay *is* the subject, and the two keep-alive tests still lean on
+`Task.Delay` because the keep-alive wait is not driven by the injected `TimeProvider`
+(`docs/FUTURE.md`).
 
 **Not done here.** The `IAsyncEnumerable<string>` responder the issue sketched for `FakeBackend` was
 not built: each of the four knobs models a distinct real-runtime behaviour and is separately
@@ -1228,12 +1229,12 @@ inside that bullet — the wall-clock races — was fixed instead. `BackendCapab
 advertised by `PhiSilicaBackend` and read by nobody; that is its own question (report it in
 `/healthz`, read it in the fake, or drop it) and is issue #17.
 
-**D81 review round (a Claude subagent and Codex, 2026-09-11).** Neither reviewer found a
-client-visible defect, and both independently produced the same equivalence table for
-`GenerationOutcome` — all six statuses plus an unmapped one, crossed with the handler's own cancel,
-answering identically to both hand-written copies. Four things came out of the round.
+**D81 review round (a Claude subagent and Codex, 2026-09-11, then a whole-branch pass).** Neither
+reviewer found a defect either could demonstrate, and both independently produced the same equivalence
+table for `GenerationOutcome` — all six statuses plus an unmapped one, crossed with the handler's own
+cancel, answering identically to both hand-written copies. Four things came out of the round.
 
-*The one that mattered.* `Task.WhenAny(wait, delay)` settled a tie by argument order, which put the
+**The tie-break in the keep-alive wait.** `Task.WhenAny(wait, delay)` settled a tie by argument order, which put the
 channel first; `wait.WaitAsync(timeout, ct)` settles it by which fired first. So if the timer expires
 and the generation completes in the same gap before the awaiting thread is scheduled, the rewrite
 writes a keep-alive where the old code returned. That matters because a backend with no preflight
@@ -1243,13 +1244,13 @@ reasoned it out of the .NET sources rather than reproducing it, and no test coul
 preference was real and is now spelled out — the timeout path returns the delta if `wait` has since
 completed, instead of inheriting the old behaviour from an overload's parameter order.
 
-*A guarantee given away and taken back.* `DeltaSink` was first hoisted with an `Action<string>?`
+**`DeltaSink`'s destination is a type, not a delegate.** `DeltaSink` was first hoisted with an `Action<string>?`
 observer, which would have accepted a closure over the `HttpResponse` — the exact thing the type
 exists to make impossible, weakened in the commit that hoisted it for chunk 7 to use. It now takes a
 `ChannelWriter<string>` or a `CutWatcher` through one of two factories, with a private constructor, so
 the compiler is back to checking what the comment claims.
 
-*Comments that were wrong about the framework.* `Task.WaitAsync` does not leave a continuation behind
+**Two comments were wrong about the framework.** `Task.WaitAsync` does not leave a continuation behind
 per timed-out lap — its promise unregisters itself and releases its timer on the timeout path too —
 and a timeout has no precedence over a cancellation that becomes ready at the same moment; either can
 win, which is why the explicit `ThrowIfCancellationRequested` before the keep-alive write stays. The
@@ -1257,6 +1258,15 @@ entry above also had the callback-thread invariant backwards: `CutWatcher` compl
 `TaskCompletionSource` *on* the backend's callback thread on purpose, and
 `RunContinuationsAsynchronously` is what keeps the continuation that cancels the generation off it.
 
-*Coverage the new test file claimed and did not have.* A `Complete` that the handler had also
+**Verified on the NPU.** `smoke.ps1 -Backend phi-silica -Port 5298` passed every step on build 29648
+(one skip, the chunk-7 tool probe; five informational), and the numbers are the ones D80 recorded
+before the refactor: `prompt_tokens` 41 and `completion_tokens` 2 for the PONG exchange on both
+shapes, 3581 Phi-3 tokens at the preflight boundary for the fox filler and the CJK run, the
+eight-token cut streaming 31 characters as 8 tokens with `finish=length`, a cache hit on the
+continuing conversation, `text_mismatches=0` and `late_deltas=0`, and four clean teardown rows. The
+unit suite only ever sees `FakeBackend`, so this is the check that the live path both shapes share
+still behaves as it did.
+
+**Coverage the new test file claimed and did not have.** A `Complete` that the handler had also
 cancelled, and a status the mapping has never heard of, are now pinned rather than asserted in a doc
 comment. 655 tests.

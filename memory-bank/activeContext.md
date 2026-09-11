@@ -1,14 +1,16 @@
 # Active Context: npu-bridge
 
-_Last updated: 2026-09-11, latest (D80 real token counts merged; issue #9 next)_
+_Last updated: 2026-09-11, latest (D81 one post-generation pipeline merged, issue #9 closed; chunk 7
+next)_
 
 ## Where we are
-Chunks 1 to 6 are merged on `main` (`a98c508`). Today added chunk 5 (context cache and overflow
+Chunks 1 to 6 are merged on `main` (`9c646ec`). Today added chunk 5 (context cache and overflow
 handling, D71 to D76), the OpenAI conformance pass (D77), D78, which closed issue #12 without a
 change, D79, the test hardening from the coverage audit (issue #15's first three smoke items
 and issue #14's first six tests), and D80, real token counts (issue #13 closed): `usage` and the
 `max_tokens` budget are Phi-3 tokens on Phi Silica, the preflight's byte answer is converted, chars/4
-stays on Aion and the fake. Chunk 6, the Aion Instruct Preview adapter, is merged but code-verified only: build 29648
+stays on Aion and the fake. D81 then wrote the post-generation pipeline once, closing issue #9.
+Chunk 6, the Aion Instruct Preview adapter, is merged but code-verified only: build 29648
 never appends `WIN://SYSAPPID` for a main-package dynamic dependency, so the Qualcomm QNN provider
 cannot be image-mapped and no Aion generation has ever run here (D70; issue #2 open). Only `main`
 exists. The repository is `ookla-ariel-ride/npu-bridge`; the local folder is still named
@@ -19,11 +21,13 @@ Aion Instruct ships as a model swap behind the Phi Silica API (Microsoft's Phi S
 Feature Rollout with a registry key, retail in November with Phi Silica removed, no LAF token.
 `PhiSilicaBackend` is therefore the production Aion path. Details in `techContext.md`.
 
-632 tests pass. `scripts/smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648,
+655 tests pass. `scripts/smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648,
 including four teardown rows (main server plus three auxiliary servers) and the D80 tokenizer step
-(3581 / 3543 / 3581 tokens at the fox, JSON and CJK boundaries). `/healthz` is the
-readiness check, not the package list. The model runtime can fail its RPC channel on the first
-generation after start (seen twice now, 2026-09-11); the re-run is clean.
+(3581 / 3543 / 3581 tokens at the fox, JSON and CJK boundaries); the D81 run returned every one of
+those numbers again on the refactored pipeline, which the unit suite cannot check because it never
+sees a real backend. `/healthz` is the readiness check, not the package list. The model runtime can
+fail its RPC channel on the first generation after start (seen twice now, 2026-09-11); the re-run is
+clean.
 
 ## What today built
 - Chunk 5: `ConversationKey` (a length-prefixed encoding of `(system, turns)`, never the rendered
@@ -63,6 +67,18 @@ generation after start (seen twice now, 2026-09-11); the re-run is clean.
   whitespace-free reply, sets `StopRequested` eight tokens past the budget and cuts exactly at the
   end. `POST /debug/tokenize`; a smoke step repeats the measurement (fails above 2 % spread). Two
   reviews found the 16-char settlement rule and the stop-truncation count wrong; both fixed.
+- D81 (issue #9): the post-generation pipeline is written once. `Api/GenerationPipeline.cs` holds
+  `DeltaSink` (a `ChannelWriter<string>` or a `CutWatcher` through one of two factories, never a
+  delegate, so the backend's callback cannot reach the response), `CutWatcher`, `CancelGuardedAsync`
+  and the raw-output log; `GenerationOutcome` beside `GenerationFailure` decides failure / filtered /
+  content as three ordered rules, with the cut's post-flush verdict a caller argument (D57). The
+  smaller items landed with it: the hand-built 502 goes through `GenerationFailure.FromException`,
+  `CompletionUsage.For`, `roleSent` gone, the chars-per-token ratio spelled only in
+  `CharEstimateTokenCounter`, and `TestWait.UntilAsync` / `Sse.Payloads` / `ChatBody.User` shared
+  from `BridgeTestHost.cs`. `FakeBackendOptions.StartDelay` is deleted and `StartGate` takes its
+  slot, which ends the last three wall-clock races. Nothing a client can observe changed. Codex's
+  catch: the rewritten first-delta wait preferred a stale timeout over a delta that had just landed,
+  which on a preflight-less backend would turn an over-length 400 into an SSE error event.
 - The README rewritten for chunk 5 and validated again (real layout, two Mermaid diagrams, a
   references section, no contributing section); a humanizer pass over the docs; the gitleaks path
   allowlists for docs removed (notes are scanned; a full-history scan is clean). After D79 the
@@ -76,14 +92,17 @@ generation after start (seen twice now, 2026-09-11); the re-run is clean.
   Core", "make injectable" and "delete or mark" sections; #15's items 4 to 9, the manual checklist
   and the exe paths list (the "honours a system prompt" and chat-text steps are still vacuous); #16,
   a CI run of the exe with the fake backend, blocked on an ARM64 runner. Progress is recorded on
-  the issues.
-- Issue #9 before chunk 7: the two endpoints each carry a retry loop, a null-usage flag and now the
-  counter-based usage and `StopRequested` handling, so the duplicated post-generation pipeline is
-  larger than it was.
+  the issues; #14's newest comment is the gap D81 opened, `DeltaSink` and `CutWatcher` now in Core
+  with no unit tests of their own while `GenerationOutcome`, hoisted beside them, got a test file.
+- Issue #17: `BackendCapabilities.Cancellation` is advertised by `PhiSilicaBackend` and read by
+  nobody. Report it on `/healthz`, read it in the fake, or drop it; split out of #9 because that was
+  a no-behaviour-change consolidation.
 - D80 leftovers (`docs/FUTURE.md`): the pressure warning still measures characters against the hint
   × 4; Aion keeps chars/4 until a generation runs there; when Aion Instruct arrives behind the Phi
   Silica API, run the smoke's tokenizer step before trusting the counter for that model.
-- Chunk 7 (issue #3) after that. `ChatMessage.ToolCalls` is carried and keyed but not rendered.
+- Chunk 7 (issue #3) is next. `ChatMessage.ToolCalls` is carried and keyed but not rendered. Its
+  buffered path is the third caller of the shared pipeline: it classifies through
+  `GenerationOutcome.Classify` and passes the cut's verdict in, rather than deciding either itself.
 - Chunk 5 deferrals (`docs/FUTURE.md`, chunk 5 section): mixed raw-then-markers format on a hit
   after a bare first message; the pressure warning cannot fire on Phi Silica at the default hint
   (the owner kept 4096); the header is lost on a stream that truncates after a keep-alive.
@@ -96,8 +115,9 @@ generation after start (seen twice now, 2026-09-11); the re-run is clean.
 - Do not re-investigate the Aion blocker on this machine (D70).
 
 ## How to resume
-1. Read `CLAUDE.md`, then `docs/SESSION-HANDOFF.md`, then `docs/DECISIONS.md` D71 to D80 and the
+1. Read `CLAUDE.md`, then `docs/SESSION-HANDOFF.md`, then `docs/DECISIONS.md` D71 to D81 and the
    chunk 5 section of `docs/FUTURE.md`.
-2. `dotnet build; dotnet test` (632). `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298` should
+2. `dotnet build; dotnet test` (655). `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298` should
    pass every step (1 skipped, 5 informational). Do not build while a smoke server is running.
-3. Issue #9, then chunk 7 (issue #3). Read the issue and its comments before starting.
+3. Chunk 7 (issue #3). Read the issue and its comments before starting, and D81 for the pipeline it
+   plugs into.

@@ -45,12 +45,14 @@ rest of both issues stays open, as does the CI job.
   serving a dead handle. `PhiSilicaBackend` could dispose and recreate the `LanguageModel` (and drop
   every cached context) when a generation fails with an RPC-class HRESULT, or `/healthz` could at
   least turn 503 after one. Needs a decision on whether to retry the request that hit the fault.
-- **Keep-alive waits driven by the injected `TimeProvider`.** `WaitForFirstDeltaAsync` calls
-  `Task.Delay` on the wall clock, so a test can prove a non-positive first delay is accepted but not
-  what it falls back to (zero or any non-negative span would pass), and the disabled-interval test's
-  zero row leans on `Task.Delay(TimeSpan.Zero)` completing before the first delta reaches the
-  channel, which is near-certain rather than guaranteed. `Task.Delay(TimeSpan, TimeProvider, ...)`
-  with a fake time provider would let both tests pin the exact delay requested (from the D79 reviews).
+- **Keep-alive waits driven by the injected `TimeProvider`.** `WaitForFirstDeltaAsync` times its wait
+  on the wall clock, so a test can prove a non-positive first delay is accepted but not what it falls
+  back to (zero or any non-negative span would pass), and the disabled-interval test's zero row leans
+  on the timeout elapsing before the first delta reaches the channel, which is near-certain rather
+  than guaranteed. A fake time provider would let both tests pin the exact delay requested (from the
+  D79 reviews). Amended 2026-09-11 (D81): the wait is now `Task.WaitAsync(TimeSpan, CancellationToken)`
+  rather than `Task.WhenAny` against a `Task.Delay`, so the change is to the
+  `WaitAsync(TimeSpan, TimeProvider, CancellationToken)` overload; the deferral itself is unchanged.
 
 ## Chunk 5 deferrals (context cache and overflow handling)
 

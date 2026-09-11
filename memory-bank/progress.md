@@ -3,7 +3,8 @@
 ## Works today (verified)
 | Area | Status | Evidence |
 |---|---|---|
-| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; 632 xunit tests green (chunk 5, the D77 conformance pass, D78, the D79 test hardening and D80 real token counts merged 2026-09-11) |
+| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; 655 xunit tests green (chunk 5, the D77 conformance pass, D78, the D79 test hardening, D80 real token counts and the D81 shared pipeline merged 2026-09-11) |
+| One post-generation pipeline for both shapes | ✅ | D81: `Api/GenerationPipeline.cs` (`DeltaSink`, `CutWatcher`, `CancelGuardedAsync`, the raw-output log) and `GenerationOutcome` beside `GenerationFailure`; `GenerationOutcomeTests` pins every status crossed with the handler's own cancel, so the D56 and D57 drifts between the two hand-written copies cannot recur. No client-visible change: the smoke run on the NPU returned D80's numbers exactly |
 | Token counts (`usage`, `max_tokens`) | ✅ | D80: Phi-3 tokens on Phi Silica (`Phi3TokenCounter` over the vendored Phi-3.5-mini model, measured against the runtime's preflight: 3581 tokens at every ASCII boundary), chars/4 on Aion and the fake; `TokenCounterTests`, `TokenUsageTests`, `TokenBudgetCutTests`, `DebugTokenizeTests`; the smoke's tokenizer step repeats the measurement per build (fails above 2 % spread) |
 | Preflight units | ✅ | D80: `GetUsablePromptLength` answers in UTF-8 bytes, converted by `Utf8Offsets`; before the fix a 5,001-char CJK prompt at 1.6 × the window passed the preflight |
 | `/healthz`, `/v1/models`, `/v1` fallback | ✅ | TestServer tests + live curl on the exe; `/healthz` carries identity, cache counters (D74), keep-alive timings (D79) and backend diagnostics, and a test pins that the registered options, not defaults, are reported |
@@ -47,6 +48,10 @@
   waits go through the injected `TimeProvider` (`docs/FUTURE.md`); their summaries say so.
 - Issues #14 and #15 are part-done: `honours a system prompt` and the chat steps in the smoke
   script still assert nothing about the text; the exe has no unit coverage by construction.
+  `DeltaSink` and `CutWatcher` moved into Core in D81 without unit tests of their own and are
+  reached only through the endpoint suites (#14).
+- `BackendCapabilities.Cancellation` is advertised by `PhiSilicaBackend` and the fake's default and
+  read by nothing: no endpoint branches on it, `/healthz` omits it, no test asserts it (#17).
 - Experimental Windows App SDK channel in use (no LAF token); APIs may change between releases.
 - Phi Silica returns multi-token progress chunks → callback-based token counts undercount by roughly
   2.3x to 3x; `usage` used `ceil(chars/4)` on both sides (D44) until D80 replaced it with the Phi-3
@@ -110,3 +115,17 @@
   (a budget ending inside a byte-fallback character stops before it). The Claude review's fuzz: 480
   stream trials never over budget, largest re-merge shift 2 tokens against a reserve of 8. Three NPU
   runs passed. Fast-forward merged; #13 closed.
+- D81 (2026-09-11, branch `chore/issue-9-post-generation-pipeline`): the duplicated post-generation
+  pipeline consolidated, issue #9. Two adversarial reviews (a Claude subagent and Codex) on the
+  first two commits, then a whole-branch pass. Neither reviewer found a defect either could
+  demonstrate, and both independently built the same equivalence table for `GenerationOutcome`
+  against the two copies it replaced. Four things came out of the round: the first-delta wait's
+  tie-break (`Task.WhenAny` settled a timeout-against-delta tie by argument order, `Task.WaitAsync`
+  by which fired first, and on a preflight-less backend the difference turns an over-length 400 into
+  an SSE error event — Codex reasoned it out of the .NET sources, no test can see it);
+  `DeltaSink`'s destination changed back from an `Action<string>` to a `ChannelWriter<string>` or a
+  `CutWatcher`, so the compiler again checks what the type exists to guarantee; two comments that
+  were wrong about framework behaviour; and two rules `GenerationOutcomeTests` claimed in a doc
+  comment rather than pinning. 655 tests, the NPU run reproduced D80's numbers. Fast-forward merged;
+  #9 closed. `BackendCapabilities.Cancellation` went out as #17 and the missing `DeltaSink` and
+  `CutWatcher` unit tests onto #14.

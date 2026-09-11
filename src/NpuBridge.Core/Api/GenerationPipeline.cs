@@ -63,13 +63,12 @@ internal static class GenerationPipeline
 
 /// <summary>
 /// The only thing the backend's callback thread can reach. It holds a stopwatch and exactly one
-/// destination, which is either a <see cref="ChannelWriter{T}"/> or a <see cref="CutWatcher"/> — no
+/// destination, either a <see cref="ChannelWriter{T}"/> or a <see cref="CutWatcher"/>: no
 /// <see cref="Microsoft.AspNetCore.Http.HttpResponse"/>, no <c>HttpContext</c>, and no delegate that
-/// could close over one. That is deliberate and is the type's reason for existing: "never write to the
-/// response from the callback" stays a property of what is in scope rather than a rule someone has to
-/// remember. An <c>Action&lt;string&gt;</c> parameter here would accept a closure over the response and
-/// give that property away, which is why the two destinations are named types and why the constructor
-/// is private — the factories below are the only two shapes there are.
+/// could close over one. So "never write to the response from the callback" stays a property of what
+/// is in scope rather than a rule someone has to remember. An <c>Action&lt;string&gt;</c> parameter here
+/// would accept a closure over the response and give that property away, which is why both
+/// destinations are named types and why the constructor is private.
 ///
 /// The mutable fields are touched through interlocked operations because <see cref="OnDelta"/> and the
 /// request's own task run at once; the destination and the stopwatch are readonly and need none.
@@ -109,14 +108,15 @@ internal sealed class DeltaSink
         new(stopwatch, writer: null, watcher);
 
     /// <summary>Callbacks seen. Not a token count: runtimes batch several tokens per callback (D44).</summary>
-    public int Count => Volatile.Read(ref _count);
+    private int Count => Volatile.Read(ref _count);
 
     /// <summary>Stopwatch ticks at the first callback; meaningless when <see cref="Count"/> is 0.</summary>
-    public long FirstTokenTicks => Interlocked.Read(ref _firstTokenTicks);
+    private long FirstTokenTicks => Interlocked.Read(ref _firstTokenTicks);
 
     /// <summary>
-    /// Time to first token. A generation that produced no delta at all has no first token to time, and
-    /// reporting 0 would read as an instant one, so the whole elapsed time is reported instead.
+    /// Time to first token, the one thing either handler asks this type for. A generation that produced
+    /// no delta at all has no first token to time, and reporting 0 would read as an instant one, so the
+    /// whole elapsed time is reported instead.
     /// </summary>
     public double TtftMs(double totalMs) => Count == 0 ? totalMs : FirstTokenTicks * 1000.0 / Stopwatch.Frequency;
 

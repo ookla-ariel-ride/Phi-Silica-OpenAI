@@ -271,7 +271,8 @@ internal sealed class ChatCompletionsStreamEndpoint
             var tail = outcome.Filtered ? string.Empty : cutter.Flush();
 
             // Read after the flush, never before -- except for a filtered reply, which has no flush to
-            // read after and whose label does not depend on the cut anyway. Flush() can be the call that commits the cap: it is
+            // read after and whose label does not depend on the cut anyway. Flush() can be the call
+            // that commits the cap: it is
             // deliberately deferred until the text runs Holdback past the budget, so a reply that ends
             // inside that window is only cut here. Reading FinishReason first labelled such a request
             // "stop" on this shape while the JSON path -- which reads it after its own flush -- called
@@ -399,8 +400,8 @@ internal sealed class ChatCompletionsStreamEndpoint
     /// The channel is completed on every outcome of the generation, a cancelled one included, so this
     /// returns on its own and the caller always reaches the drain. A client that leaves mid-wait is the
     /// other way out: the wait ends as an <see cref="OperationCanceledException"/>, which the caller's
-    /// client-gone clause catches and answers with the silent http=0 log line. Both ways lead to the
-    /// finally, which is the only thing that has to be true here — the context is disposed either way.
+    /// client-gone clause catches and answers with the silent http=0 log line. Both routes reach the
+    /// caller's finally, so the context is disposed whichever happens.
     /// </summary>
     private static async Task<bool> WaitForFirstDeltaAsync(
         SseStream sse,
