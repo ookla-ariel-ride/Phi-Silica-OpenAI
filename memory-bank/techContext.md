@@ -107,8 +107,19 @@ NpuBridge.exe service install|start|stop|uninstall # elevated; aion/fake only
 - **Aion 1.0 Instruct**: the Phi Silica successor, announced at Build 2026 on 2026-06-02. Preview SDK
   available now from the sample repo's release v1.0.0.0 (framework MSIX + `AionInstructPreview.Text.Framework.1.0.0.nupkg`,
   ARM64 only, QNN NPU, no CPU fallback; first load compiles the model for 3 to 5 minutes). Also in Edge
-  Insider; open weights on Hugging Face were promised for July 2026. Microsoft replaces Phi Silica with
-  it in Windows "this fall". The sample repo was updated 2026-09-10; re-read its README before installing.
+  Insider; open weights on Hugging Face were promised for July 2026. The sample repo's last code change
+  is 2026-08-07 (the QNN acquisition fix); `aka.ms/tryaion` points at it.
+- **How Aion Instruct actually ships (learn.microsoft.com/windows/ai/apis/phi-silica, updated
+  2026-07-24, re-read 2026-09-11):** as a model swap behind the existing
+  `Microsoft.Windows.AI.Text.LanguageModel` API, not a new SDK. Early October 2026: a standalone
+  sideloadable package for testing and LoRA training. October 2026: Insider rollout; Phi Silica stays
+  present, the active model is chosen by a Controlled Feature Rollout, and a registry key lets
+  developers test side by side. November 2026: retail rollout, Phi Silica removed. "Unlike Phi Silica,
+  LAF tokens are no longer needed with Aion Instruct." Windows App SDK 2.4.4 / 2.4.8-experimental
+  metadata carries no `Aion` identifier and this Insider build (29648) has no Aion registry keys or
+  Aion-branded workload packages yet. Consequence: the preview SDK adapter (chunk 6) is a stopgap; the
+  production Aion path is the Phi Silica adapter with a different model behind it, so the October
+  work is a `--backend phi-silica` smoke run with the registry key flipped and a re-check of D31.
 - **Aion 1.0 Plan**: a different model, not a newer Instruct. 14B parameters, 32K context, native tool
   calling and reasoning, for agentic workloads. "In-box on capable devices in the coming months"; one
   secondary source cites 2026-11-24. **No SDK, no preview package, not on Hugging Face, not in the
