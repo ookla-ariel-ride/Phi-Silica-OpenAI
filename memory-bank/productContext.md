@@ -57,10 +57,10 @@ so those tools can run fully local, offline, and free.
   HTTP 400 `context_length_exceeded`, decided by the backend's preflight before any generation where
   it has one (Phi Silica), and `--truncate-history` drops the oldest exchanges instead, saying how many
   in `x-npu-bridge-truncated-turns`. `--queue-capacity` is accepted but does nothing until chunk 8.
-- Token counts in `usage` are estimates on both sides (`ceil(chars/4)`), documented as such, because
-  Phi Silica's progress callbacks undercount tokens roughly threefold. The owner decided on
-  2026-09-11 to adopt the Phi-3 tokenizer for real counts if a measurement against the preflight
-  agrees (issue #13).
+- Token counts in `usage` are real on Phi Silica since D80 (2026-09-11): the Phi-3.5-mini tokenizer,
+  adopted after the measurement the owner asked for agreed with the runtime's preflight. `max_tokens`
+  is a budget in those tokens. Aion and the fake report `ceil(chars/4)`, documented as an estimate.
+  `POST /debug/tokenize` shows the count and which counter answered.
 - The Phi Silica runtime can fail its first generation after a start with an RPC fault (seen twice
   on 2026-09-11); the request is a 502 `backend_error`, every later request in that process fails
   the same way, and a restart clears it. The bridge does not recreate the model on its own yet

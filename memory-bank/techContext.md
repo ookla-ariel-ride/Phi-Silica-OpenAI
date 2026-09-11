@@ -12,7 +12,14 @@ machine; the NPU is here.
   version-constants source) + CsWinRT 2.3.1 (direct) + `Microsoft.Windows.SDK.BuildTools` 10.0.26100.4948
   (makeappx/signtool; also used by `identity.ps1`). CsWinRT reads Windows metadata from the
   `Microsoft.Windows.SDK.NET.Ref` 10.0.26100.57 NuGet, so no Windows SDK install is needed.
-- Tests: xunit 2.9.3, `Microsoft.AspNetCore.TestHost` 10.0.11. 512 tests, about 1 s.
+- Tests: xunit 2.9.3, `Microsoft.AspNetCore.TestHost` 10.0.11. 632 tests, about 1 s.
+- `Microsoft.ML.Tokenizers` 2.0.0 is Core's one package reference (D80); it pulls `Google.Protobuf`.
+  `LlamaTokenizer.Create(stream, addBeginOfSentence: false)` over the embedded Phi-3.5-mini
+  `tokenizer.model` (499,723 bytes, sha256 `9e556afd…8347`, MIT, `src/NpuBridge.Core/Tokenizers/Phi3/`).
+  Facts learned: `GetIndexByTokenCount` and `EncodeToTokens` offsets refer to the normalized text,
+  one char longer than the input (the dummy prefix); byte-fallback tokens of one character share
+  that character's offsets; the instance is thread-safe; counting 5,000 chars takes about 3 ms here
+  and the index about 1 ms; the model parses in about 57 ms (`tokenizer_load_ms` in `/healthz`).
   `coverlet.collector` is referenced: `dotnet test --collect:"XPlat Code Coverage"` (Core was at
   94.2 % lines and 89.8 % branches on 2026-09-11 before D79). TestServer completes the response pipe
   before it signals `RequestAborted`, so a "client gone" write usually attempts and fails rather
@@ -47,11 +54,14 @@ machine; the NPU is here.
 - **No tokenizer and no token count in the API** (checked 2026-09-11 in the 2.4.4 and
   2.4.8-experimental `Microsoft.Windows.AI.Text` metadata): the only tokenizer-informed members are
   `GetUsablePromptLength`, a `GetUsablePromptLength2` overload not yet examined, and the experimental
-  `CompressPromptAsync`. Microsoft describes Phi Silica as "based on a Cyber-EO compliant derivative
-  of Phi-3.5-mini", whose tokenizer is the Phi-3 one (Llama-style SentencePiece, 32,064 entries,
-  `tokenizer.model` on Hugging Face, MIT). `Microsoft.ML.Tokenizers`'s `LlamaTokenizer` loads it.
-  Whether the derivative kept that vocabulary is unpublished; issue #13 measures it against the
-  preflight before adopting it for `usage`.
+  `CompressPromptAsync`. **Measured 2026-09-11 (D80): the runtime's tokenizer is Phi-3.5-mini's.**
+  The preflight lands on exactly 3581 Phi-3 tokens at every ASCII text boundary (words, digits,
+  spaces, markdown, code) and about 1 % lower on punctuation-cluster-dense text (JSON 3543); the
+  usable window of an empty context is 3581 tokens, so 515 of 4096 are the runtime's template and
+  reply reservation. **`GetUsablePromptLength` returns a UTF-8 byte offset**, not a UTF-16 index
+  (Microsoft's page says only "the index"); CJK, emoji and typographic punctuation boundaries agree
+  only once converted. Phi Silica *does* return `PromptLargerThanContext` for a prompt moderately
+  over the window (584 ms for 1.6 ×); D55's 225 KB prompt is the case that gets the generic error.
 - LAF: `LimitedAccessFeatures.TryUnlockFeature("com.microsoft.windows.ai.languagemodel", token, attestation)`;
   stable → `Unavailable` without token; experimental works regardless.
 - Measured: model create 15.7 s to 23.6 s cold across two runs on 2026-09-05 (10 s was one earlier

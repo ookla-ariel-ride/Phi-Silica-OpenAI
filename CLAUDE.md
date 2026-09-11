@@ -32,16 +32,19 @@ suffix lookup for truncated conversations; the follow-up turn already hits) and 
 from the coverage audit: the smoke script's readiness step says what ready means per backend, its
 teardown proves the activated child exited and every auxiliary server gets a teardown row, an
 `InfoStep` may fail on a contradiction, `/healthz` reports the keep-alive timings, and issue #14's
-first six tests landed; 512 tests). Issues #14 and #15 stay open for their remaining items. Next is
-issue #13 (the Phi-3 tokenizer, measured against the preflight first), then issue #9 (consolidate the
-duplicated post-generation pipeline), then chunk 7 (tool-call emulation, issue #3). The repository is
+first six tests landed) and D80 (issue #13, closed: `usage` and the `max_tokens` budget are Phi-3
+tokens on Phi Silica because the runtime's tokenizer was measured to be Phi-3.5-mini's, the preflight's
+answer is read as the UTF-8 bytes it is, chars/4 stays on Aion and the fake, `POST /debug/tokenize`
+and a smoke step repeat the measurement per build; 632 tests). Issues #14 and #15 stay open for
+their remaining items. Next is issue #9 (consolidate the duplicated post-generation pipeline), then
+chunk 7 (tool-call emulation, issue #3). The repository is
 `ookla-ariel-ride/npu-bridge`; the local folder keeps its old name because package identity is
 registered against the build path.
 All four defects from the 2026-09-10 code review (#5 to #8) are fixed and merged (D62 to D65). The
 Insider flight to build 29661 broke Phi Silica and was rolled back to 29648; if it is offered again,
 expect the same (workload packages fail to register, model `NotReady`). An empty
 `Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'` listing is not proof of breakage on 29648;
-`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D79 so
+`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D80 so
 far); `docs/FUTURE.md` holds deferred work. Update both whenever a chunk changes a choice or defers
 something.
 

@@ -1,20 +1,21 @@
-# Session handoff, 2026-09-11, after the D79 merge
+# Session handoff, 2026-09-11, after the D80 merge
 
-Supersedes the handoff written after the coverage audit earlier today (in git history). Everything
+Supersedes the handoff written after the D79 merge earlier today (in git history). Everything
 below was verified at write time.
 
 ## Where things stand
 
-- `main` is at or after `908cb7a`, tree clean, in sync with origin. The repository is
+- `main` is at or after `a98c508`, tree clean, in sync with origin. The repository is
   `ookla-ariel-ride/npu-bridge` (renamed today; the old `Phi-Silica-OpenAI` URL redirects). The local
   folder keeps its old name on purpose: package identity is registered against the build path, and
   renaming it means `identity.ps1 -Install` again.
 - Chunks 1 to 6 are merged. Chunk 5 (context cache and overflow, D71 to D76), the OpenAI
-  conformance pass (D77), D78 (issue #12 closed without a change) and D79 (test hardening from the
-  coverage audit) all landed today. Chunk 6 stays code-verified only (D70; issue #2 open).
-- 512 tests pass. `smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648 on the
-  final `main` code, with four teardown rows (the main server and the three auxiliary servers).
-- Open issues: #2, #3, #4, #9, #10, #11, #13, #14, #15, #16. Closed today: #1, #12. Progress on #14
+  conformance pass (D77), D78 (issue #12 closed without a change), D79 (test hardening from the
+  coverage audit) and D80 (real token counts, issue #13) all landed today. Chunk 6 stays
+  code-verified only (D70; issue #2 open).
+- 632 tests pass. `smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648 on the
+  final `main` code: four teardown rows, and the D80 tokenizer step at 3581 / 3543 / 3581 tokens.
+- Open issues: #2, #3, #4, #9, #10, #11, #14, #15, #16. Closed today: #1, #12, #13. Progress on #14
   and #15 is recorded in comments on each.
 
 ## What this session did, in order
@@ -55,6 +56,23 @@ below was verified at write time.
    over the 30 s plus 15 s shutdown worst case. All applied. Two NPU runs: the first hit the
    model-runtime RPC fault on the first generation (second time today), the re-run and the run on
    the final code passed. Fast-forward merged; both issues stay open with comments.
+8. D80 on the branch `issue-13-tokenizer`. Measured first, per the issue: fourteen texts sent as lone
+   over-length messages, each preflight boundary counted with `Microsoft.ML.Tokenizers` over
+   Phi-3.5-mini's `tokenizer.model`. Every ASCII text lands on 3581 tokens, so the runtime's
+   tokenizer is Phi-3.5-mini's; the non-ASCII texts only agree once the preflight's answer is read
+   as UTF-8 bytes, which is what it is, and the adapter had read it as chars (a 5,001-char CJK
+   prompt at 1.6 × the window passed the preflight and got the 400 from the generation's
+   `PromptLargerThanContext` status instead, which also amends D55). Built with TDD in six commits:
+   `Utf8Offsets`, `ITokenCounter` with chars/4 and Phi-3 implementations (the model vendored, MIT),
+   `ILanguageModelBackend.TokenCounter`, `usage` from the counter, `max_tokens` as a token budget in
+   `OutputCutter`, `POST /debug/tokenize`, a smoke step that repeats the measurement. Two reviews
+   (Codex, then a Claude subagent that first died on a network error and was relaunched) found the
+   same two defects: a "16 characters back is settled" rule that a run of hyphens refutes, and
+   stop-truncated prefixes counting more on their own than the model spent. Fixed: settled text ends
+   at the last whitespace boundary only, `StopRequested` stops the model past the reserve while the
+   exact cut waits for the end, `completion_tokens` is `TokensCovering`; a third fix from the CJK
+   test (a budget ending inside a byte-fallback character stops before it). Three NPU runs, all
+   passed. Fast-forward merged; #13 closed from the commit.
 
 ## Decisions the owner made today
 
@@ -72,7 +90,11 @@ below was verified at write time.
 
 ## Do this next
 
-1. Issue #13. Measure first: tokenize the two prompts D55 and D75 give (the fox filler that fits at
+0. Done today: issue #13 (D80). What remains of it is in `docs/FUTURE.md`: the pressure warning
+   still measures characters, and Aion keeps chars/4 until a generation runs there. When Aion
+   Instruct arrives behind the Phi Silica API, the smoke's tokenizer step is the check before
+   trusting the counter for that model.
+1. Issue #13 as it was planned, kept for the record. Measure first: tokenize the two prompts D55 and D75 give (the fox filler that fits at
    13,429 characters, the smoke transcript that fits at 13,179) with `LlamaTokenizer` over
    Phi-3.5-mini's `tokenizer.model`. If both land on the same token count within a few tokens, adopt
    it for `usage` and the `max_tokens` budget, per backend, with chars/4 as the fallback for Aion.
@@ -113,6 +135,18 @@ below was verified at write time.
 - `Task.Run` awaited in the fake can continue synchronously on the caller's thread; a test that
   blocks synchronously inside a `Responder` iterator must put an async hop (`FirstTokenDelay`)
   before it, or it can block the handler before it enters its wait.
+- A lone over-length user message is the cheapest probe of the runtime: it is passed raw (D71), the
+  400 arrives in about 60 to 230 ms with the preflight's numbers, and no generation runs. Fourteen
+  such probes plus a scratch console app over the vendored tokenizer decided D80 in an hour.
+- `GetUsablePromptLength` answers in UTF-8 bytes; Microsoft's page says only "the index". Read the
+  index in the units the tokenizer confirms, not the ones the type suggests.
+- A BPE boundary is settled only at a whitespace boundary: twenty hyphens tokenize as `----` first,
+  twenty-one as `-` first. No fixed lookback is safe; "at most 16 chars back" was wrong.
+- `Microsoft.ML.Tokenizers`' `GetIndexByTokenCount` returns an index into the *normalized* text,
+  one longer than the input (the Llama dummy prefix); `EncodeToTokens` offsets likewise. Byte-fallback
+  tokens of one character all carry that character's offsets.
+- The scratch console app for tokenizer probes lives in this session's scratchpad only
+  (`TokCount/`); rebuild it from `Microsoft.ML.Tokenizers` 2.0.0 and the vendored model if needed.
 
 ## Machine facts (do not re-discover)
 
@@ -145,8 +179,8 @@ below was verified at write time.
 
 ```powershell
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\Phi-Silica-OpenAI
-git status; git log --oneline -3                          # expect main at or after 908cb7a, tree clean
-dotnet build; dotnet test                                 # expect 512 passed
+git status; git log --oneline -3                          # expect main at or after a98c508, tree clean
+dotnet build; dotnet test                                 # expect 632 passed
 .\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 1 skipped, 5 informational
-gh issue list                                             # #2, #3, #4, #9, #10, #11, #13, #14, #15, #16 open
+gh issue list                                             # #2, #3, #4, #9, #10, #11, #14, #15, #16 open
 ```

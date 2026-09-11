@@ -76,6 +76,19 @@ concurrent requests for one conversation never share a context: the second misse
   pipeline does under that profile (system text folded into the prompt, sampling dropped with one
   warning, no preflight 400, overflow learned only from the generation).
 - Status enums are mapped by name per adapter (`Error` is 6 on Phi Silica, 2 on Aion).
+- **`TokenCounter` (D80):** every backend names an `ITokenCounter` (`Count`, `IndexAtTokenCount`
+  with the total, `TokensCovering`, `PrefixStable`, `Name`). Phi Silica: `Phi3TokenCounter`;
+  Aion, the unavailable backend and the fake's default: `CharEstimateTokenCounter` (chars/4). The
+  preflight decides what fits; the counter only counts, for `usage` and the `max_tokens` budget.
+  `GetUsablePromptLength`'s byte answer is converted in the adapter (`Utf8Offsets`) so the
+  interface's "characters" contract holds.
+- **The token budget in `OutputCutter` (D80):** the cap is the counter's index at `cap` tokens over
+  everything generated; for a non-prefix-stable counter, within 8 tokens of the budget only text
+  before the last whitespace boundary is released (a run of one character retokenizes from its
+  start, so no fixed lookback is settled), the cap commits only once settled or at the end, and
+  `StopRequested` asks the handler to cancel 8 tokens past the budget while the deltas in flight
+  still reach the cutter for the exact final cut. Both handlers cancel on `StopRequested`, not
+  `IsCut`. `completion_tokens` is `TokensCovering(generatedText, deliveredLength)`.
 - **The text contract (D65):** `GenerationResult.Text` is the concatenation of the deltas delivered,
   on every status (empty on `ContentFiltered`), so the JSON shape and the stream cut the same
   characters. Both adapters get it from one Core class, `DeltaAccumulator` (D67): append and deliver

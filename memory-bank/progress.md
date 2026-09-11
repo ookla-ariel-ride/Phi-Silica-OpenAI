@@ -3,7 +3,9 @@
 ## Works today (verified)
 | Area | Status | Evidence |
 |---|---|---|
-| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; 512 xunit tests green (chunk 5, the D77 conformance pass, D78 and the D79 test hardening merged 2026-09-11) |
+| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; 632 xunit tests green (chunk 5, the D77 conformance pass, D78, the D79 test hardening and D80 real token counts merged 2026-09-11) |
+| Token counts (`usage`, `max_tokens`) | ✅ | D80: Phi-3 tokens on Phi Silica (`Phi3TokenCounter` over the vendored Phi-3.5-mini model, measured against the runtime's preflight: 3581 tokens at every ASCII boundary), chars/4 on Aion and the fake; `TokenCounterTests`, `TokenUsageTests`, `TokenBudgetCutTests`, `DebugTokenizeTests`; the smoke's tokenizer step repeats the measurement per build (fails above 2 % spread) |
+| Preflight units | ✅ | D80: `GetUsablePromptLength` answers in UTF-8 bytes, converted by `Utf8Offsets`; before the fix a 5,001-char CJK prompt at 1.6 × the window passed the preflight |
 | `/healthz`, `/v1/models`, `/v1` fallback | ✅ | TestServer tests + live curl on the exe; `/healthz` carries identity, cache counters (D74), keep-alive timings (D79) and backend diagnostics, and a test pins that the registered options, not defaults, are reported |
 | Smoke script trust (`scripts/smoke.ps1`) | ✅ | D79: readiness requires identity and bootstrap `ok` on phi-silica, the preflight step refuses a null answer, teardown proves the activated child and the port are gone (60 s), each auxiliary server has its own teardown row, `InfoStep` may fail on a contradiction. Run on the NPU 2026-09-11: all steps passed, 1 skipped, 5 informational, four teardown rows |
 | Config precedence json < local < env < CLI | ✅ | real-file test + live probes |
@@ -47,7 +49,11 @@
   script still assert nothing about the text; the exe has no unit coverage by construction.
 - Experimental Windows App SDK channel in use (no LAF token); APIs may change between releases.
 - Phi Silica returns multi-token progress chunks → callback-based token counts undercount by roughly
-  3x, so `usage` uses `ceil(chars/4)` on both sides instead (D44).
+  2.3x to 3x; `usage` used `ceil(chars/4)` on both sides (D44) until D80 replaced it with the Phi-3
+  tokenizer on Phi Silica (chars/4 had been overcounting English prose by 1.35x). Aion still chars/4.
+- A whitespace-free reply (CJK) with `max_tokens` streams nothing in its last stretch: within eight
+  tokens of the budget the cutter holds text it cannot settle, stops the model eight tokens past the
+  budget, and cuts exactly at the end (D80). Correct, but chunkier than English near the cap.
 - The model follows system prompts under the chunk 3 template on both placements; only the bare
   `/debug/generate` path ignores them (D45).
 - Activated instance's console window flashes before `--hide-console` hides it; its logs are not
@@ -95,3 +101,12 @@
   test summaries claiming more than they pinned, and a `-NoStart` identity check that belonged to
   launch provenance; all applied, 512 tests, the NPU smoke run passed with four teardown rows.
   Fast-forward merged. Both issues stay open for their remaining items.
+- D80 (2026-09-11, branch `issue-13-tokenizer`): measurement first (fourteen lone over-length probes
+  counted with the Phi-3.5 tokenizer), then six TDD commits. Codex and a Claude subagent (relaunched
+  after a network failure) independently found the same two defects: a fixed 16-character
+  "settled" lookback that a run of hyphens refutes (20 are `----` first, 21 are `-` first) and a
+  stop-truncated prefix counting more on its own than the model spent (`international` 1 token,
+  `internation` 2). Fixed with `StopRequested` and `TokensCovering`; a third fix from the CJK test
+  (a budget ending inside a byte-fallback character stops before it). The Claude review's fuzz: 480
+  stream trials never over budget, largest re-merge shift 2 tokens against a reserve of 8. Three NPU
+  runs passed. Fast-forward merged; #13 closed.
