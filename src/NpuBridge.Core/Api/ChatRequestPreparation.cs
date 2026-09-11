@@ -226,7 +226,7 @@ internal static class ChatRequestPreparer
                 Rendered: rendered,
                 NativeSystem: nativeSystem,
                 Sampling: sampling is null || sampling.IsEmpty ? null : sampling,
-                Limits: OutputLimits.From(request),
+                Limits: OutputLimits.From(request, backend.TokenCounter),
                 PromptChars: promptChars));
         }
         catch (Exception ex) when (ex is not OperationCanceledException)

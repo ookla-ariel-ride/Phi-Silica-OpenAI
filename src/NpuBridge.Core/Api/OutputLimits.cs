@@ -1,8 +1,10 @@
+using NpuBridge.Tokenizers;
+
 namespace NpuBridge.Api;
 
 /// <summary>
 /// The client-side cut: <c>max_tokens</c>/<c>max_completion_tokens</c> and <c>stop</c>, reduced to the
-/// two things the pipeline can actually act on — a character budget and a set of stop strings.
+/// two things the pipeline can actually act on — a token budget and a set of stop strings.
 ///
 /// Neither Windows runtime offers a token cap or stop sequences (Phi Silica's
 /// <c>LanguageModelOptions</c> carries sampling knobs and nothing else; Aion has no options object at
@@ -10,24 +12,20 @@ namespace NpuBridge.Api;
 /// best effort in one specific sense: the model is not steered by them, it is interrupted by them, so
 /// the tokens up to the cut are generated either way.
 ///
-/// The cap is a **character** budget rather than a token count because that is the only measure this
-/// process has. <c>usage.completion_tokens</c> is <c>ceil(chars/4)</c> (D44) — the progress callback
-/// batches several tokens per call, so counting callbacks is not a token count — and a cap measured
-/// any other way would let a reply report more completion tokens than the client asked for. Four
-/// characters per token, so the budget is exactly <c>cap * 4</c> characters: cut there and
-/// <c>ceil(chars/4)</c> lands on the cap, never above it.
+/// The budget is measured by the backend's <see cref="ITokenCounter"/> (D80): Phi-3 tokens on Phi
+/// Silica, whose vocabulary the runtime was measured to share, and <c>cap * 4</c> characters where the
+/// tokenizer is unpublished (D53). <c>usage.completion_tokens</c> is counted by the same counter over the
+/// same text, so a reply never reports more completion tokens than the client asked for.
 /// </summary>
 internal sealed class OutputLimits
 {
     /// <summary>No cap and no stop strings: <see cref="Cut"/> and <see cref="OutputCutter"/> pass text through.</summary>
-    public static readonly OutputLimits None = new(null, []);
+    public static readonly OutputLimits None = new(null, [], CharEstimateTokenCounter.Instance);
 
-    /// <summary>Characters per token in the <c>usage</c> estimate. The cap is converted with the same number.</summary>
-    private const int CharsPerToken = 4;
-
-    private OutputLimits(int? maxChars, IReadOnlyList<string> stop)
+    private OutputLimits(int? maxTokens, IReadOnlyList<string> stop, ITokenCounter counter)
     {
-        MaxChars = maxChars;
+        MaxTokens = maxTokens;
+        Counter = counter;
         Stop = stop;
 
         var longest = 0;
@@ -42,8 +40,11 @@ internal sealed class OutputLimits
         Holdback = Math.Max(0, longest - 1);
     }
 
-    /// <summary>Character budget for the completion, or null when the request set no cap.</summary>
-    public int? MaxChars { get; }
+    /// <summary>Token budget for the completion, or null when the request set no cap.</summary>
+    public int? MaxTokens { get; }
+
+    /// <summary>The backend's counter: what <see cref="MaxTokens"/> is measured in.</summary>
+    public ITokenCounter Counter { get; }
 
     /// <summary>Stop strings, already normalised from a bare string or an array. Never contains an empty entry.</summary>
     public IReadOnlyList<string> Stop { get; }
@@ -52,7 +53,7 @@ internal sealed class OutputLimits
     public int Holdback { get; }
 
     /// <summary>True when nothing was requested, so no text can ever be cut.</summary>
-    public bool IsEmpty => MaxChars is null && Stop.Count == 0;
+    public bool IsEmpty => MaxTokens is null && Stop.Count == 0;
 
     /// <summary>
     /// Reads the two cap fields and <c>stop</c> off a validated request. When both caps are present the
@@ -64,7 +65,7 @@ internal sealed class OutputLimits
     /// honouring it would answer every such request with an empty completion. It is not an error
     /// either — a client that sends one gets the reply it would have got without it.
     /// </summary>
-    public static OutputLimits From(ChatCompletionRequest request)
+    public static OutputLimits From(ChatCompletionRequest request, ITokenCounter counter)
     {
         ArgumentNullException.ThrowIfNull(request);
 
@@ -76,15 +77,19 @@ internal sealed class OutputLimits
             _ => null,
         };
 
-        // cap * 4 overflows int for a cap past ~536 million. Saturate rather than wrap: an absurd cap
-        // is indistinguishable from no cap at all, and a negative budget would cut everything.
-        var maxChars = cap is { } tokens ? (int)Math.Min((long)tokens * CharsPerToken, int.MaxValue) : (int?)null;
-
         var stop = request.Stop is null
             ? []
             : request.Stop.Where(s => !string.IsNullOrEmpty(s)).ToArray();
 
-        return maxChars is null && stop.Length == 0 ? None : new OutputLimits(maxChars, stop);
+        return Create(cap, stop, counter);
+    }
+
+    /// <summary>The limits from their parts; tests build them here without a request.</summary>
+    public static OutputLimits Create(int? maxTokens, IReadOnlyList<string> stop, ITokenCounter counter)
+    {
+        ArgumentNullException.ThrowIfNull(stop);
+        ArgumentNullException.ThrowIfNull(counter);
+        return maxTokens is null && stop.Count == 0 ? None : new OutputLimits(maxTokens, stop, counter);
     }
 
     /// <summary>
@@ -134,15 +139,40 @@ internal readonly record struct CutResult(string Text, string? FinishReason);
 /// means a reply that lands exactly on the budget finishes <c>stop</c>: the cap fires when text is
 /// dropped, not when the budget is touched.
 ///
+/// <b>A token budget adds one more thing to wait for.</b> The budget's position is the counter's
+/// index at <c>cap</c> tokens over everything generated so far, and with a BPE tokenizer that index
+/// can move when text arrives: a merge can reach into the word still being written, so the last
+/// tokens of the text are provisional (D80). SentencePiece pieces never span a whitespace boundary
+/// and are at most <see cref="MaxPieceChars"/> characters, so everything before the trailing partial
+/// word, or more than that many characters back, is settled. Near the budget (within
+/// <see cref="NearBudgetReserveTokens"/> tokens of it) the stream releases only settled text and
+/// commits the cap only once its index is settled, or the generation ends; far from the budget a
+/// provisional count cannot matter and text flows as it arrives. A counter that is
+/// <see cref="ITokenCounter.PrefixStable"/> (chars/4) needs none of this.
+///
 /// Not thread-safe. The streaming path drives it from the single channel reader, never from the
 /// backend's callback thread; the non-streaming path locks its watcher instance.
 /// </summary>
 internal sealed class OutputCutter
 {
+    /// <summary>
+    /// How close to the budget, in tokens, the stream starts holding provisional text back. Eight tokens
+    /// is far more than a BPE re-merge shifts a count by in practice (one or two), so releasing freely
+    /// below it cannot overshoot; above it the trailing word waits for its whitespace, or for
+    /// <see cref="MaxPieceChars"/> more characters.
+    /// </summary>
+    internal const int NearBudgetReserveTokens = 8;
+
+    /// <summary>The longest piece in the Phi-3 vocabulary: text further back than this cannot be re-merged.</summary>
+    internal const int MaxPieceChars = 16;
+
     private readonly OutputLimits _limits;
 
     /// <summary>Text generated but not yet emitted: the held tail, plus whatever the last delta added.</summary>
     private string _pending = string.Empty;
+
+    /// <summary>Everything generated so far: the token budget is measured over it, since a counter's prefix counts are not additive.</summary>
+    private readonly System.Text.StringBuilder _all = new();
 
     /// <summary>Everything emitted so far, for the token count of what the client received (D80).</summary>
     private readonly System.Text.StringBuilder _emittedText = new();
@@ -200,10 +230,29 @@ internal sealed class OutputCutter
         if (incoming.Length > 0)
         {
             _pending = _pending.Length == 0 ? incoming : _pending + incoming;
+            _all.Append(incoming);
         }
         else if (!final && _pending.Length == 0)
         {
             return string.Empty;
+        }
+
+        // The token budget over everything so far, in the pending window's coordinates, and how much
+        // of the text is settled. Both are null when there is no cap; settledEnd is also null for a
+        // prefix-stable counter, whose every index is final the moment it is computed.
+        int? capAt = null;
+        int? settledEnd = null;
+        var near = false;
+        if (_limits.MaxTokens is { } cap)
+        {
+            var all = _all.ToString();
+            var counter = _limits.Counter;
+            capAt = Math.Max(0, counter.IndexAtTokenCount(all, cap) - _emitted);
+            if (!counter.PrefixStable)
+            {
+                near = cap <= NearBudgetReserveTokens || counter.IndexAtTokenCount(all, cap - NearBudgetReserveTokens) < all.Length;
+                settledEnd = Math.Max(0, Math.Max(TrailingWordStart(all), all.Length - MaxPieceChars) - _emitted);
+            }
         }
 
         // Where the earliest stop string starts inside the pending window, relative to it. Everything
@@ -220,11 +269,6 @@ internal sealed class OutputCutter
                 stopAt = at;
             }
         }
-
-        // The cap's cut point in the same relative coordinates; null when the request set no cap.
-        // Never negative: the release below never hands out more than capAt characters, so _emitted
-        // cannot pass the budget without a cut.
-        var capAt = _limits.MaxChars is { } max ? max - _emitted : (int?)null;
 
         // A match is committed only once no *longer* stop string starting earlier can still form. One
         // beginning at q < stopAt is unresolved while q + longest > _pending.Length, so the unresolved
@@ -244,13 +288,15 @@ internal sealed class OutputCutter
             cutAt = stopAt;
             FinishReason = "stop";
         }
-        else if (capAt is { } cap && _pending.Length > cap && (final || _pending.Length - cap >= _limits.Holdback))
+        else if (capAt is { } budget && _pending.Length > budget
+            && (final || (_pending.Length - budget >= _limits.Holdback && (settledEnd is null || budget <= settledEnd))))
         {
-            // Text was actually dropped (> cap, not >= cap) and no stop string can still turn out to
-            // start before the budget: a stop string beginning at cap-1 would end by cap-1+Holdback+1,
-            // so Holdback characters past the budget is exactly enough evidence to rule one out. Cutting
-            // at the budget itself makes ceil(chars/4) land on the cap rather than one above it.
-            cutAt = cap;
+            // Text was actually dropped (> budget, not >= budget), no stop string can still turn out to
+            // start before it (a stop string beginning at budget-1 would end by budget-1+Holdback+1, so
+            // Holdback characters past the budget is exactly enough evidence to rule one out), and the
+            // budget's own position is settled, so no later merge can move it. Cutting at the budget
+            // itself makes the counted completion land on the cap rather than one above it.
+            cutAt = budget;
             FinishReason = "length";
         }
         else if (final)
@@ -266,6 +312,13 @@ internal sealed class OutputCutter
             if (capAt is { } room && safe > room)
             {
                 safe = room;
+            }
+
+            // Near a token budget, only settled text goes out: a release into the trailing partial word
+            // could turn out to hold more tokens than it did when it was released.
+            if (near && settledEnd is { } settled && safe > settled)
+            {
+                safe = settled;
             }
 
             safe = NotSplittingASurrogatePair(_pending, safe);
@@ -315,4 +368,25 @@ internal sealed class OutputCutter
         index > 0 && index < text.Length && char.IsLowSurrogate(text[index]) && char.IsHighSurrogate(text[index - 1])
             ? index - 1
             : index;
+
+    /// <summary>
+    /// Where the provisional tail begins: the start of the whitespace run before the last word, since a
+    /// SentencePiece piece carries its leading whitespace and never spans a whitespace boundary. Zero
+    /// when the text has no whitespace at all, so the whole of it is still one word in progress.
+    /// </summary>
+    private static int TrailingWordStart(string text)
+    {
+        var i = text.Length - 1;
+        while (i >= 0 && !char.IsWhiteSpace(text[i]))
+        {
+            i--;
+        }
+
+        while (i >= 0 && char.IsWhiteSpace(text[i]))
+        {
+            i--;
+        }
+
+        return i + 1;
+    }
 }

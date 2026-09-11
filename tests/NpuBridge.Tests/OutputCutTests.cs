@@ -732,9 +732,10 @@ public class OutputCutTests
     [Fact]
     public void An_absurd_cap_saturates_rather_than_overflowing_into_a_negative_budget()
     {
+        // cap * 4 characters would overflow int; the counter's index saturates at the text instead.
         var limits = Limits(int.MaxValue);
 
-        Assert.Equal(int.MaxValue, limits.MaxChars);
+        Assert.Equal(int.MaxValue, limits.MaxTokens);
         Assert.Equal(new CutResult("anything at all", null), limits.Cut("anything at all"));
     }
 
@@ -750,7 +751,8 @@ public class OutputCutTests
             stop = stops.Length == 0 ? null : stops,
         });
 
-        return OutputLimits.From(JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!);
+        // chars/4, the counter every test here was written against (D53); the token budget has its own tests.
+        return OutputLimits.From(JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!, NpuBridge.Tokenizers.CharEstimateTokenCounter.Instance);
     }
 
     private static IEnumerable<string> Counted(StrongBox<int> counter, int count)
