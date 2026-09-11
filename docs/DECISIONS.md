@@ -711,6 +711,17 @@ providers. Ruled out: Developer Mode (on, no effect), the driver (irrelevant bef
 package folder's ACL (Users have read-and-execute on every file), Smart App Control (off), AppLocker
 (no policy), Defender blocks (no events), a package staged on the broken 29661 flight (the folders
 date from 2026-08-16 and were registered after the rollback boot at 19:57). Not tried: removing and
-re-acquiring the two provider packages on this build, and a different Windows build. Consequence for
-chunk 6: the adapter is code-verified and review-clean; the hardware half of the definition of done
-cannot be met on this machine until the OS honours main-package dependencies again. (chunk 6)
+re-acquiring the two provider packages on this build, and a different Windows build. Also tried, same
+day: the sample repo's own `AcquireQnnEp` tool (rebuilt for .NET 10) reports the provider ready, adds
+the dependency, and then fails every load with `E_ACCESSDENIED` and exits 5 (`TryRegister` failed),
+so it reproduces the finding independently of npu-bridge; and running `--backend aion` inside a
+process that carries the sparse-package identity (activated through the package with the backend on
+its command line) fails identically at `TryRegister` before the cache build, so a packaged process
+gets no different treatment. The sample repo's closed issue #1 is the mirror image: on a retail
+26200 build the hard-coded provider family was absent (that machine carried in-box
+`WindowsWorkload.EP.Qualcomm.QNN.*` packages, including a framework variant) and acquiring the main
+package fixed it. Here the machine-wide registry shows `WindowsWorkload.EP.Qualcomm.QNN.Framework.1.8`
+and the LanguageModel workload packages as staged but not registered for any user, which is also why
+Phi Silica works only through the workload session host. Consequence for chunk 6: the adapter is
+code-verified and review-clean; the hardware half of the definition of done cannot be met on this
+machine until the OS honours main-package dependencies again. (chunk 6)

@@ -60,9 +60,38 @@ compiled model cache under `C:\ProgramData\Aion Instruct Preview\Cache\<ver>\QNN
 package `MicrosoftCorporationII.WinML.Qualcomm.QNN.EP.1.8` (installed here at 1.8.30.0 by
 `ExecutionProvider.EnsureReadyAsync` on 2026-09-11; a `...QNN.EP.2` 2.2450.47.0 arrived with it). Its
 DLLs fail `LoadLibrary` with `E_ACCESSDENIED` on this machine, which is why `CreateAsync` fails (D68).
+Root cause (D70): the provider is a main package that opts in as a dynamic-dependency target; the OS
+accepts the dependency (`TryCreatePackageDependency` and `AddPackageDependency` succeed) but this
+Insider build still refuses to map the package's DLLs as images from any process, packaged or not.
+Every main package on the machine behaves the same; every framework package loads. Not the ACL, not
+signatures, not Developer Mode (turned on 2026-09-11, no change), not the driver.
 
 Installed on this machine (2026-09-11): the framework MSIX 1.0.0.0 (user scope, `Add-AppxPackage`, no
-elevation), the SDK NuGet in `nuget-local/`, both QNN provider packages. Developer Mode is off.
+elevation), the SDK NuGet in `nuget-local/`, both QNN provider packages. Developer Mode is on.
+The machine-wide package registry also holds an in-box `WindowsWorkload.EP.Qualcomm.QNN.Framework.1.8`
+and the `WindowsWorkload.LanguageModel.*` packages as *staged only* (registered for no user).
+
+## Current docs, read through Context7 on 2026-09-11 (learn.microsoft.com)
+- **Dynamic dependencies on main packages** exist only in the Windows 11 OS API (the Windows App SDK
+  implementation targets framework packages), and the target main package must opt in with
+  `DependencyTarget` in its manifest (the QNN provider does, `uap15:DependencyTarget`). Windows App
+  SDK 1.7+ on 24H2+ delegates dynamic dependencies to the OS and extends them to packaged processes.
+- **Windows ML moved providers to framework packages** in Windows App SDK 2.1.3 ("discovery of
+  execution providers delivered as framework packages"; 2.4.0 adds ARM64EC). Aion is pinned to
+  Windows App Runtime 1.8, whose catalog still uses main-package providers, so Aion is the only thing
+  here exposed to the main-package path.
+- **Phi Silica is a Limited Access Feature on the stable channel** as of Windows App SDK 2.1.3, with
+  `AIFeatureReadyState.CapabilityMissing` and `OSUpdateNeeded` added for diagnosis (matches D31).
+- **Structured JSON output** (stable `Microsoft.Windows.AI.Text` in 2.4.x, present in both the 2.4.4
+  and 2.4.8-experimental metadata): `LanguageModel.GenerateStructuredJsonResponseAsync(..., jsonSchema)`
+  returns `GenerateStructuredJsonResponseResult` with its own `GenerateStructuredJsonResponseStatus`
+  carrying a schema-failure value; the 2.4.0 notes say output is "strictly constrained to a
+  caller-supplied JSON Schema". Relevant to chunk 7: a schema-constrained tool-call turn could replace
+  the tolerant parser as the primary path on Phi Silica, with the parser as the fallback for Aion.
+- **Prompt compression** (`Microsoft.Windows.AI.Text.Experimental`, 2.4.8-experimental metadata only):
+  `LanguageModelExperimental.CompressPromptAsync` with `LanguageModelOptionsExperimental.PreferredRetentionRatio`.
+  Relevant to chunk 5 as an alternative to dropping turns under `--truncate-history`; experimental,
+  Phi Silica only, and the exe references 2.4.1-experimental, so it would need a version bump.
 
 ## Commands
 ```powershell

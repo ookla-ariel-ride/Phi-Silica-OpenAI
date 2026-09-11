@@ -42,9 +42,11 @@ land here instead of widening the chunk. Each entry says where it came from and 
   `AddPackageDependency` both succeed from a plain process), and the build still refuses to map the
   package's DLLs as images (error 5) from that process. Developer Mode was turned on and changed
   nothing; the ACL, signatures, Smart App Control, AppLocker, Defender and the driver are ruled out.
-  Left to try: remove and re-acquire the two provider packages on this build (the retargeted
-  `AcquireQnnEp` tool is in the session scratchpad and would need rebuilding), or a different Windows
-  build. Everything that depends on a generation stays unmeasured: load time, TTFT, tok/s,
+  Also tried without effect: the sample's own `AcquireQnnEp` tool (exit 5, `TryRegister` failed, the
+  same access-denied loads), and running the backend inside the sparse-package identity. Left to try:
+  remove and re-acquire the two provider packages on this build, or a different Windows build. When
+  a build works, the sample's `scripts/Diagnose-AionInstructPreview.ps1` is the reference for what a
+  healthy machine reports, and its OutputDebugString capture is the way to read the SDK's EP decision. Everything that depends on a generation stays unmeasured: load time, TTFT, tok/s,
   system-prompt adherence under folded placement, whether cancel stops the device, and the over-length
   verdict.
 - **`BackendCapabilities.Cancellation` is not advertised on Aion** until the cut measurement earns it.
