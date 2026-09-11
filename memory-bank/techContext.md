@@ -1,4 +1,4 @@
-# Tech Context — npu-bridge
+# Tech Context: npu-bridge
 
 ## Machine
 Samsung Galaxy Book4 Edge, Snapdragon X Elite (X1E80100), Windows 11 ARM64 Insider build 29648. The
@@ -12,12 +12,12 @@ machine; the NPU is here.
   version-constants source) + CsWinRT 2.3.1 (direct) + `Microsoft.Windows.SDK.BuildTools` 10.0.26100.4948
   (makeappx/signtool; also used by `identity.ps1`). CsWinRT reads Windows metadata from the
   `Microsoft.Windows.SDK.NET.Ref` 10.0.26100.57 NuGet, so no Windows SDK install is needed.
-- Tests: xunit 2.9.3, `Microsoft.AspNetCore.TestHost` 10.0.11. 279 tests, ~1 s.
+- Tests: xunit 2.9.3, `Microsoft.AspNetCore.TestHost` 10.0.11. 472 tests, about 1 s.
 - gitleaks 8.30.1 (pre-commit hook + CI workflow) with project rules for LAF tokens.
 
 ## Runtime prerequisites on the machine
 - Windows App Runtime 2.4.0 (stable) and **2.4.1 experimental** (`Microsoft.WindowsAppRuntime.2-experimentalB`
-  + DDLM) — the experimental one is what the exe currently binds to; `identity.ps1` installs it from
+  + DDLM); the experimental one is what the exe currently binds to. `identity.ps1` installs it from
   `~/.nuget/packages/microsoft.windowsappsdk.runtime/2.4.1-experimental/tools/MSIX/win10-arm64`.
 - Windows App Runtime 1.8 (WinML stack; needed by Aion).
 - Sparse package `NpuBridge_0.1.0.0_arm64__jtas4mnxdyzpe` registered for
@@ -36,9 +36,10 @@ machine; the NPU is here.
   CapabilityMissing, NotCompatibleWithSystemHardware, OSUpdateNeeded.
 - LAF: `LimitedAccessFeatures.TryUnlockFeature("com.microsoft.windows.ai.languagemodel", token, attestation)`;
   stable → `Unavailable` without token; experimental works regardless.
-- Measured: model create 15.7 s–23.6 s cold across two runs on 2026-09-05 (10 s was one earlier
-  chunk-2 recording; it varies) / ~50 ms warm; ~10 tok/s; first token in 1.1 s–1.7 s
-  (`/debug/generate`); a full non-streaming `/v1/chat/completions` reply in 677 ms–899 ms; progress
+- Measured: model create 15.7 s to 23.6 s cold across two runs on 2026-09-05 (10 s was one earlier
+  chunk-2 recording; it varies), about 50 ms warm; about 10 tok/s counted by progress callbacks (the
+  chars/4 estimate reads about 35, D44 and D75); first token in 1.1 s to 1.7 s
+  (`/debug/generate`); a full non-streaming `/v1/chat/completions` reply in 677 ms to 899 ms; progress
   delivers multiple tokens per callback.
 - `--system-prompt-placement auto|native|prompt` (new in chunk 3, default `auto`): native context when
   the backend advertises the capability. Measured on this NPU: both placements produce the instructed
@@ -64,8 +65,8 @@ DLLs fail `LoadLibrary` with `E_ACCESSDENIED` on this machine, which is why `Cre
 Root cause (D70): the provider is a main package that opts in as a dynamic-dependency target; the OS
 accepts the dependency (`TryCreatePackageDependency` and `AddPackageDependency` succeed) but this
 Insider build still refuses to map the package's DLLs as images from any process, packaged or not.
-Every main package on the machine behaves the same; every framework package loads. Not the ACL, not
-signatures, not Developer Mode (turned on 2026-09-11, no change), not the driver.
+Every main package on the machine behaves the same; every framework package loads. The ACL,
+signatures, Developer Mode (turned on 2026-09-11, no change) and the driver are ruled out.
 
 Installed on this machine (2026-09-11): the framework MSIX 1.0.0.0 (user scope, `Add-AppxPackage`, no
 elevation), the SDK NuGet in `nuget-local/`, both QNN provider packages. Developer Mode is on.
@@ -123,8 +124,8 @@ NpuBridge.exe service install|start|stop|uninstall # elevated; aion/fake only
   work is a `--backend phi-silica` smoke run with the registry key flipped and a re-check of D31.
 - **Aion 1.0 Plan**: a different model, not a newer Instruct. 14B parameters, 32K context, native tool
   calling and reasoning, for agentic workloads. "In-box on capable devices in the coming months"; one
-  secondary source cites 2026-11-24. **No SDK, no preview package, not on Hugging Face, not in the
-  Foundry Local catalog** as of 2026-09-10. API unpublished; probably the Windows AI Foundry APIs
+  secondary source cites 2026-11-24. As of 2026-09-10 it has no SDK and no preview package, and it is
+  on neither Hugging Face nor the Foundry Local catalog. API unpublished; probably the Windows AI Foundry APIs
   rather than the Instruct framework. Needs a 40+ TOPS NPU (this machine qualifies); Windows AI APIs
   now also target GPUs and CPUs.
 - Consequence for the plan: a backend with native tool calling should bypass chunk 7's emulation via a

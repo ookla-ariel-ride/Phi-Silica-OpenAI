@@ -1,4 +1,4 @@
-# Progress — npu-bridge
+# Progress: npu-bridge
 
 ## Works today (verified)
 | Area | Status | Evidence |
@@ -11,7 +11,7 @@
 | Sparse package identity (`identity.ps1`) | ✅ | registered; PFN `NpuBridge_jtas4mnxdyzpe` |
 | Self-relaunch via package activation + supervision | ✅ | child had identity, saw shell env, died with the parent |
 | Phi Silica adapter (experimental SDK) | ✅ | smoke passed 2026-09-11 on build 29648 (generate, preflight, system prompt, disconnect drain, text contract: `text_mismatches=0 late_deltas=0`, D65). Insider flight 29661 broke it on 2026-09-10 (workload packages fail to register, model `NotReady`); rolled back |
-| `/v1/chat/completions` non-streaming | ✅ | `ChatCompletionsTests`; smoke on the real NPU: 677 ms–899 ms across runs, correct shape and usage |
+| `/v1/chat/completions` non-streaming | ✅ | `ChatCompletionsTests`; smoke on the real NPU: 677 ms to 899 ms across runs, correct shape and usage |
 | `/v1/chat/completions` streaming (SSE) | ✅ | `ChatCompletionsStreamingTests` (framing, error event, keep-alive, disconnect drain); smoke streaming step on the NPU |
 | Client-side cut: `max_tokens`, `max_completion_tokens`, `stop` | ✅ | `OutputCutTests` on both shapes; smoke shows the cut cancels the NPU (D53) |
 | PromptTemplate (message flattening) | ✅ | exact-string tests; both system-prompt placements measured on hardware |
@@ -25,14 +25,14 @@
 | Aion Instruct adapter (`--backend aion`) | ⚠️ | code-verified: 404 tests incl. `AionCapabilityProfileTests` and `DeltaAccumulatorTests`, two adversarial reviews applied (D69); `/healthz` reports the SDK's `InvalidCache` failure on this machine because the QNN provider cannot be loaded (D70) |
 
 ## Not built yet
-- `/v1/completions` — chunk 8
-- Aion Instruct adapter hardware verification — the adapter merged 2026-09-11 (chunk 6, D66 to D70) but
+- `/v1/completions` (chunk 8)
+- Aion Instruct adapter hardware verification: the adapter merged 2026-09-11 (chunk 6, D66 to D70) but
   build 29648 never grants a main-package dynamic dependency execute access, so no Aion generation has
   run; issue #2 stays open. Aion Instruct itself ships in October/November 2026 as a model swap behind
   the Phi Silica API, so `PhiSilicaBackend` is the production path.
-- Aion Plan backend — unscheduled; the model has no SDK yet (GitHub issue tracks it)
-- Tool-call emulation — chunk 7
-- Scheduler / 429 queue, client docs — chunk 8
+- Aion Plan backend: unscheduled, since the model has no SDK yet (a GitHub issue tracks it)
+- Tool-call emulation (chunk 7)
+- Scheduler, 429 queue, client docs (chunk 8)
 
 ## Known issues and caveats
 - Experimental Windows App SDK channel in use (no LAF token); APIs may change between releases.
@@ -55,8 +55,8 @@
   the `messages` array reached the handler and threw HTTP 500 instead of failing validation (D49). A
   separate whole-branch review found a latent bug that would have broken chunk 6: forcing
   `--system-prompt-placement native` rejected every request, not only ones carrying a system message,
-  because the check ran before the prompt was rendered — dormant today since both shipping backends
-  advertise native support, but would have rejected all Aion traffic (D50). Two fix rounds addressed
+  because the check ran before the prompt was rendered. It was dormant since both shipping backends
+  advertise native support, but it would have rejected all Aion traffic (D50). Two fix rounds addressed
   both findings; the rest of each review's findings were deferred to `docs/FUTURE.md`'s chunk 3 section.
   Commits `796252b`, `2c4bdc5`, `d6236e9`, `8f533fe`, `91383f4`, `030d49c`.
 - Chunk 4: five reviewed tasks (preparation-phase extraction, streaming happy path, failure paths,

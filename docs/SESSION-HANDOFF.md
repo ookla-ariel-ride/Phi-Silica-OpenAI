@@ -1,20 +1,20 @@
-# Session handoff — 2026-09-11, after the chunk 5 merge
+# Session handoff, 2026-09-11, after the chunk 5 merge
 
 Supersedes the 2026-09-11 end-of-day handoff (in git history). Everything below was verified at write
 time.
 
 ## TL;DR
 
-- **Chunks 1 to 6 are merged on `main`** (`main` at or after `ef29693`). Chunk 5 (context cache and
+- Chunks 1 to 6 are merged on `main` (`main` at or after `ef29693`). Chunk 5 (context cache and
   overflow handling, issue #1) merged today after two adversarial reviews and two Phi Silica smoke
   runs; D71 to D76 record it. Chunk 6 stays code-verified only (D70; issue #2 open).
-- **What chunk 5 does:** a continuing conversation hits a cached context and sends only its newest
-  turns (measured: 274 ms TTFT on a hit against 417 ms for the replay); an over-length transcript is
-  refused by the preflight in 31 ms instead of a 26 s failed generation (D55 closed); with
-  `--truncate-history` the oldest exchanges are dropped and the reply carries
+- Chunk 5 does three things. A continuing conversation hits a cached context and sends only its
+  newest turns (measured: 274 ms TTFT on a hit against 417 ms for the replay). An over-length
+  transcript is refused by the preflight in 31 ms instead of by a 26 s failed generation (D55
+  closed). With `--truncate-history` the oldest exchanges are dropped and the reply carries
   `x-npu-bridge-truncated-turns`. `/healthz` reports `contexts_cached`, `context_cache_capacity`,
-  `context_cache_hits`, `context_cache_misses`.
-- **Next:** issue #9 (consolidate the duplicated post-generation pipeline) before chunk 7 (tool-call
+  `context_cache_hits` and `context_cache_misses`.
+- Next is issue #9 (consolidate the duplicated post-generation pipeline), then chunk 7 (tool-call
   emulation, issue #3).
 
 ## State at write time
@@ -23,7 +23,7 @@ time.
 |---|---|
 | OS build | 29648 |
 | `dotnet build` | clean, 0 warnings, both with the Aion SDK and `-p:AionSdkAvailable=false` |
-| `dotnet test` | **472 passed**, 0 failed |
+| `dotnet test` | 472 passed, 0 failed |
 | `smoke.ps1 -Backend phi-silica -Port 5298` | all steps passed, 1 skipped, 5 informational, twice today (before and after the review fixes) |
 | Branches | only `main`, locally and on origin (the chunk 5 branch was deleted after the fast-forward) |
 | GitHub issues | #1 closed by the merge; #2 open (hardware half of chunk 6); #3, #4, #9, #10, #11 open |
@@ -44,15 +44,15 @@ time.
 
 ## Things learned today worth keeping
 
-- **`contexts_cached` alone cannot prove a cache hit once the cache is full**: a miss evicts one and
+- **`contexts_cached` alone cannot prove a cache hit once the cache is full.** A miss evicts one and
   adds one, so the count is unchanged either way. That is why `/healthz` gained the hit and miss
   counters and why the smoke step reads them (D74).
-- **The preflight's answer depends on the text**: 13,179 usable characters for the smoke transcript,
-  13,429 for the D55 prompt. It is a tokenizer's verdict, not a constant; ask it every time.
-- **After a truncation the next request in that conversation misses and truncates again** (the
-  stored key is over the truncated transcript, the client sends the full one). Correct but slower;
+- **The preflight's answer depends on the text.** 13,179 usable characters for the smoke transcript,
+  13,429 for the D55 prompt. It is a tokenizer's verdict rather than a constant; ask it every time.
+- **After a truncation the next request in that conversation misses and truncates again.** The
+  stored key is over the truncated transcript and the client sends the full one. Correct but slower;
   the fix options are in `docs/FUTURE.md`'s chunk 5 section.
-- **Do not run `dotnet build` while `smoke.ps1` has a server up**: the exe is locked and the copy
+- **Do not run `dotnet build` while `smoke.ps1` has a server up.** The exe is locked and the copy
   step fails. Wait for the run, then build.
 - Under package activation the server's console output is not in the smoke log (the by-path parent
   is what the redirect captures), so the server-side log line is not evidence for a smoke assertion;
@@ -60,10 +60,10 @@ time.
 
 ## Do this next
 
-1. **Issue #9**: consolidate the duplicated post-generation pipeline across the two shapes before
+1. Issue #9: consolidate the duplicated post-generation pipeline across the two shapes before
    chunk 7 adds the buffered tool-detection path on top of both. Chunk 5 added a retry loop to each
-   endpoint, which makes the duplication larger, not smaller.
-2. **Chunk 7 (issue #3)**: tool-call emulation. `ChatMessage.ToolCalls` is already carried and keyed;
+   endpoint, which made the duplication larger.
+2. Chunk 7 (issue #3): tool-call emulation. `ChatMessage.ToolCalls` is already carried and keyed;
    rendering the model its own protocol and computing the stored key from the parsed calls are the
    chunk's job. Structured JSON output (`GenerateStructuredJsonResponseAsync`, 2.4.x stable) is the
    design option on the issue.

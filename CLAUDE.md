@@ -7,9 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `npu-bridge`: a .NET 10 Windows console app / Windows service that exposes the Copilot+ PC on-device
 language model as an OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/models`, `/healthz`;
 `/v1/completions` arrives in chunk 8) so agent tools (OpenCode, Hermes) can use the NPU model as a provider.
-Two real backends behind one interface: **Phi Silica** (`Microsoft.Windows.AI.Text`, Windows App SDK)
-and **Aion Instruct Preview** (`AionInstructPreview.Text`, Microsoft's announced replacement), plus a
-**fake** backend for tests. Aion 1.0 **Plan** is a different model (14B, 32K context, native tool
+Two real backends behind one interface: Phi Silica (`Microsoft.Windows.AI.Text`, Windows App SDK)
+and Aion Instruct Preview (`AionInstructPreview.Text`, Microsoft's announced replacement), plus a
+fake backend for tests. Aion 1.0 Plan is a different model (14B, 32K context, native tool
 calling) with no SDK as of 2026-09-10; it is tracked as a GitHub issue, and a backend for it would
 bypass the tool-call emulation rather than use it.
 
@@ -19,7 +19,7 @@ template, streaming over server-sent events with the client-side cut for `max_to
 context cache with overflow handling (chunk 5, merged 2026-09-11, D71 to D75: a continuing
 conversation sends only its newest turns on a cached context, an over-length transcript is refused
 by the preflight before a token is generated, and `--truncate-history` drops the oldest exchanges
-instead), and the Aion Instruct Preview adapter (chunk 6, merged 2026-09-11 as **code-verified only**,
+instead), and the Aion Instruct Preview adapter (chunk 6, merged 2026-09-11 as code-verified only,
 D66 to D70): `AionBackend`, the shared `DeltaAccumulator` in Core, the Aion capability-profile tests
 and the `-Backend aion` smoke steps exist, but no Aion generation has ever run on this machine,
 because build 29648 never appends the `WIN://SYSAPPID` token attribute for a main-package dynamic
@@ -91,7 +91,7 @@ context-pressure warning. See "Protocol rules" below.
 
 Three projects, deliberately:
 
-- `src/NpuBridge.Core` (net10.0, AnyCPU, **no WinRT references**): everything with logic. Built so
+- `src/NpuBridge.Core` (net10.0, AnyCPU, no WinRT references): everything with logic. Built so
   far: OpenAI DTOs and endpoint mapping (`FrameworkReference` to ASP.NET Core so `TestServer` covers
   HTTP framing), message flattening + prompt template (`PromptTemplate`), the shared preparation
   phase (`ChatRequestPreparer`), the JSON and SSE generation phases (`ChatCompletionsEndpoint`,
@@ -100,7 +100,7 @@ Three projects, deliberately:
   conversation key and the context cache (`ConversationKey`, `ContextCache`), and the session that
   drives lookup, tail rendering and overflow handling for both shapes (`ConversationSession`,
   `ContextLease`).
-  **Not built yet** — do not describe these as existing: tool-call emulation (chunk 7), generation
+  Not built yet, so do not describe these as existing: tool-call emulation (chunk 7), generation
   scheduler and `/v1/completions` (chunk 8).
 - `src/NpuBridge` (net10.0-windows10.0.26100.0, ARM64 exe): `Program.cs`, config, service and task
   verbs, `PhiSilicaBackend`, `AionBackend` (behind a conditional SDK reference: when
@@ -145,17 +145,17 @@ concurrent requests for one conversation each get their own context (the second 
 
 ### Backend contract facts that must not be "simplified" away
 
-- The two WinRT APIs are **not** identical. Aion has only `CreateAsync`, `CreateContext()`,
+- The two WinRT APIs are not identical. Aion has only `CreateAsync`, `CreateContext()`,
   `GenerateResponseAsync(ctx, prompt)`. No `LanguageModelOptions`, no system-prompt `CreateContext`,
   no `GetUsablePromptLength`. Sampling and system-prompt-context are per-backend *capabilities*.
 - Status enums differ numerically (`Error` is 6 on Phi Silica, 2 on Aion). Map by name inside each
   adapter to `GenerationStatus`; never share numeric values.
-- `Progress` delivers **deltas** (not accumulated text) on a WinRT thread. Never write to the HTTP
+- `Progress` delivers deltas (not accumulated text) on a WinRT thread. Never write to the HTTP
   response from that callback; hand off through a `Channel<string>`.
 - `LanguageModel` and `LanguageModelContext` are `IDisposable`. A context whose generation ended in
   anything other than `Complete` (error, cancel, overflow) has indeterminate state: dispose it, never
   return it to the cache. Evicted contexts are disposed. Tests count creates vs disposes on the fake.
-- Phi Silica needs **package identity** (sparse package with `systemAIModels` capability). Identity is
+- Phi Silica needs package identity (sparse package with `systemAIModels` capability). Identity is
   granted only when Windows *activates* the app through its package, never when the exe is started by
   path (D24). So: `--backend phi-silica` started by path relaunches itself via
   `IApplicationActivationManager` (`PackageActivation.cs`), re-expressing `NPU_BRIDGE_*` on the child's
@@ -164,7 +164,7 @@ concurrent requests for one conversation each get their own context (the second 
   dies (D37). A Windows service cannot carry identity, hence `task install` (logon scheduled task) is the
   Phi Silica auto-start and `service install` is for aion/fake only. The registered PFN on this machine is
   `NpuBridge_jtas4mnxdyzpe`. `EnsureReadyAsync` (multi-GB download) only runs with `--install-model` (D39).
-- The exe targets the **experimental** Windows App SDK channel (2.4.1-experimental) because stable needs a
+- The exe targets the experimental Windows App SDK channel (2.4.1-experimental) because stable needs a
   LAF token that has not been issued (D31). The experimental runtime is a separate framework family
   (`Microsoft.WindowsAppRuntime.2-experimentalB`) named in `packaging/AppxManifest.xml` and installed by
   `identity.ps1` from the NuGet payload. Changing the SDK version means updating the manifest dependency
@@ -240,8 +240,8 @@ concurrent requests for one conversation each get their own context (the second 
 Live today:
 
 - Errors use the OpenAI body `{"error":{"message","type","param","code"}}`. An over-length
-  transcript is HTTP 400 with code `context_length_exceeded` — from the preflight before any
-  generation on Phi Silica, from the generation's status on a backend without one — and nothing is
+  transcript is HTTP 400 with code `context_length_exceeded` (from the preflight before any
+  generation on Phi Silica, from the generation's status on a backend without one), and nothing is
   silently truncated. `--truncate-history` is the only switch that may drop turns instead: it removes
   the oldest exchange (every turn up to the next user turn, tool calls and results included) until the
   transcript fits, never the message being answered, logs each drop at Warning, and adds
@@ -283,10 +283,10 @@ it is current behaviour, so do not describe it as working:
 
 ## Working method for this repo
 
-Each chunk: build + tests green → adversarial review (correctness, OpenAI spec, streaming races,
-`IDisposable` leaks, untested branches) → fix in-scope findings, file out-of-scope ones in
-`docs/FUTURE.md` → append to `docs/DECISIONS.md` → whole-branch review → fast-forward merge to `main`.
-Do not widen a chunk to absorb review findings.
+Each chunk runs in this order: build and tests green, then an adversarial review (correctness, OpenAI
+spec, streaming races, `IDisposable` leaks, untested branches), then fix the in-scope findings and file
+the out-of-scope ones in `docs/FUTURE.md`, then append to `docs/DECISIONS.md`, then a whole-branch
+review, then a fast-forward merge to `main`. Do not widen a chunk to absorb review findings.
 
 After the merge, in the same session: update the status paragraph at the top of this file, the chunk
 table in `docs/PLAN.md`, `docs/SESSION-HANDOFF.md` and `memory-bank/`. A merge without this leaves the

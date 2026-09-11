@@ -1,4 +1,4 @@
-# Project Brief — npu-bridge
+# Project Brief: npu-bridge
 
 ## One line
 An OpenAI-compatible local HTTP server that lets agent tools (OpenCode, Hermes, any `openai` client)
@@ -8,7 +8,7 @@ use the on-device language model on a Copilot+ PC (Snapdragon ARM64 NPU) as a pr
 Windows ships an on-device model (Phi Silica today, Aion Instruct from November 2026) reachable only
 through a WinRT API that takes one prompt string and a stateful context. Agent tools speak the OpenAI
 chat-completions protocol: full `messages` arrays, SSE streaming, function calling. Nothing bridges
-the two, so the NPU sits idle while agents call the cloud.
+the two, so agents call the cloud while the NPU sits idle.
 
 ## Goals
 1. `http://127.0.0.1:5273/v1` works as a drop-in OpenAI provider: `/v1/models`,
@@ -47,12 +47,12 @@ LoRA adapters, Microsoft Store publication. Tracked in `docs/FUTURE.md`.
 - Every chunk ships with tests, an adversarial review, and entries in `docs/DECISIONS.md`.
 
 ## Key documents
-- `docs/PLAN.md` — architecture, request/response mapping, chunk order, sign-off record.
-- `docs/DECISIONS.md` — running log of choices and reasons (D1 onwards).
-- `docs/FUTURE.md` — deferred and out-of-scope items, including review findings not acted on.
-- `docs/CLIENTS.md` — client configuration (chunk 8).
-- `CLAUDE.md` — orientation for Claude Code sessions.
-- `memory-bank/` — this brief plus productContext, systemPatterns, techContext, activeContext, progress.
+- `docs/PLAN.md`: architecture, request/response mapping, chunk order, sign-off record.
+- `docs/DECISIONS.md`: running log of choices and reasons (D1 onwards).
+- `docs/FUTURE.md`: deferred and out-of-scope items, including review findings not acted on.
+- `docs/CLIENTS.md`: client configuration (chunk 8).
+- `CLAUDE.md`: orientation for Claude Code sessions.
+- `memory-bank/`: this brief plus productContext, systemPatterns, techContext, activeContext, progress.
 
 ## Delivery plan (8 chunks)
 1. Skeleton, fake backend, `/healthz`, `/v1/models`, service verbs, identity packaging script. **Done.**

@@ -31,32 +31,32 @@ land here instead of widening the chunk. Each entry says where it came from and 
 
 - **After a truncation, every later request in that conversation misses and truncates again.** The
   context is stored under the key of the *truncated* transcript plus the reply; the client keeps
-  sending the full transcript, whose prefixes never match it. Correct — the reply is right and the
-  turns dropped are the same ones — but each request replays the whole transcript and pays the
-  preflight rounds again. Two ways out, both with a catch: also try the suffixes of the transcript
-  as lookup keys when `--truncate-history` is on (a suffix hit is exactly what truncation produced,
-  but only under that switch, since otherwise it would hand a cached context to a longer history it
-  never saw), or remember per stored context how many leading turns it lacks. Either needs a test
-  that a suffix hit is never taken without the switch.
+  sending the full transcript, whose prefixes never match it. The result is correct (the reply is
+  right and the turns dropped are the same ones), but each request replays the whole transcript and
+  pays the preflight rounds again. Two ways out, both with a catch: also try the suffixes of the
+  transcript as lookup keys when `--truncate-history` is on (a suffix hit is exactly what truncation
+  produced, but only under that switch, since otherwise it would hand a cached context to a longer
+  history it never saw), or remember per stored context how many leading turns it lacks. Either needs
+  a test that a suffix hit is never taken without the switch.
 - **Mixed formats on a hit after a raw first turn.** The common `curl` case sends one bare user
   message, which is passed through raw; its continuation is rendered as a marker-format tail on the
   same context, so the model sees a raw string followed by `### Conversation so far`. The smoke test
   measures that the continuation answers; whether quality differs from a replay is unmeasured. If it
   does, the fix is to render the first turn with markers whenever caching is enabled, which costs a
-  little quality on the single-message case D-series measurements were taken on.
+  little quality on the single-message case the D-series measurements were taken on.
 - **Sampling parameters are not part of the key.** A conversation continued with a different
-  `temperature` hits the context its earlier turns built. That is right — the context holds text,
-  not sampling state, and Phi Silica takes the options per generation — but it is a fact a reader of
-  the key should not have to infer.
+  `temperature` hits the context its earlier turns built. That is right: the context holds text
+  rather than sampling state, and Phi Silica takes the options per generation. It is still a fact a
+  reader of the key should not have to infer.
 - **`prompt_tokens` on a hit is an estimate of the whole transcript, not of what the runtime holds.**
   What the runtime actually keeps in its context after several turns (and whether it compacts) is not
   observable through the API; the number is the same chars/4 estimate as before, over the transcript
   the client sent. `CompressPromptAsync` (2.4.8-experimental, Phi Silica only, issue #1's comment) is
   the one lever if the runtime's window turns out smaller than the transcript suggests.
 - **`ChatMessage.ToolCalls` is carried and keyed but not rendered.** Chunk 7 owns rendering the
-  model its own tool-call protocol; until then an assistant turn with only tool calls renders as an
-  empty turn in the prompt while keying as a distinct one, which is the right half of the behaviour
-  to have first (no cache collision) and the wrong half to leave (the model does not see the call).
+  model its own tool-call protocol. Until then an assistant turn with only tool calls renders as an
+  empty turn in the prompt while keying as a distinct one: the cache cannot collide, which is the
+  half to have first, and the model does not see the call, which is the half left to do.
 - **A status-driven truncation after a keep-alive loses the header.** Only reachable on a backend
   without a preflight, on the streaming path, when the verdict takes longer than the first keep-alive
   (about a second). The reply is still right and the Warning says the header was lost. A trailer or
@@ -73,7 +73,8 @@ land here instead of widening the chunk. Each entry says where it came from and 
   looked for here first.
 - **The same-conversation concurrency test exists because nothing serializes requests yet.** Chunk
   8's scheduler will queue the second request behind the first, at which point it could wait for the
-  first's context instead of missing. That is an optimisation for chunk 8 to consider, not a defect.
+  first's context instead of missing. That is an optimisation for chunk 8 to consider; nothing is
+  wrong today.
 
 ## Chunk 6 deferrals (Aion Instruct Preview adapter)
 
@@ -85,7 +86,7 @@ land here instead of widening the chunk. Each entry says where it came from and 
   that every DLL in the `MicrosoftCorporationII.WinML.Qualcomm.QNN.EP.1.8` package fails `LoadLibrary`
   with `E_ACCESSDENIED`, even from a process that has the package in its dependency graph and even though
   the files read fine. The Aion framework's own DLLs load from the same `WindowsApps` root without
-  trouble. **Root cause pinned later the same day (D70):** the provider is a main package that opts
+  trouble. Root cause, pinned later the same day (D70): the provider is a main package that opts
   in as a dynamic-dependency target, the OS accepts the dependency (`TryCreatePackageDependency` and
   `AddPackageDependency` both succeed from a plain process), and the build still refuses to map the
   package's DLLs as images (error 5) from that process. Developer Mode was turned on and changed
@@ -94,9 +95,9 @@ land here instead of widening the chunk. Each entry says where it came from and 
   same access-denied loads), and running the backend inside the sparse-package identity. Left to try:
   remove and re-acquire the two provider packages on this build, or a different Windows build. When
   a build works, the sample's `scripts/Diagnose-AionInstructPreview.ps1` is the reference for what a
-  healthy machine reports, and its OutputDebugString capture is the way to read the SDK's EP decision. Everything that depends on a generation stays unmeasured: load time, TTFT, tok/s,
-  system-prompt adherence under folded placement, whether cancel stops the device, and the over-length
-  verdict.
+  healthy machine reports, and its OutputDebugString capture is the way to read the SDK's EP decision.
+  Everything that depends on a generation stays unmeasured: load time, TTFT, tok/s, system-prompt
+  adherence under folded placement, whether cancel stops the device, and the over-length verdict.
 - **`BackendCapabilities.Cancellation` is not advertised on Aion** until the cut measurement earns it.
   The pipeline reads the flag nowhere yet (chunk 4 deferral above), so this changes no behaviour; the
   point is that the adapter claims nothing the smoke test has not shown.
@@ -137,7 +138,8 @@ land here instead of widening the chunk. Each entry says where it came from and 
 - **The drain timeout's window.** `DeltaAccumulator.Drain` waits up to five seconds for in-flight
   callbacks. A callback that passed the closed check and was then descheduled for that long would
   append after `Text` had been read. Unreachable in practice; the alternative (wait forever) trades it
-  for a hung request if a sink ever blocks. Noted so the timeout is not "tidied" away either direction.
+  for a hung request if a sink ever blocks. Noted so the timeout is not "tidied" away in either
+  direction.
 - **The delta sink must stay non-blocking.** The accumulator delivers under its append lock, and the
   drain waits for delivery to finish. Today's sinks (the JSON watcher's lock, the stream's unbounded
   channel `TryWrite`) never block. Chunk 7's whole-reply buffer and chunk 8's scheduler must keep it
@@ -153,14 +155,14 @@ land here instead of widening the chunk. Each entry says where it came from and 
 - **The drain is unbounded and silent.** The streaming handler cancels the generation, awaits it to
   completion, and only then disposes the context (D51). A runtime that never completes after being
   cancelled therefore parks the request and its context forever, with nothing in the log to say so. The
-  fix is a **warning after N seconds still waiting**, naming the request id — not a timeout that gives
-  up and disposes anyway: disposing a context whose operation is still running is exactly the
-  use-after-dispose D51 removed, and a timeout would reinstate it under a different name. If the wait
-  ever has to be bounded, the context has to be leaked deliberately (handed to a reaper that disposes it
-  when the operation finally ends) rather than disposed on time. Unobserved so far: the fake always
-  completes, and neither runtime has been seen to hang after a cancel.
+  fix is a warning after N seconds still waiting, naming the request id. A timeout that gives up and
+  disposes anyway would be the wrong fix: disposing a context whose operation is still running is
+  exactly the use-after-dispose D51 removed, and a timeout would reinstate it under a different name.
+  If the wait ever has to be bounded, the context has to be leaked deliberately (handed to a reaper
+  that disposes it when the operation finally ends) rather than disposed on time. Unobserved so far:
+  the fake always completes, and neither runtime has been seen to hang after a cancel.
 - **Keep-alive covers only the wait for the first token.** Once deltas start flowing the comments stop,
-  so a long stall *between* tokens — a model that pauses mid-generation, or a machine under load — can
+  so a long stall *between* tokens (a model that pauses mid-generation, or a machine under load) can
   still trip a proxy's idle timeout even though the request is healthy. A keep-alive driven by "time
   since the last byte written" rather than "waiting for the first delta" would cover both; it needs the
   writer loop to hold a timer, which the current single-reader loop does not.
@@ -176,35 +178,36 @@ land here instead of widening the chunk. Each entry says where it came from and 
 
 - **A cut against a backend that ignores cancellation stalls the stream.** After the cut the handler
   breaks out of the reader loop and waits on the generation before writing the finish chunk and
-  `[DONE]`, and keep-alives cover only the wait for the *first* delta — so that window is silent. Not
+  `[DONE]`, and keep-alives cover only the wait for the *first* delta, so that window is silent. Not
   currently reachable on Phi Silica: D54 measured that cancelling really does stop the NPU. It becomes
-  real for a backend that does not, which is what chunk 6 brings — Aion's WinRT surface has no cancel at
+  real for a backend that does not, which is what chunk 6 brings: Aion's WinRT surface has no cancel at
   all. The client would sit through the rest of a generation whose answer it already has, and a 30 s read
   timeout would abort it. Part of the same fix: `BackendCapabilities.Cancellation` is declared on both
-  adapters and **read by nothing**, so the cut assumes cancellation works and has no degraded path.
+  adapters and read by nothing, so the cut assumes cancellation works and has no degraded path.
 - **Late deltas may be dropped from a stream while the JSON path keeps them.** `PhiSilicaBackend`
   deliberately discards callbacks arriving after its completion barrier but can still return their text
   in `result.Text`. The streaming path sees only delivered callbacks, so a delta that loses that race is
   absent from the stream and present in the non-streaming reply for the same generation, with `usage`
-  under-reporting to match. Unverified on hardware — the timing comes from the adapter's own comments,
-  not an observed run — and it needs a real NPU test before it is fixed or dismissed. Chunk 4 newly makes
-  "`Text` is the concatenation of the deltas" load-bearing for the cut, so the adapter is the right place
-  to enforce it: assert `Partial()` against `result.Text` on `Complete`, or return `Partial()` always.
+  under-reporting to match. Unverified on hardware (the timing comes from the adapter's own comments
+  rather than an observed run), and it needs a real NPU test before it is fixed or dismissed. Chunk 4
+  newly makes "`Text` is the concatenation of the deltas" load-bearing for the cut, so the adapter is
+  the right place to enforce it: assert `Partial()` against `result.Text` on `Complete`, or return
+  `Partial()` always.
 - **`finish_reason` and `usage` are omitted rather than sent as `null`.** Real OpenAI emits
   `"finish_reason": null` on every content chunk and `"usage": null` on all but the last under
   `include_usage`; the bridge omits both keys. The Python client and the Vercel AI SDK survive it, but a
-  strictly generated client — an OpenAPI-derived Java or C# SDK where `finish_reason` is a declared
-  property — can reject the frame. The same mechanism would let the error envelope carry its `param` and
+  strictly generated client (an OpenAPI-derived Java or C# SDK where `finish_reason` is a declared
+  property) can reject the frame. The same mechanism would let the error envelope carry its `param` and
   `code` keys explicitly instead of dropping them, which a client branching on `err.code` cannot read.
 - **Validation is more permissive than OpenAI in three places.** `stop` is unbounded where OpenAI caps it
-  at 4 — and an enormous stop string makes the holdback, and so the stream's latency, client-controlled;
+  at 4, and an enormous stop string makes the holdback, and so the stream's latency, client-controlled;
   `n: 0` is accepted and answered with one choice where OpenAI requires `n >= 1`; and `stream_options`
   sent without `stream: true` is silently ignored where OpenAI returns a 400, so the bridge hides that
   client bug instead of surfacing it.
 - **The chars/4 estimate is wrong by roughly 4x for non-Latin output.** D44 owns the estimate, but not
   this consequence: for CJK, Cyrillic or heavy-emoji text the real ratio is nearer one token per
   character, so `max_tokens: 100` permits about 400 real tokens and `usage` under-reports by the same
-  factor. An agent loop keeping its own context ledger from `usage` — Hermes and OpenCode both do —
+  factor. An agent loop keeping its own context ledger from `usage` (Hermes and OpenCode both do)
   overflows the window several turns before it expects to. Not fixable without a tokenizer.
 - **`usage` disagrees between the shapes on a filtered reply.** Extends the content asymmetry above: the
   stream counts what it actually sent (`cutter.ContentLength`) while the JSON path counts the blanked
@@ -212,7 +215,7 @@ land here instead of widening the chunk. Each entry says where it came from and 
   asserts either number, so the divergence is unpinned.
 - **A client that disconnects while uploading its body throws an unhandled `OperationCanceledException`.**
   `ChatRequestPreparation` guards `ReadFromJsonAsync` for `JsonException` and `InvalidOperationException`
-  only. Pre-existing and identical on main — the extraction merely moved it — but the streaming path now
+  only. Pre-existing and identical on main (the extraction only moved it), and the streaming path now
   shares it.
 - ~~**The non-streaming callback can touch a disposed `CancellationTokenSource`.**~~ Resolved with #5
   (2026-09-10, D63): the callback no longer cancels anything. It sets a `TaskCompletionSource`, which
@@ -228,8 +231,8 @@ land here instead of widening the chunk. Each entry says where it came from and 
   in the client-compatibility notes chunk 8 owns.
 - **Coverage gaps the review named and this pass did not close.** The keep-alive-disabled branch
   (`KeepAliveInterval <= 0`, whose documented consequence is that a late failure keeps a real HTTP
-  status) is never exercised; a client disconnecting *before the first token* — the keep-alive wait and
-  both client-gone branches of `FailAsync` — is untested, because both disconnect tests read a real chunk
+  status) is never exercised; a client disconnecting *before the first token* (the keep-alive wait and
+  both client-gone branches of `FailAsync`) is untested, because both disconnect tests read a real chunk
   first; and content filtering with zero deltas, where the role chunk itself commits the 200, is never
   hit. Separately, `A_cut_cancels_the_generation_and_still_disposes_the_context_once` asserts
   `count < 200` against a 400-token responder, which would still pass if cancellation took a full second
@@ -265,29 +268,28 @@ Found by a read of the merged tree after chunk 4, none load-bearing, none fixed 
   sending it as null. Clients that read `message.content` unconditionally would break on that shape.
   Found by the Codex adversarial review. Deferred because changing it alters the error contract of every
   endpoint shipped in chunks 1 and 2, so it deserves its own decision and its own review rather than
-  being absorbed into a chunk that happened to notice it — but chunk 7 cannot ship the tool-call
+  being absorbed into a chunk that happened to notice it. Chunk 7 still cannot ship the tool-call
   response shape without settling it first.
-- **Error messages escape apostrophes as `\u0027`.** Same shared serializer options, same reasoning.
+- **Error messages escape apostrophes as `0027`.** Same shared serializer options, same reasoning.
   Raised by the implementer rather than a reviewer, which is the right instinct. Fix it alongside the
   entry above.
 - **Overflow detection must not wait for a generation to fail (resolved in chunk 5, D73: the session
   asks the preflight before generating; the refusal now takes 31 ms on the NPU).** Measured in chunk
   4's smoke run and recorded as D55: Phi Silica answers a 225,042-character prompt with a generic
   `Error` after 26.5 s, never with `PromptLargerThanContext`, while `GetUsablePromptLength` says
-  13,429 of 225,042 characters fit, instantly and correctly. The truncation loop chunk 5 owns has to
+  13,429 of 225,042 characters fit, instantly and correctly. The truncation loop chunk 5 owned had to
   key off the preflight; a loop that generates and reads the status would cost 26 s per iteration and
-  could not tell overflow from any other fault. Follows from this: 400 `context_length_exceeded` is
-  probably unreachable on Phi Silica until something calls the preflight, even though the mapping and
-  its tests are correct.
+  could not tell overflow from any other fault. It followed that 400 `context_length_exceeded` was
+  unreachable on Phi Silica until something called the preflight, even though the mapping and its
+  tests were correct.
 - **The rendered prompt is not a usable conversation identity (resolved in chunk 5, D71:
   `ConversationKey` encodes `(system, turns)` with length-prefixed fields, and a test pins each of the
-  three surfaces below both ways).** Distinct
-  conversations can produce the same rendered string, so anything that treats that string as an identity
-  will hand one cached context to two different conversations. Note what the cache key actually is:
-  PLAN section 2.5 keys on SHA-256 over a *canonical rendering* of `(system, turn_0 … turn_k)`, which is
-  a different function from what `PromptTemplate.Render` emits — an earlier version of this entry said
-  the cache "hashes exactly this string", and it does not. Three collision surfaces the chunk 5
-  canonicalization has to close:
+  three surfaces below both ways).** Distinct conversations can produce the same rendered string, so
+  anything that treats that string as an identity will hand one cached context to two different
+  conversations. Note what the cache key actually is: PLAN section 2.5 keys on SHA-256 over a
+  *canonical rendering* of `(system, turn_0 … turn_k)`, which is a different function from what
+  `PromptTemplate.Render` emits. An earlier version of this entry said the cache "hashes exactly this
+  string", and it does not. The three collision surfaces the chunk 5 canonicalization had to close:
   1. **Turn markers are not escaped.** A user message containing a line reading `[Assistant]` (or
      `[User]`, or `### Conversation so far`) imitates a turn boundary, so a single forged user turn and
      a real two-turn history render identically.
@@ -295,18 +297,17 @@ Found by a read of the merged tree after chunk 4, none load-bearing, none fixed 
      `nativeSystemPromptSupported: true` the system text is returned separately in
      `RenderedPrompt.SystemText` and left out of `RenderedPrompt.Prompt`, so two conversations that
      differ *only* in their system prompt render byte-identically. Whatever the placement, the hash
-     input must carry the system text — which is why PLAN section 2.5 puts `system` in the key.
+     input must carry the system text, which is why PLAN section 2.5 puts `system` in the key.
   3. **The raw-passthrough branch has no markers at all.** A lone bare user message is sent verbatim, so
      a single user message whose text happens to *be* a rendered transcript collides with that real
      transcript's rendering.
-  Harmless today, because nothing is cached yet. Decide the escaping and a boundary-preserving canonical
-  hash input, kept distinct from the prompt string, before the cache lands.
+  This was harmless while nothing was cached. The escaping question was settled by a boundary-preserving
+  canonical hash input, kept distinct from the prompt string, before the cache landed.
 - **`ChatMessage` carries no `tool_calls` field (the field landed in chunk 5 and enters the cache key;
-  rendering it is still chunk 7's).** An assistant message with
-  `content: null` and a `tool_calls` array deserializes to an empty assistant turn, so the tool call it
-  made is lost. Chunk 7 needs it to render the model its own protocol, and chunk 5 needs it for the
-  canonicalization PLAN section 2.5 describes, where a client that re-serializes our output must still
-  hit the cache.
+  rendering it is still chunk 7's).** An assistant message with `content: null` and a `tool_calls`
+  array deserialized to an empty assistant turn, so the tool call it made was lost. Chunk 7 needs the
+  field to render the model its own protocol, and chunk 5 needed it for the canonicalization PLAN
+  section 2.5 describes, where a client that re-serializes our output must still hit the cache.
 - **`ChatCompletionRequest` is an 18-argument positional record.** Tests construct it with long runs of
   positional nulls, so inserting a field could silently shift arguments without a compiler error. Add a
   test builder or use named arguments before the parameter list grows in chunks 4, 7 and 8.
@@ -326,27 +327,27 @@ Found by a read of the merged tree after chunk 4, none load-bearing, none fixed 
   `Dispose`. None confirmed as production defects; all worth a fake-backend fault case.
 - **Nothing serializes concurrent requests against the single model handle (chunk 8 owns the fix).**
   Chunk 3 opens a generation endpoint that Kestrel will happily enter on several threads at once, while
-  the request scheduler — one worker, bounded queue, PLAN section 2.7 — is chunk 8. Between the two,
+  the request scheduler (one worker, bounded queue, PLAN section 2.7) is chunk 8. Between the two,
   context creation and generation on one shared `LanguageModel` are unguarded, and the smoke suite is
   strictly single-threaded, so two simultaneous requests against a real NPU are entirely untested. This
-  is deliberate scope, not an oversight, but it is a real gap in what has been verified: any claim that
-  the endpoint works is a claim about one request at a time. Chunk 8 should include a concurrent smoke
-  step, not just unit coverage of the queue.
+  is deliberate scope rather than an oversight, but it is a real gap in what has been verified: any
+  claim that the endpoint works is a claim about one request at a time. Chunk 8 should include a
+  concurrent smoke step as well as unit coverage of the queue.
 - **`RenderedPrompt.SystemInPrompt` is unused by production code.** No caller reads it; the endpoint
   re-derives the same fact from its own `useNativeSystem` plus `rendered.SystemText`, and only
   `PromptTemplateTests` asserts on the flag. Two ways to say one thing, which is how they drift. Either
   delete the flag and let the caller keep deriving it, or use it at the call site and stop deriving.
 - **The raw-passthrough rule omits the `tools` clause PLAN section 2.3 specifies.** The plan sends a
-  single bare user message raw only when there is no system text, **no history and no tools**;
+  single bare user message raw only when there is no system text, no history and no tools;
   `PromptTemplate.Render` tests only `messages.Count == 1 && role == "user"`. Harmless in chunk 3, where
   `tools` is accepted and ignored, but chunk 7 must restore the clause: a request carrying tools needs
   the marker format so the model sees the tool protocol it is meant to answer in.
 - **A present-but-empty system message reaches the native create-context call as `""`.** `BuildSystemText`
   deliberately returns the empty string (not null) for a `system` message with empty content, so the
-  caller can tell "no system message" from "an empty one" — but the endpoint then passes that empty
-  string straight into `backend.CreateContext(nativeSystem)`. `FakeBackend` does not care; what the
-  Phi Silica and Aion runtimes do with an empty system context is unmeasured. Collapse it to null at the
-  call site, or measure it, before it matters.
+  caller can tell "no system message" from "an empty one". The endpoint then passes that empty string
+  straight into `backend.CreateContext(nativeSystem)`. `FakeBackend` does not care; what the Phi Silica
+  and Aion runtimes do with an empty system context is unmeasured. Collapse it to null at the call
+  site, or measure it, before it matters.
 - **The response echoes back whatever `model` string the client sent.** `model` in the response body is
   `request.Model ?? backend.ModelId`, with no check that the requested model is the one being served, so
   a client asking for `gpt-4o` gets `"model": "gpt-4o"` back from the on-device model. Convenient for
@@ -358,10 +359,10 @@ Found by a read of the merged tree after chunk 4, none load-bearing, none fixed 
   needs everything up to and including generation and none of the shaping after it. If chunk 4 writes
   the SSE path alongside this method instead of on top of a shared prepared-request shape, the two will
   drift on exactly the parts that are easy to get subtly different: readiness, system-prompt placement
-  and the usage estimate. This is chunk 4's opening task, not a defect in chunk 3 — the method is
-  correct as it stands. **Ruling (controller, end of chunk 3):** the pipeline is *not* being extracted
-  now. The review calls it an extension rather than a rewrite provided it happens before the streaming
-  path is written, and this project's method forbids widening a chunk to absorb review findings. Cost if
+  and the usage estimate. This is chunk 4's opening task rather than a defect in chunk 3; the method is
+  correct as it stands. Ruling (controller, end of chunk 3): the pipeline is not being extracted now.
+  The review calls it an extension rather than a rewrite provided it happens before the streaming path
+  is written, and this project's method forbids widening a chunk to absorb review findings. Cost if
   that judgement is wrong: chunk 4 opens with a refactor instead of a feature.
 
 ## Chunk 2 review deferrals
@@ -393,11 +394,11 @@ Found by a read of the merged tree after chunk 4, none load-bearing, none fixed 
   the bridge does not depend on experimental packages.
 - ~~**Token counting.** Progress callbacks undercount on Phi Silica (speculative decoding batches tokens).
   Consider `chars/4` for completion tokens too, or expose both. Decide in chunk 3 when `usage` is built.~~
-  — answered in chunk 3: `usage` is `ceil(chars/4)` on both sides, after one generation measured 29
+  Answered in chunk 3: `usage` is `ceil(chars/4)` on both sides, after one generation measured 29
   callbacks for 367 characters, a 3.17x undercount (D44).
 - ~~**System prompt fidelity on Phi Silica.** `CreateContext(systemPrompt)` did not make the model follow a
   strict identity instruction. Chunk 3's template should be measured both ways (native context vs.
-  rendered into the user turn) with the smoke test.~~ — answered in chunk 3: both placements were measured
+  rendered into the user turn) with the smoke test.~~ Answered in chunk 3: both placements were measured
   on the NPU and both produced the instructed reply; the chunk 2 observation belonged to the bare
   `/debug/generate` path, not to the model (D45).
 - **Activated instance's console.** With `--hide-console` the window is hidden after startup but still
@@ -408,7 +409,7 @@ Found by a read of the merged tree after chunk 4, none load-bearing, none fixed 
 
 ## Chunk 1 deferrals
 
-- ~~Phi Silica auto-start needs package activation, not the SCM~~ — done in chunk 2: self-relaunch with
+- ~~Phi Silica auto-start needs package activation, not the SCM~~ Done in chunk 2: self-relaunch with
   supervision and `task install|uninstall|status` (D33, D34, D37). The non-interactive-session question is
   moot because the task runs with `/IT` in the user's session.
 - **Automated validation of `identity.ps1` and the manifest** (Codex review, chunk 1). A Pester test

@@ -1,4 +1,4 @@
-# System Patterns — npu-bridge
+# System Patterns: npu-bridge
 
 ## Shape
 ```
@@ -45,15 +45,15 @@ concurrent requests for one conversation never share a context: the second misse
   throws (500). Found the hard way: a null element crashed the endpoint until validation was widened
   (D49).
 - **A context is disposed on every path that creates one, and never on a path that doesn't.** The
-  four early-rejection paths (bad JSON, validation failure, backend not ready, a placement conflict —
-  which is checked after the prompt is rendered but before any context is created) return before any
-  context exists, so they create none. Every other exit
-  disposes the one context it created, in a `finally`. Tests assert not just "no leak" but the actual
-  create-vs-dispose count on each path, so the guarantee can't be satisfied by accident (D43).
+  four early-rejection paths (bad JSON, validation failure, backend not ready, and a placement
+  conflict, which is checked after the prompt is rendered but before any context is created) return
+  before any context exists, so they create none. Every other exit disposes the one context it
+  created, in a `finally`. Tests assert the exact create-versus-dispose count on each path, so the
+  guarantee can't be satisfied by accident (D43).
 - **A capability check that gates on backend support must first check the request needs the
   capability.** Forcing `--system-prompt-placement native` on a backend without native system-prompt
-  support should reject only requests that actually carry a system message, not every request — the
-  check runs after the prompt is rendered, not before (D50).
+  support should reject only requests that actually carry a system message. The check therefore runs
+  after the prompt is rendered (D50).
 
 ## Backend contract (`ILanguageModelBackend`)
 - `InitializeAsync` once, possibly minutes; `BackendLifecycle` runs it in the background, owns the

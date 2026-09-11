@@ -1,4 +1,4 @@
-# Active Context — npu-bridge
+# Active Context: npu-bridge
 
 _Last updated: 2026-09-11 (chunk 5 merged; issue #9 then chunk 7 next)_
 

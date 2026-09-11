@@ -1,4 +1,4 @@
-# Product Context — npu-bridge
+# Product Context: npu-bridge
 
 ## Why this exists
 Copilot+ PCs carry a capable small language model on the NPU, but the only way to reach it is a
@@ -42,14 +42,11 @@ so those tools can run fully local, offline, and free.
   `max_completion_tokens` and `stop` are enforced by the bridge on both shapes (D53).
 - A system message is delivered to the model by default (`--system-prompt-placement auto`, native
   context when the backend supports one), and the model does follow it under both placements (D45).
-  `max_tokens`,
-  `max_completion_tokens`, `stop`, `tools` and `tool_choice` are accepted but currently ignored (each
-  warns once per process); the client-side `stop`/`max_tokens` cut and tool-call handling land in
-  chunks 4 and 7.
-- With `tools` in a request the whole reply will be buffered before streaming once tool-call emulation
-  ships (chunk 7); today `tools` is accepted and ignored, as above.
+  `tools` and `tool_choice` are accepted but ignored until chunk 7; each warns once per process.
+- Once tool-call emulation ships (chunk 7), a request with `tools` will have its whole reply buffered
+  before streaming.
 - A continuing conversation hits the context cache (`--context-cache-size`, default 4) and sends only
-  its newest turns; the reply is the same as a replay would give, faster. Context overflow returns
+  its newest turns. The reply is the one a replay would give, sooner. Context overflow returns
   HTTP 400 `context_length_exceeded`, decided by the backend's preflight before any generation where
   it has one (Phi Silica), and `--truncate-history` drops the oldest exchanges instead, saying how many
   in `x-npu-bridge-truncated-turns`. `--queue-capacity` is accepted but does nothing until chunk 8.
