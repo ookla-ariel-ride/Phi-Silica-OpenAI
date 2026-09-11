@@ -36,8 +36,8 @@ The fake backend needs none of this, so it is the quickest way to see the API sh
 ## Quick start
 
 ```powershell
-git clone https://github.com/ookla-ariel-ride/Phi-Silica-OpenAI.git
-cd Phi-Silica-OpenAI
+git clone https://github.com/ookla-ariel-ride/npu-bridge.git
+cd npu-bridge
 dotnet build
 dotnet test
 ```

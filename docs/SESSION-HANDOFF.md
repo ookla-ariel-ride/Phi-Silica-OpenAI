@@ -78,6 +78,9 @@ time.
 
 ## Machine facts (do not re-discover)
 
+- The GitHub repository was renamed to `ookla-ariel-ride/npu-bridge` on 2026-09-11 (the old name
+  redirects). The local folder is still `Phi-Silica-OpenAI`, on purpose: package identity is registered
+  against the build path, and renaming the folder means `identity.ps1 -Install` again.
 - Galaxy Book4 Edge, Snapdragon X Elite, Windows 11 ARM64 Insider build 29648 (29661 was taken on
   2026-09-10 and rolled back). Git Bash reports `AMD64` under emulation; PowerShell is native Arm64.
 - .NET SDK 10.0.400 arm64. Sparse package registered against the Debug build output, PFN
