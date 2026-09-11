@@ -102,9 +102,10 @@ land here instead of widening the chunk. Each entry says where it came from and 
   point is that the adapter claims nothing the smoke test has not shown.
 - **The third overflow behaviour is still unknown.** Aion's status enum does have
   `PromptLargerThanContext`, unlike what Phi Silica returns in practice (D55), so it may be the one
-  backend that reports overflow honestly, or it may fail generically like Phi Silica. Chunk 5's
-  `--truncate-history` loop on a backend with no preflight cannot be designed until this is measured;
-  D67 records what is decided in the meantime.
+  backend that reports overflow honestly, or it may fail generically like Phi Silica. Chunk 5 built
+  the `--truncate-history` loop for a backend with no preflight to retry on a `PromptLargerThanContext`
+  status (D73); whether Aion ever reports that status is what the measurement will tell, and the fake
+  is the only backend that has exercised the path.
 - **No setup script for the Aion prerequisites.** Getting to a first run took: the framework MSIX from
   the sample repo's release (`Add-AppxPackage`, user scope, no elevation), the SDK NuGet into
   `nuget-local/`, and the QNN execution provider 1.8 package, which is not on the machine by default and
@@ -144,8 +145,8 @@ land here instead of widening the chunk. Each entry says where it came from and 
   real path.
 - **`AionCapabilityProfileTests` asserts `SystemPrompt` is null, which the fake guarantees itself.**
   `FakeBackend.CreateContext` nulls the argument when the capability is absent, so that assertion
-  cannot fail; the `Prompt` equality beside it is the load-bearing one. The two overflow tests pin
-  behaviour chunk 5 will build on rather than a branch that exists today. Both noted in the tests.
+  cannot fail; the `Prompt` equality beside it is the load-bearing one. The two overflow tests pinned
+  behaviour chunk 5 then built on (`TruncationTests`). Both noted in the tests.
 
 ## Chunk 4 review deferrals
 
@@ -269,7 +270,8 @@ Found by a read of the merged tree after chunk 4, none load-bearing, none fixed 
 - **Error messages escape apostrophes as `\u0027`.** Same shared serializer options, same reasoning.
   Raised by the implementer rather than a reviewer, which is the right instinct. Fix it alongside the
   entry above.
-- **Overflow detection must not wait for a generation to fail (chunk 5 blocker).** Measured in chunk
+- **Overflow detection must not wait for a generation to fail (resolved in chunk 5, D73: the session
+  asks the preflight before generating; the refusal now takes 31 ms on the NPU).** Measured in chunk
   4's smoke run and recorded as D55: Phi Silica answers a 225,042-character prompt with a generic
   `Error` after 26.5 s, never with `PromptLargerThanContext`, while `GetUsablePromptLength` says
   13,429 of 225,042 characters fit, instantly and correctly. The truncation loop chunk 5 owns has to
@@ -277,7 +279,9 @@ Found by a read of the merged tree after chunk 4, none load-bearing, none fixed 
   could not tell overflow from any other fault. Follows from this: 400 `context_length_exceeded` is
   probably unreachable on Phi Silica until something calls the preflight, even though the mapping and
   its tests are correct.
-- **The rendered prompt is not a usable conversation identity (chunk 5 blocker).** Distinct
+- **The rendered prompt is not a usable conversation identity (resolved in chunk 5, D71:
+  `ConversationKey` encodes `(system, turns)` with length-prefixed fields, and a test pins each of the
+  three surfaces below both ways).** Distinct
   conversations can produce the same rendered string, so anything that treats that string as an identity
   will hand one cached context to two different conversations. Note what the cache key actually is:
   PLAN section 2.5 keys on SHA-256 over a *canonical rendering* of `(system, turn_0 … turn_k)`, which is
@@ -297,7 +301,8 @@ Found by a read of the merged tree after chunk 4, none load-bearing, none fixed 
      transcript's rendering.
   Harmless today, because nothing is cached yet. Decide the escaping and a boundary-preserving canonical
   hash input, kept distinct from the prompt string, before the cache lands.
-- **`ChatMessage` carries no `tool_calls` field (chunks 5 and 7).** An assistant message with
+- **`ChatMessage` carries no `tool_calls` field (the field landed in chunk 5 and enters the cache key;
+  rendering it is still chunk 7's).** An assistant message with
   `content: null` and a `tool_calls` array deserializes to an empty assistant turn, so the tool call it
   made is lost. Chunk 7 needs it to render the model its own protocol, and chunk 5 needs it for the
   canonicalization PLAN section 2.5 describes, where a client that re-serializes our output must still
@@ -363,8 +368,8 @@ Found by a read of the merged tree after chunk 4, none load-bearing, none fixed 
 
 - **In-flight generation tracking in the adapter.** `PhiSilicaBackend.DisposeAsync` disposes the model
   (and would call `Bootstrap.Shutdown`, a no-op under identity) while caller-owned contexts or an
-  in-flight `GenerateAsync` may exist. Harmless today; chunk 5/8 (cache + scheduler) should drain
-  in-flight work before disposal.
+  in-flight `GenerateAsync` may exist. Harmless today; the cache now empties before the backend is
+  disposed (chunk 5), and the scheduler (chunk 8) should drain in-flight work before disposal.
 - **UAC over-the-shoulder elevation.** If a standard user elevates with an admin's credentials, the
   elevated token is the admin's: `task install` would register the task for the wrong account and the
   package lookup would miss the user's registration. Detect (elevated token user ≠ interactive session
@@ -421,8 +426,8 @@ Found by a read of the merged tree after chunk 4, none load-bearing, none fixed 
   for the current user. A service under `LocalSystem` would not see it even if activation-by-path
   worked; any future service+identity experiment must run as the registering user (`sc create ... obj=`).
   Moot while D24 stands, recorded so the failure is not misdiagnosed later.
-- **`healthz` queue/cache counters** are hard-coded to 0 until the scheduler (chunk 8) and context
-  cache (chunk 5) exist.
+- **`healthz` queue counters** are hard-coded to 0 until the scheduler (chunk 8) exists; the cache
+  counters are real since chunk 5.
 - **Sparse-package `PackageDependency` set** in `packaging/AppxManifest.xml` mirrors the Aion sample
   (WAR 2 + WAR 1.8). Whether Phi Silica additionally needs `Microsoft.WindowsAppRuntime.CBS.*` in a
   hand-written manifest is unknown until chunk 2 tries it; the Windows App SDK build targets inject

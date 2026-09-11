@@ -228,8 +228,8 @@ concurrent requests for one conversation each get their own context (the second 
   `LanguageModel.GenerateStructuredJsonResponseAsync(..., jsonSchema)` is in the stable Text metadata
   of both 2.4.4 and 2.4.8-experimental (a design option for chunk 7's tool calls on Phi Silica);
   `LanguageModelExperimental.CompressPromptAsync` with `PreferredRetentionRatio` is experimental-only
-  and needs a bump from the 2.4.1-experimental the exe references (an alternative to dropping turns in
-  chunk 5, Phi Silica only). Both noted on issues #3 and #1.
+  and needs a bump from the 2.4.1-experimental the exe references (an alternative to dropping turns
+  under `--truncate-history`, Phi Silica only). Both noted on issues #3 and #1.
 - **Cancelling really stops the NPU.** Measured on the streaming path with the cut: an early cut
   ended the request in a fraction of the uncut time, and no request is answered until its generation
   has ended. So `Cancellation` is a real capability on Phi Silica, and the cancel → drain → dispose
