@@ -1022,3 +1022,81 @@ before the handler enters its wait. `BridgeTestHost` gained a request ledger (a 
 completed requests and recording escaped exceptions, since TestServer has no Kestrel to log one at
 Error) and the `CapturingLoggerProvider` an `OnRecord` hook so a test can act inside the window a
 log line marks. 512 tests.
+
+
+**D80. `usage` and the `max_tokens` budget are counted in Phi-3 tokens on Phi Silica, because the
+runtime's tokenizer is Phi-3.5-mini's; the preflight answers in UTF-8 bytes; chars/4 stays where the
+tokenizer is unpublished.** Issue #13 asked for a measurement before adopting a tokenizer, and the
+measurement decided two things. Method: a lone over-length user message reaches the model raw (D71),
+so the 400 body's `can take N characters of the M-character prompt` is the preflight's own answer
+with no template and no generation, in about 60 to 230 ms; the fitting prefix of each text was then
+counted with `Microsoft.ML.Tokenizers` 2.0.0's `LlamaTokenizer` over Phi-3.5-mini-instruct's
+`tokenizer.model` (SentencePiece, 32,000 pieces, MIT, vendored under
+`src/NpuBridge.Core/Tokenizers/Phi3/` with its licence and provenance). Fourteen texts on build
+29648 with Windows App SDK 2.4.1-experimental.
+
+(a) **The vocabulary is the runtime's.** Every ASCII text whose tokens are words, digits, spaces or
+newlines lands on exactly 3581 tokens at the preflight's boundary: D55's fox filler (13,429 chars),
+the smoke transcript's turns (13,340), a digit run (3,580), markdown lines (10,149), `line N`
+lines (5,426), twenty-space runs (28,652), C# identifiers (14,502) and a C# source file (13,058
+chars once the units below are right). Text dense in punctuation clusters lands about 1 % lower:
+JSON objects at 3543 and `{"a":"b","c":"d"},` runs at 3546, so the runtime counts `":`-style
+clusters slightly more finely than the ML.Tokenizers implementation does; PLAN.md prose, which has
+both, lands at 3588. Chars/4 over the same texts ranges from 0.88 to 8.0 characters per token. The
+usable window of an empty context is therefore **3581 tokens** (3582 with BOS), and 4096 − 3581 =
+515 tokens are the runtime's own template and its reply reservation, which explains the issue's
+question about the 4K window and the 13.4K characters exactly: 13,429 / 3.75 characters per token
+on that filler. The counter carries no BOS, since `usage` reports what the caller sent.
+
+(b) **`GetUsablePromptLength` returns a UTF-8 byte offset, not a UTF-16 char index.** Microsoft's
+page says only "the index in the given prompt". Read as characters, the CJK boundary (9,474) was
+10,739 Phi-3 tokens and emoji (6,562) 4,375; read as bytes and converted, the same three answers
+(CJK, emoji, typographic punctuation `→ § ≈ — “ ”`) are 3581, 3578 and 3581 tokens, the emoji
+off by three because a pair straddles the byte boundary. `PhiSilicaBackend` had treated the answer
+as a char index (its comment said so); identical for ASCII, and up to three times too generous for
+CJK. Confirmed live: a 5,001-character CJK prompt (15,001 bytes, about 5,700 tokens, 1.6 × the
+window) passed the preflight, generated, and came back 400 from the generation's own
+`PromptLargerThanContext` status after 584 ms. Two consequences. The adapter now converts the byte
+answer with `Utf8Offsets.CharIndexAtByteOffset` (Core, tested), rounding down to a character and
+never between the halves of a surrogate pair. And D55 needs an amendment: Phi Silica *does* report
+`PromptLargerThanContext`, quickly, for a prompt moderately over the window; D55's 225 KB prompt got
+the generic `Error` after 26 s. Both are true, and the preflight remains the overflow decision (D73)
+because it is exact and costs tens of milliseconds.
+
+**The design.** `ILanguageModelBackend.TokenCounter` is an `ITokenCounter` (`Count`,
+`IndexAtTokenCount`, `PrefixStable`, `Name`): `Phi3TokenCounter` on Phi Silica, loaded once per
+process from the embedded model; `CharEstimateTokenCounter` (chars/4, D44) on Aion, whose
+tokenizer is unpublished and which has never generated here, on the unavailable backend and as the
+fake's default, so every older usage assertion in the suite still reads as D44 defined it. When Aion
+Instruct arrives as a model swap behind the Phi Silica API, the smoke step below is the check
+before trusting the counter for that model. The preflight still decides what fits; the counter only
+counts. `usage.prompt_tokens` counts the whole rendered transcript plus the native system text, the
+same on a hit and a miss (D74); `completion_tokens` counts the text the client received, the
+whole-text cut on the JSON shape and the cutter's emitted text on the stream. `max_tokens` is a
+budget in the counter's tokens: `OutputLimits` carries `MaxTokens` and the counter, and the cut
+point is the counter's `IndexAtTokenCount` over everything generated so far, which for chars/4 is
+exactly the old `cap * 4` characters (D53, D58 unchanged). With a BPE counter the stream has one
+more thing to wait for: a merge can reach into the word still being written, so the last tokens of
+the text are provisional. SentencePiece pieces never span a whitespace boundary and are at most 16
+characters, so everything before the trailing partial word, or more than 16 characters back, is
+settled. Within `NearBudgetReserveTokens` (8) of the budget the stream releases only settled text
+and commits the cap only once its index is settled or the generation ends; farther from the budget
+a provisional count cannot matter and text flows as it arrives. The reserve is the honest bound:
+overshooting the cap would take a re-merge that shifts a count by more than eight tokens inside one
+whitespace-free run, which this vocabulary does not do in practice, and the tests pin the
+equivalence of the two shapes on stand-in counters that recount a word when it grows. Measured on
+the NPU after the change: `prompt_tokens` 41 and `completion_tokens` 2 for the smoke's PONG exchange
+(36 and 1 under chars/4), 3,394 for the truncated transcript, and the cut step's eight-token cap
+streamed 31 characters counted as 8 Phi-3 tokens.
+
+**Repeated per build.** `POST /debug/tokenize` (loopback, needs no model) returns the backend's
+count and its counter's name, and `scripts/smoke.ps1` has a step that sends the fox filler, JSON
+objects and a CJK run as lone over-length messages, reads each preflight boundary, counts the prefix
+and fails if the counts differ by more than 2 %: on the day, 3581, 3543 and 3581, a spread of 38.
+A different vocabulary, or the preflight read in the wrong units again, lands far outside that.
+Not done: the pressure warning still compares characters against `--context-window-hint × 4`
+(`docs/FUTURE.md`); Aion keeps chars/4 until a generation runs and the same measurement can be made.
+One more number from the same run, for D44's record: the measurement step's English reply was 367
+characters and 68 Phi-3 tokens (5.4 characters per token), so chars/4 had been *over*counting
+English prose by 1.35 × while the progress callbacks undercount it by 2.3 ×; the decode rate that
+read as 35 tokens per second under chars/4 is 27.4 real tokens per second.

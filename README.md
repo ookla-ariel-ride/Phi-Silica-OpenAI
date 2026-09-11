@@ -4,9 +4,10 @@ An OpenAI-compatible HTTP endpoint for the on-device language model on a Copilot
 NPU). Point OpenCode, Hermes, `curl` or the Python `openai` client at `http://127.0.0.1:5273/v1` and
 use the NPU model as a provider: local, offline, free.
 
-The model is small. Microsoft describes Phi Silica with a 4K-token context, and on a Snapdragon X
-Elite the runtime accepts roughly 13,400 characters of prompt and decodes at about 35 tokens per
-second by the bridge's own estimate (four characters per token). Short conversations work well, and a
+The model is small. Microsoft describes Phi Silica with a 4K-token context; measured on a Snapdragon
+X Elite, an empty context takes 3,581 tokens of prompt (about 13,400 characters of English) and the
+model decodes at about 27 tokens per second. Those are real tokens: the bridge counts with the
+Phi-3.5 tokenizer, which the runtime's own limits were measured against. Short conversations work well, and a
 continuing conversation is cheap because the bridge keeps the model's context between turns. Long
 agent loops with a dozen tools will not fit, and the bridge answers with OpenAI's
 `context_length_exceeded` error instead of dropping turns on its own.
@@ -131,6 +132,7 @@ generation's status instead, and with `--truncate-history` the bridge retries af
 | `GET /healthz` | backend state, load time, package identity, the context cache's count and hit/miss counters, the streaming keep-alive timings, diagnostics. 200 when ready, 503 otherwise |
 | `GET /v1/models`, `GET /v1/models/{id}` | the active model id |
 | `POST /debug/generate` | one literal prompt into the backend with timing. Diagnostic, loopback only |
+| `POST /debug/tokenize` | the backend's token count of a literal text, and which counter answered. Diagnostic, loopback only, works while the model loads |
 
 Anything else under `/v1` returns an OpenAI-shaped 404, or a 405 with `Allow` when the path is known
 but the method is wrong. Errors use the `{"error":{"message","type","param","code"}}` body with all
@@ -179,7 +181,8 @@ matched case-insensitively); any other id is a 404 with code `model_not_found`, 
 and the reply always names the model that served it. `temperature`, `top_p` and `top_k` reach Phi
 Silica, and `temperature` and `top_p` are range-checked as OpenAI's schema states. `max_tokens`,
 `max_completion_tokens` and `stop` are enforced by the bridge, since neither Windows API offers them:
-output is cut at the limit and the generation cancelled, and cancelling stops the accelerator.
+output is cut at the limit, counted in the model's own tokens on Phi Silica, and the generation
+cancelled, and cancelling stops the accelerator.
 Measured on the streaming path, a prompt cut after four tokens finished in about a fifth of the time
 the same prompt took with a generous cap. An assistant message's `tool_calls` are carried and
 distinguish conversations in the cache, but tool calling itself is not emulated yet: `tools`,
@@ -239,16 +242,19 @@ flowchart LR
 Phi Silica uses a logon task (`NpuBridge.exe task install`, elevated); aion and fake use a service
 (`NpuBridge.exe service install`).
 
-**Phi Silica never says a prompt is too long.** Left to itself it fails generically after ten to
-thirty seconds. The 400 you get instead comes from asking the model's prompt-length preflight before
-generating, which is why it arrives in milliseconds. A backend without that preflight (the Aion
-preview SDK) can only say so by failing the generation, and with `--truncate-history` the bridge
-retries after that failure too.
+**Phi Silica is unreliable about saying a prompt is too long.** A prompt far over the window fails
+generically after about 26 seconds; one moderately over gets a proper "too long" status in about
+half a second. The 400 you get comes from asking the model's prompt-length preflight before
+generating, which is why it arrives in milliseconds either way. A backend without that preflight
+(the Aion preview SDK) can only say so by failing the generation, and with `--truncate-history` the
+bridge retries after that failure too.
 
-**Token counts are estimates**: characters divided by four, on both `prompt_tokens` and
-`completion_tokens`. The SDK exposes no tokenizer, and progress callbacks would undercount by about
-three times on this hardware. On a cache hit `prompt_tokens` still counts the whole conversation,
-including the turns that were not sent. An open issue evaluates the Phi-3 tokenizer for real counts.
+**Token counts are real on Phi Silica and estimates elsewhere.** The SDK exposes no tokenizer, so
+the bridge ships Phi-3.5-mini's, after measuring that the runtime's prompt-length preflight lands on
+the same token count for every kind of text it was given (English, digits, code, JSON, CJK, emoji).
+`usage` and the `max_tokens` budget use it. The Aion preview adapter and the fake backend count
+characters divided by four. On a cache hit `prompt_tokens` still counts the whole conversation,
+including the turns that were not sent.
 
 **Concurrent requests are not serialized.** Nothing queues generations against the single model
 handle, and concurrent requests on hardware are untested. A request queue is planned.
@@ -285,9 +291,8 @@ nuget-local/               where the Aion SDK nupkg goes (gitignored; the adapte
 
 Start with `docs/PLAN.md` for the design and the order remaining work lands in, `docs/DECISIONS.md`
 for why things are the way they are, and `docs/FUTURE.md` for what is deliberately not done.
-Remaining work, in order: real token counts from the Phi-3 tokenizer, a consolidation of the two
-endpoints' shared pipeline, tool-call emulation, then a request queue with `/v1/completions`. Each is
-a GitHub issue. The tests run against the fake backend and need no NPU; the smoke script is the
+Remaining work, in order: a consolidation of the two endpoints' shared pipeline, tool-call
+emulation, then a request queue with `/v1/completions`. Each is a GitHub issue. The tests run against the fake backend and need no NPU; the smoke script is the
 hardware check.
 
 ## References

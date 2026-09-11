@@ -524,15 +524,18 @@ try {
         if ($null -eq $u) { throw 'no usage chunk, though stream_options.include_usage was set' }
         $decodeMs = if ($null -ne $s.FirstChunkMs) { $s.TotalMs - $s.FirstChunkMs } else { $null }
         $tokS = if ($null -ne $decodeMs -and $decodeMs -gt 0 -and $u.completion_tokens -gt 1) { [Math]::Round(($u.completion_tokens - 1) * 1000.0 / $decodeMs, 1) } else { $null }
-        "asked: one user message, max_tokens=128, streaming`nttft=$($s.FirstChunkMs)ms total=$($s.TotalMs)ms chars=$($s.Content.Length) completion_tokens=$($u.completion_tokens) chunks=$($s.Chunks.Count) finish=$((Get-FinishReasons $s.Chunks) -join ',')`nestimated tok/s over the decode phase: $tokS (chars/4 tokens per second after the first chunk; an estimate, D44)"
+        # completion_tokens is whatever the backend's counter says (D80): Phi-3 tokens on phi-silica,
+        # the chars/4 estimate (D44) elsewhere. Name it, so the number is read in the right unit.
+        $counter = (Get-Json '/debug/tokenize' 'POST' (@{ text = 'probe' } | ConvertTo-Json -Compress)).counter
+        "asked: one user message, max_tokens=128, streaming`nttft=$($s.FirstChunkMs)ms total=$($s.TotalMs)ms chars=$($s.Content.Length) completion_tokens=$($u.completion_tokens) chunks=$($s.Chunks.Count) finish=$((Get-FinishReasons $s.Chunks) -join ',')`ntok/s over the decode phase: $tokS ($counter tokens per second after the first chunk; $([Math]::Round($s.Content.Length / [Math]::Max(1, $u.completion_tokens), 2)) chars per token on this reply)"
     }
 
     Step 'streaming client-side cut (max_tokens and stop)' {
-        # D53: the cap is a character budget of max_tokens * 4, so usage.completion_tokens -- ceil of
-        # chars/4 -- lands on the cap and never above it. Streaming is where the cut is hardest: text
-        # already written cannot be recalled.
+        # D53/D80: the cap is a budget in the backend's own tokens (Phi-3 on phi-silica, chars/4
+        # elsewhere), so usage.completion_tokens lands on the cap and never above it, and the text that
+        # reached the client counts exactly what usage says. Streaming is where the cut is hardest:
+        # text already written cannot be recalled.
         $cap = 8
-        $capChars = $cap * 4
         $capBody = @{
             model          = $servedModel
             stream         = $true
@@ -549,10 +552,14 @@ try {
             throw "max_tokens: finish_reason=$($capFinishes -join ',') expected exactly one 'length' (the model may have stopped on its own before the cap)"
         }
         if (-not $capped.Content) { throw 'max_tokens: no content before the cut' }
-        if ($capped.Content.Length -gt $capChars) { throw "max_tokens: $($capped.Content.Length) chars streamed > budget of $capChars" }
         $capUsage = @($capped.Chunks | Where-Object { $null -ne $_.usage })[0].usage
         if ($null -eq $capUsage) { throw 'max_tokens: no usage chunk, though stream_options.include_usage was set' }
         if ($capUsage.completion_tokens -gt $cap) { throw "max_tokens: usage.completion_tokens=$($capUsage.completion_tokens) > max_tokens=$cap" }
+        # The text on the wire, counted by the same counter the server used: it must be what usage
+        # reports, and within the cap. A chars/4 counter makes this the old cap * 4 character check.
+        $counted = Get-Json '/debug/tokenize' 'POST' (@{ text = $capped.Content } | ConvertTo-Json -Compress -EscapeHandling EscapeNonAscii)
+        if ([int]$counted.tokens -ne [int]$capUsage.completion_tokens) { throw "max_tokens: the streamed text counts $($counted.tokens) $($counted.counter) tokens but usage.completion_tokens=$($capUsage.completion_tokens)" }
+        if ([int]$counted.tokens -gt $cap) { throw "max_tokens: $($capped.Content.Length) chars streamed = $($counted.tokens) $($counted.counter) tokens > max_tokens=$cap" }
 
         # The stop string is removed from the reply rather than never produced (D53), and the streaming
         # path has to hold text back to catch one that straddles two deltas.
@@ -585,7 +592,7 @@ try {
             "not confirmed: the control run did not contain '$stop' either, so nothing needed truncating this time"
         }
 
-        "max_tokens=$cap -> finish=length, $($capped.Content.Length) chars <= $capChars budget, completion_tokens=$($capUsage.completion_tokens); stop='$stop' -> finish=stop, absent from the reply, $evidence"
+        "max_tokens=$cap -> finish=length, $($capped.Content.Length) chars streamed = $($counted.tokens) $($counted.counter) tokens <= $cap, completion_tokens=$($capUsage.completion_tokens); stop='$stop' -> finish=stop, absent from the reply, $evidence"
     }
 
     # The contract both shapes rest on: GenerationResult.Text is the concatenation of the deltas the
@@ -784,19 +791,23 @@ try {
         }
     }
 
-    # --- measurement 1: does completion_tokens (chars/4) track progress callbacks? -----------------
-    InfoStep 'measurement: chars/4 estimate vs progress-callback count' {
+    # --- measurement 1: how far the progress-callback count and the chars/4 estimate are from the tokens
+    InfoStep 'measurement: token count vs chars/4 estimate vs progress-callback count' {
         $prompt = 'In two or three sentences, explain what a neural processing unit does and why a Copilot+ PC has one.'
 
-        # Single generation: read the callback count and the character count off the same response, so
-        # the ratio measures the thing being decided rather than the difference between two replies.
+        # Single generation: read the callback count, the character count and the counted tokens off the
+        # same reply, so the ratios measure the thing being decided rather than the difference between
+        # two replies. On phi-silica the count is Phi-3 tokens (D80); on a chars/4 backend it is the estimate.
         $g = Get-Json '/debug/generate' 'POST' (@{ prompt = $prompt } | ConvertTo-Json)
         if ($g.status -ne 'Complete') { throw "debug/generate status=$($g.status)" }
         $callbacks = $g.progress_callbacks
         $chars = $g.chars
         $estimate = [Math]::Ceiling($chars / 4.0)
+        $counted = Get-Json '/debug/tokenize' 'POST' (@{ text = [string]$g.text } | ConvertTo-Json -Compress -EscapeHandling EscapeNonAscii)
         $ratio = if ($callbacks -gt 0) { [Math]::Round($estimate / $callbacks, 2) } else { $null }
         $ratioText = if ($null -ne $ratio) { "${ratio}x" } else { 'n/a (0 callbacks)' }
+        $tokenLine = if ($counted.counter -eq 'chars/4') { "counted tokens: this backend counts chars/4, so the count is the estimate ($($counted.tokens))" }
+                     else { "counted tokens ($($counted.counter)) = $($counted.tokens); the chars/4 estimate is $([Math]::Round($estimate / [Math]::Max(1, [int]$counted.tokens), 2))x the count, and the callbacks $([Math]::Round($callbacks / [Math]::Max(1, [int]$counted.tokens), 2))x" }
 
         # Cross-check only, from a second, separate generation through the real endpoint. Deliberately
         # not folded into the ratio above: two different replies of different lengths would measure
@@ -814,12 +825,13 @@ asked: one bare user-message prompt ($($prompt.Length) chars) to /debug/generate
 progress-callback count (this generation) = $callbacks
 raw completion character count (this generation) = $chars
 chars/4 estimate derived from this generation = $estimate
+$tokenLine
 ratio: chars/4 estimate is $ratioText the callback count, both numbers from the same generation
 cross-check (a different generation, same prompt, via /v1/chat/completions): $crossCheck -- for
-comparison only, not part of the ratio above
+comparison only, not part of the ratios above
 verdict: chunk 3 chose chars/4 over counting callbacks because callbacks were measured undercounting by
-roughly 4x (11 callbacks for 178 chars); this ratio is that assumption checked on one real generation,
-not a recollection.
+roughly 4x (11 callbacks for 178 chars), and D80 replaced the estimate with the runtime's own
+tokenizer on phi-silica; these ratios are both assumptions checked on one real generation.
 "@
     }
 

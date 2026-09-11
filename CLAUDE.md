@@ -76,7 +76,7 @@ dotnet test --filter "DisplayName~Loading_backend"          # one test by name f
 dotnet run --project src/NpuBridge -- --backend fake --verbose   # run the exe (bin\Debug\...\win-arm64\NpuBridge.exe)
 .\scripts\identity.ps1 -Install                # sparse package identity for Phi Silica; installs the runtime dep; prints the PFN
 .\scripts\identity.ps1 -Status                 # is the package registered, which PFN
-.\scripts\smoke.ps1 -Backend phi-silica        # real NPU run: health, models, /debug/generate, chat (JSON and SSE), the cut, the cache hit, the overflow refusal and --truncate-history (on a second server), the D53/D55 measurements; the tool probe SKIPs until chunk 7
+.\scripts\smoke.ps1 -Backend phi-silica        # real NPU run: health, models, /debug/generate, chat (JSON and SSE), the cut, the cache hit, the overflow refusal and --truncate-history (on a second server), the D80 tokenizer boundary check, the D53/D55 measurements, teardown; the tool probe SKIPs until chunk 7
 NpuBridge.exe task install|status|uninstall    # logon task that starts Phi Silica with identity (install/uninstall elevated)
 NpuBridge.exe service install|start|stop|uninstall   # Windows service for aion/fake (elevated)
 ```
@@ -106,9 +106,11 @@ Three projects, deliberately:
   phase (`ChatRequestPreparer`), the JSON and SSE generation phases (`ChatCompletionsEndpoint`,
   `ChatCompletionsStreamEndpoint`), the client-side cut (`OutputLimits`/`OutputCutter`), one failure
   mapping for both shapes (`GenerationFailure`), `ILanguageModelBackend`, `FakeBackend`, the
-  conversation key and the context cache (`ConversationKey`, `ContextCache`), and the session that
+  conversation key and the context cache (`ConversationKey`, `ContextCache`), the session that
   drives lookup, tail rendering and overflow handling for both shapes (`ConversationSession`,
-  `ContextLease`).
+  `ContextLease`), and the token counters (`Tokenizers/`: `ITokenCounter`, `CharEstimateTokenCounter`,
+  `Phi3TokenCounter` over the embedded Phi-3.5-mini `tokenizer.model`, D80; `Microsoft.ML.Tokenizers`
+  is Core's only package reference).
   Not built yet, so do not describe these as existing: tool-call emulation (chunk 7), generation
   scheduler and `/v1/completions` (chunk 8).
 - `src/NpuBridge` (net10.0-windows10.0.26100.0, ARM64 exe): `Program.cs`, config, service and task
@@ -191,9 +193,17 @@ concurrent requests for one conversation each get their own context (the second 
 - **The model does follow a system prompt** when the transcript is rendered through `PromptTemplate`,
   under both native and folded placement (measured, D45). Only the bare `/debug/generate` path ignores
   its system prompt, so a finding from that endpoint is about the raw model, not this API.
-- **Token counts are estimated from characters, not progress callbacks, on both sides of `usage`.**
-  `completion_tokens = ceil(chars/4)`. Phi Silica batches several tokens per callback under speculative
-  decoding, so a callback count undercounts by roughly 3x (measured, D44).
+- **Token counts come from the backend's `ITokenCounter`, never from progress callbacks (D80).** On
+  Phi Silica that is `Phi3TokenCounter` over the vendored Phi-3.5-mini `tokenizer.model`, measured to
+  be the runtime's own vocabulary (the preflight lands on 3581 of its tokens at every ASCII boundary;
+  about 1 % off on punctuation-dense text). Aion, the unavailable backend and the fake's default use
+  `CharEstimateTokenCounter` (`ceil(chars/4)`, D44). Phi Silica batches several tokens per callback
+  under speculative decoding, so a callback count undercounts by roughly 3x (D44). The usable window
+  of an empty Phi Silica context is 3581 tokens.
+- **`GetUsablePromptLength` answers in UTF-8 bytes (D80).** `PhiSilicaBackend` converts with
+  `Utf8Offsets.CharIndexAtByteOffset`; read as chars the answer is up to three times too generous
+  for CJK. `Microsoft.ML.Tokenizers` 2.0.0 is Core's one package dependency; `POST /debug/tokenize`
+  (loopback, works while loading) returns the backend's count and its counter's name.
 - **A context is disposed on every path that creates one.** `/v1/chat/completions` creates its
   context immediately before generating and disposes it in a `finally`, covering success, prompt
   overflow, content filter, a backend `Error`/`Cancelled` status, a thrown exception, and a client
@@ -214,9 +224,10 @@ concurrent requests for one conversation each get their own context (the second 
   `content: null` and a `tool_calls` array keys as a distinct turn (D71) but still renders as an
   empty turn in the prompt. Chunk 7 owns the rendering, and its stored key after a tool-call reply
   must be computed from the parsed calls so a client that re-serialises our output still hits.
-- **Overflow is decided by the preflight where one exists (D73).** Phi Silica never reports
-  `PromptLargerThanContext` (D55), so `ConversationSession` asks `GetUsablePromptLength` before
-  generating and the 400 now arrives in tens of milliseconds. Aion has no preflight, so both endpoints
+- **Overflow is decided by the preflight where one exists (D73).** Phi Silica reports
+  `PromptLargerThanContext` only sometimes (a prompt moderately over the window gets it in about
+  600 ms; D55's 225 KB prompt got a generic `Error` after 26 s, D80), so `ConversationSession` asks
+  `GetUsablePromptLength` before generating and the 400 arrives in tens of milliseconds. Aion has no preflight, so both endpoints
   retry on a `PromptLargerThanContext` status when `--truncate-history` can drop something; Aion's
   actual overflow status is still unmeasured (D70), so re-check that path when it runs. After a
   truncation the next request in that conversation misses and truncates again (`docs/FUTURE.md`).
@@ -270,9 +281,10 @@ Live today:
   miss alike; the log line's `prompt_chars` is what was sent, and it also carries `cache=hit|miss`,
   `tail_turns=N` and `truncated_turns=N`. `/healthz` reports `contexts_cached`,
   `context_cache_capacity`, `context_cache_hits` and `context_cache_misses`.
-- Token counts in `usage` are estimates: `ceil(chars/4)` on both `prompt_tokens` and
-  `completion_tokens` (D44). On a stream, `completion_tokens` counts the characters the cutter
-  actually released, not the backend's returned text.
+- Token counts in `usage` are the backend's counter's (D80): Phi-3 tokens on Phi Silica, `ceil(chars/4)`
+  on Aion and the fake (D44). `prompt_tokens` counts the whole rendered transcript plus the native
+  system text, the same on a hit and a miss; on a stream, `completion_tokens` counts the text the
+  cutter actually released, not the backend's returned text.
 - **Streaming** (`stream: true`): one `chat.completion.chunk` per cutter release, the first carrying
   `role: "assistant"`, `finish_reason` on the last real chunk, an optional `usage` chunk with empty
   `choices` when `stream_options.include_usage` is set, then `data: [DONE]`. The headers are committed
@@ -280,13 +292,17 @@ Live today:
   is first (D52). A failure before that is the ordinary HTTP status and JSON body, so a streamed
   request that fails validation, readiness or the first generation step is a plain 400/502/503. A
   failure after it is a `data: {"error":...}` event with the identical envelope, then `[DONE]`.
-- **The client-side cut** (D53): `max_tokens`/`max_completion_tokens` (the smaller wins) is a
-  character budget of `cap * 4`; `stop` strings are excluded from the output; the generation is
-  cancelled at the cut. A stream holds back `longest stop - 1` characters so a stop string split
-  across deltas is never leaked, and neither the holdback nor the budget may split a surrogate pair
-  (D58). Only a `Cancelled` status may be reinterpreted by a cut; any other failure status is still a
-  failure (D56), and a filtered reply outranks the cut. Both shapes cut through the same
-  `OutputCutter`, so the same text always yields the same reply and finish reason.
+- **The client-side cut** (D53, D80): `max_tokens`/`max_completion_tokens` (the smaller wins) is a
+  budget in the backend's counter's tokens, cut at the counter's index for that many tokens over
+  everything generated (exactly `cap * 4` characters under chars/4); `stop` strings are excluded from
+  the output; the generation is cancelled at the cut. A stream holds back `longest stop - 1`
+  characters so a stop string split across deltas is never leaked, and neither the holdback nor the
+  budget may split a surrogate pair (D58). With a BPE counter the stream also holds the trailing
+  partial word (at most 16 characters) once within 8 tokens of the budget, because a later merge can
+  move the budget's index; far from the budget text flows as it arrives. Only a `Cancelled` status
+  may be reinterpreted by a cut; any other failure status is still a failure (D56), and a filtered
+  reply outranks the cut. Both shapes cut through the same `OutputCutter`, so the same text always
+  yields the same reply and finish reason.
 
 Agreed design for chunks that have not landed. These rules are what each chunk must implement; none of
 it is current behaviour, so do not describe it as working:

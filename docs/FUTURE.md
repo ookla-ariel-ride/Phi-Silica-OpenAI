@@ -73,10 +73,10 @@ rest of both issues stays open, as does the CI job.
   `temperature` hits the context its earlier turns built. That is right: the context holds text
   rather than sampling state, and Phi Silica takes the options per generation. It is still a fact a
   reader of the key should not have to infer.
-- **`prompt_tokens` on a hit is an estimate of the whole transcript, not of what the runtime holds.**
+- **`prompt_tokens` on a hit counts the whole transcript, not what the runtime holds.**
   What the runtime actually keeps in its context after several turns (and whether it compacts) is not
-  observable through the API; the number is the same chars/4 estimate as before, over the transcript
-  the client sent. `CompressPromptAsync` (2.4.8-experimental, Phi Silica only, issue #1's comment) is
+  observable through the API; the number is the backend's count (Phi-3 tokens since D80) over the
+  transcript the client sent. `CompressPromptAsync` (2.4.8-experimental, Phi Silica only, issue #1's comment) is
   the one lever if the runtime's window turns out smaller than the transcript suggests.
 - **`ChatMessage.ToolCalls` is carried and keyed but not rendered.** Chunk 7 owns rendering the
   model its own tool-call protocol. Until then an assistant turn with only tool calls renders as an
@@ -229,11 +229,15 @@ rest of both issues stays open, as does the CI job.
   `n: 0` is accepted and answered with one choice where OpenAI requires `n >= 1`; and `stream_options`
   sent without `stream: true` is silently ignored where OpenAI returns a 400, so the bridge hides that
   client bug instead of surfacing it.
-- **The chars/4 estimate is wrong by roughly 4x for non-Latin output.** D44 owns the estimate, but not
-  this consequence: for CJK, Cyrillic or heavy-emoji text the real ratio is nearer one token per
-  character, so `max_tokens: 100` permits about 400 real tokens and `usage` under-reports by the same
-  factor. An agent loop keeping its own context ledger from `usage` (Hermes and OpenCode both do)
-  overflows the window several turns before it expects to. Not fixable without a tokenizer.
+- ~~**The chars/4 estimate is wrong by roughly 4x for non-Latin output.**~~ Fixed for Phi Silica by
+  D80 (2026-09-11): `usage` and the `max_tokens` budget are Phi-3 tokens there, measured against the
+  runtime's preflight on CJK and emoji among others. Still true on Aion, which keeps chars/4 until a
+  generation runs and the same measurement can be made against its preflight, if it has one.
+- **The pressure warning still measures characters.** `ConversationSession` compares the transcript's
+  characters against `--context-window-hint × 4`; with a real counter on Phi Silica it could compare
+  tokens against the hint directly, and the warning would then fire before the preflight refuses
+  only if the hint is set below the measured 3581-token window. Deferred with the chunk 5 note on the
+  default hint (from D80).
 - **`usage` disagrees between the shapes on a filtered reply.** Extends the content asymmetry above: the
   stream counts what it actually sent (`cutter.ContentLength`) while the JSON path counts the blanked
   content, so the same filtered generation reports N completion tokens streamed and 0 as JSON. No test
