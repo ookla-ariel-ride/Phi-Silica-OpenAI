@@ -477,7 +477,7 @@ try {
     # adapter delivered (ILanguageModelBackend). The fake honours it by construction, so dotnet test
     # cannot check a real adapter; this does. The adapter now returns the accumulated deltas on every
     # status and counts, in /healthz, every time the runtime's own text disagreed with them and every
-    # callback that arrived after the completion barrier. Those counters are the assertion. Whether the
+    # callback that arrived after a completed generation ended. Those counters are the assertion. Whether the
     # two shapes' texts match on the wire is reported but not asserted: temperature 0 on this runtime
     # is not a documented promise of determinism, so a difference there is a finding about the model.
     Step 'both shapes return the deltas the adapter delivered (text contract)' {
@@ -505,7 +505,7 @@ try {
         if ($d.text_mismatches -ne 0) { throw "the runtime's text disagreed with the delivered deltas $($d.text_mismatches) time(s) this run" }
         if ($d.late_deltas -ne 0) { throw "$($d.late_deltas) progress callback(s) arrived after the completion barrier this run" }
 
-        "text_mismatches=0 late_deltas=0 over every generation so far; $match"
+        "text_mismatches=0 late_deltas=0 over every completed generation so far (a callback after a cancelled one is exempt); $match"
     }
 
     if ($ToolProbeRuns -gt 0) {

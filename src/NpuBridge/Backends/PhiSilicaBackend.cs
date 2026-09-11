@@ -195,23 +195,39 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
             {
                 if (Volatile.Read(ref closed) == 1)
                 {
-                    _diagnostics["late_deltas"] = Interlocked.Increment(ref _lateDeltas);
-                    _logger.LogWarning("A Phi Silica progress callback ({Length} chars) arrived after the generation completed and was dropped.", delta?.Length ?? 0);
+                    // After a cancellation the barrier closes the moment AsTask throws, so a callback
+                    // the runtime raises on its way out is expected and its text was going to be
+                    // discarded anyway: not a contract breach, not counted. After a completion it is
+                    // text the runtime produced that neither shape will ever see, and it is both.
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        _logger.LogDebug("A Phi Silica progress callback ({Length} chars) arrived after the cancelled generation ended; dropped.", delta.Length);
+                    }
+                    else
+                    {
+                        Count("late_deltas", ref _lateDeltas);
+                        _logger.LogWarning("A Phi Silica progress callback ({Length} chars) arrived after the generation completed and was dropped.", delta.Length);
+                    }
+
                     return;
                 }
 
+                // Append and deliver under the same lock, so the order the caller sees is the order
+                // the text accumulates in: the returned Text is that accumulation, and if two callbacks
+                // ever overlapped, appending inside the lock but delivering outside it could hand the
+                // stream "BA" while reporting "AB". Neither the JSON watcher nor the stream's channel
+                // sink blocks inside onDelta, so holding the lock across the call costs nothing.
                 lock (accumulated)
                 {
                     accumulated.Append(delta);
-                }
-
-                try
-                {
-                    onDelta(delta);
-                }
-                catch (Exception ex)
-                {
-                    Interlocked.CompareExchange(ref deltaFailure, ex, null);
+                    try
+                    {
+                        onDelta(delta);
+                    }
+                    catch (Exception ex)
+                    {
+                        Interlocked.CompareExchange(ref deltaFailure, ex, null);
+                    }
                 }
             }
             finally
@@ -263,7 +279,7 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
         var text = Partial();
         if (!string.IsNullOrEmpty(result.Text) && !string.Equals(result.Text, text, StringComparison.Ordinal))
         {
-            _diagnostics["text_mismatches"] = Interlocked.Increment(ref _textMismatches);
+            Count("text_mismatches", ref _textMismatches);
             _logger.LogWarning(
                 "Phi Silica's result text ({ResultLength} chars) differs from the delivered deltas ({DeltaLength} chars); returning the deltas.",
                 result.Text.Length, text.Length);
@@ -292,6 +308,19 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
 
     /// <summary>Upper bound on waiting for a straggling Progress callback after the operation completed.</summary>
     private static readonly TimeSpan CallbackDrainTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Increments a counter and publishes it to <see cref="Diagnostics"/> as one step. Two concurrent
+    /// generations (nothing queues them until chunk 8) could otherwise increment to 1 and 2 and publish
+    /// in the opposite order, leaving <c>/healthz</c> a step behind until the next event.
+    /// </summary>
+    private void Count(string key, ref int counter)
+    {
+        lock (_diagnostics)
+        {
+            _diagnostics[key] = ++counter;
+        }
+    }
 
     public ValueTask DisposeAsync()
     {
