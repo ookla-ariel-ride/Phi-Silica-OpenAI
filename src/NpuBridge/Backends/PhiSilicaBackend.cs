@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Text;
 using Microsoft.Extensions.Logging;
 using Microsoft.Windows.AI;
 using Microsoft.Windows.AI.Text;
@@ -176,65 +175,17 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
         // SDK 2.4 has no context overload without options; defaults come from a fresh LanguageModelOptions.
         var op = Guarded(() => model.GenerateResponseAsync(ctx, prompt, ToOptions(sampling)), "GenerateResponseAsync");
 
-        // Progress delivers the newest token(s) only; accumulate here, because the accumulation *is* the
-        // text this method returns (the contract: Text is the deltas delivered, concatenated -- the two
-        // response shapes cut the same characters only because of it). An exception from onDelta would
-        // otherwise vanish on the WinRT callback thread. Completion of the operation does not guarantee
-        // the last Progress callback has finished (or even started), so callbacks are counted and drained
-        // before this method returns; anything arriving after the barrier is dropped rather than
-        // delivered to a caller that has moved on -- and counted, because a dropped delta is text the
-        // runtime produced that neither shape will ever see.
-        var accumulated = new StringBuilder();
-        Exception? deltaFailure = null;
-        var inFlight = 0;
-        var closed = 0;
-        op.Progress = (_, delta) =>
-        {
-            Interlocked.Increment(ref inFlight);
-            try
-            {
-                if (Volatile.Read(ref closed) == 1)
-                {
-                    // After a cancellation the barrier closes the moment AsTask throws, so a callback
-                    // the runtime raises on its way out is expected and its text was going to be
-                    // discarded anyway: not a contract breach, not counted. After a completion it is
-                    // text the runtime produced that neither shape will ever see, and it is both.
-                    if (cancellationToken.IsCancellationRequested)
-                    {
-                        _logger.LogDebug("A Phi Silica progress callback ({Length} chars) arrived after the cancelled generation ended; dropped.", delta.Length);
-                    }
-                    else
-                    {
-                        Count("late_deltas", ref _lateDeltas);
-                        _logger.LogWarning("A Phi Silica progress callback ({Length} chars) arrived after the generation completed and was dropped.", delta.Length);
-                    }
-
-                    return;
-                }
-
-                // Append and deliver under the same lock, so the order the caller sees is the order
-                // the text accumulates in: the returned Text is that accumulation, and if two callbacks
-                // ever overlapped, appending inside the lock but delivering outside it could hand the
-                // stream "BA" while reporting "AB". Neither the JSON watcher nor the stream's channel
-                // sink blocks inside onDelta, so holding the lock across the call costs nothing.
-                lock (accumulated)
-                {
-                    accumulated.Append(delta);
-                    try
-                    {
-                        onDelta(delta);
-                    }
-                    catch (Exception ex)
-                    {
-                        Interlocked.CompareExchange(ref deltaFailure, ex, null);
-                    }
-                }
-            }
-            finally
-            {
-                Interlocked.Decrement(ref inFlight);
-            }
-        };
+        // The deltas are accumulated, delivered under the append lock and drained after the operation
+        // ends by the accumulator both adapters share (the contract: Text is the deltas delivered,
+        // concatenated; the two response shapes cut the same characters only because of it, D65).
+        var deltas = new DeltaAccumulator(
+            _logger,
+            "Phi Silica",
+            onDelta,
+            onLateDelta: () => Count("late_deltas", ref _lateDeltas),
+            onTextMismatch: () => Count("text_mismatches", ref _textMismatches),
+            cancellationToken);
+        op.Progress = (_, delta) => deltas.OnProgress(delta);
 
         LanguageModelResponseResult result;
         try
@@ -243,26 +194,26 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
         }
         catch (OperationCanceledException)
         {
-            DrainCallbacks();
-            return new GenerationResult(Partial(), GenerationStatus.Cancelled, "cancelled");
+            deltas.Drain();
+            return new GenerationResult(deltas.Text, GenerationStatus.Cancelled, "cancelled");
         }
         catch (Exception ex) when ((uint)ex.HResult == AccessDenied)
         {
-            DrainCallbacks();
+            deltas.Drain();
             throw new BackendUnavailableException($"Phi Silica refused access (E_ACCESSDENIED) during generation. {_lafHint}", ex);
         }
 
-        DrainCallbacks();
+        deltas.Drain();
 
-        if (deltaFailure is not null)
+        if (deltas.DeltaFailure is { } failure)
         {
-            return new GenerationResult(Partial(), GenerationStatus.Error, $"delta callback threw: {deltaFailure.GetType().Name}: {deltaFailure.Message}");
+            return new GenerationResult(deltas.Text, GenerationStatus.Error, $"delta callback threw: {failure.GetType().Name}: {failure.Message}");
         }
 
         // A runtime that honours Cancel() by finishing early still reports Complete; the caller asked to stop.
         if (cancellationToken.IsCancellationRequested)
         {
-            return new GenerationResult(Partial(), GenerationStatus.Cancelled, "cancelled (runtime finished early)");
+            return new GenerationResult(deltas.Text, GenerationStatus.Cancelled, "cancelled (runtime finished early)");
         }
 
         var status = MapStatus(result.Status);
@@ -272,42 +223,11 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
             return new GenerationResult(string.Empty, status, DescribeStatus(result));
         }
 
-        // The delivered deltas are the answer, on every status (D65). The runtime's own Text is a
-        // cross-check, not a source: if it ever differs, the JSON path would have cut different
-        // characters from the ones the stream cut, and the same request would answer differently by
-        // shape. Not observed on hardware; measured by the smoke test's text-contract step from now on.
-        var text = Partial();
-        if (!string.IsNullOrEmpty(result.Text) && !string.Equals(result.Text, text, StringComparison.Ordinal))
-        {
-            Count("text_mismatches", ref _textMismatches);
-            _logger.LogWarning(
-                "Phi Silica's result text ({ResultLength} chars) differs from the delivered deltas ({DeltaLength} chars); returning the deltas.",
-                result.Text.Length, text.Length);
-        }
-
-        return new GenerationResult(text, status, DescribeStatus(result));
-
-        string Partial()
-        {
-            lock (accumulated)
-            {
-                return accumulated.ToString();
-            }
-        }
-
-        void DrainCallbacks()
-        {
-            // Close the gate first so a late callback exits early, then wait for any that are mid-flight.
-            Volatile.Write(ref closed, 1);
-            if (!SpinWait.SpinUntil(() => Volatile.Read(ref inFlight) == 0, CallbackDrainTimeout))
-            {
-                _logger.LogWarning("A Phi Silica progress callback did not finish within {Timeout}; continuing.", CallbackDrainTimeout);
-            }
-        }
+        // The delivered deltas are the answer, on every status (D65); the runtime's own Text is a
+        // cross-check the accumulator counts a disagreement on. Not observed on hardware; measured by
+        // the smoke test's text-contract step.
+        return new GenerationResult(deltas.Reconcile(result.Text), status, DescribeStatus(result));
     }
-
-    /// <summary>Upper bound on waiting for a straggling Progress callback after the operation completed.</summary>
-    private static readonly TimeSpan CallbackDrainTimeout = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Increments a counter and publishes it to <see cref="Diagnostics"/> as one step. Two concurrent
