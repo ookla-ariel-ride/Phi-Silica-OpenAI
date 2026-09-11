@@ -28,6 +28,10 @@ public class HealthzTests
         Assert.Equal("NpuBridge_abc", json.GetProperty("package_family_name").GetString());
         Assert.Equal(7, json.GetProperty("queue_capacity").GetInt32());
         Assert.Equal(0, json.GetProperty("queue_depth").GetInt32());
+        Assert.Equal(0, json.GetProperty("contexts_cached").GetInt32());
+        Assert.Equal(4, json.GetProperty("context_cache_capacity").GetInt32());
+        Assert.Equal(0, json.GetProperty("context_cache_hits").GetInt64());
+        Assert.Equal(0, json.GetProperty("context_cache_misses").GetInt64());
         Assert.False(json.GetProperty("first_run_compile_likely").GetBoolean());
         Assert.False(json.TryGetProperty("error", out _), "error should be omitted when null");
         Assert.True(json.GetProperty("diagnostics").GetProperty("fake").GetBoolean());

@@ -6,8 +6,9 @@
   Starts NpuBridge.exe (or, with -NoStart, tests a server already listening), waits for /healthz to
   report ready (the first Phi Silica / Aion load can take minutes), then exercises /v1/models,
   /debug/generate (raw model access, cancellation, prompt-length preflight), /v1/chat/completions
-  non-streaming and streaming (the SSE wire contract and the client-side cut) and, once chunk 7 lands,
-  a tool-call compliance probe.
+  non-streaming and streaming (the SSE wire contract and the client-side cut), the context cache
+  (a continuation hits, a control misses, both timed) and overflow handling (the preflight refusal,
+  then --truncate-history on a second server) and, once chunk 7 lands, a tool-call compliance probe.
 
   It also takes the measurements docs/DECISIONS.md cites: the token estimate against the progress
   callbacks, which system-prompt placement this model obeys, whether cancelling a generation really
@@ -536,6 +537,120 @@ try {
         if ($d.late_deltas -ne 0) { throw "$($d.late_deltas) progress callback(s) arrived after the completion barrier this run" }
 
         "text_mismatches=0 late_deltas=0 over every completed generation so far (a callback after a cancelled one is exempt); $match"
+    }
+
+    # --- chunk 5: the context cache and overflow handling ----------------------------------------
+    Step 'context cache: a continuing conversation reuses its context and sends only the tail' {
+        # Three requests. The first opens a conversation; its context goes into the cache. The second
+        # continues it with the reply echoed back: a hit checks that context out, sends only the new
+        # turn, and stores it back. The third is the control: the same transcript with the assistant
+        # text altered cannot hit and replays the whole conversation on a fresh context. /healthz's
+        # hit and miss counters are the evidence (contexts_cached alone cannot tell a hit from a miss
+        # once the cache is full); the TTFTs are the measurement, since a hit skips re-reading the prefix.
+        $q1 = 'Name one primary colour. Reply with just the colour.'
+        $q2 = 'Name a different primary colour, again with just the colour.'
+        $h0 = Get-Json '/healthz'
+
+        $first = Invoke-Sse '/v1/chat/completions' (@{ model = $Backend; stream = $true; temperature = 0; messages = @(@{ role = 'user'; content = $q1 }) } | ConvertTo-Json -Depth 5)
+        if ($first.StatusCode -ne 200 -or -not $first.Done -or $first.ErrorFrames.Count -gt 0) { throw "first turn: HTTP $($first.StatusCode) done=$($first.Done) errors=$($first.ErrorFrames.Count)" }
+        $reply = $first.Content
+        $h1 = Get-Json '/healthz'
+        if ($h1.context_cache_misses -ne $h0.context_cache_misses + 1 -or $h1.context_cache_hits -ne $h0.context_cache_hits) { throw "first turn: hits $($h0.context_cache_hits)->$($h1.context_cache_hits) misses $($h0.context_cache_misses)->$($h1.context_cache_misses); a new conversation must miss exactly once" }
+        if ($h1.contexts_cached -ne [Math]::Min($h0.contexts_cached + 1, $h0.context_cache_capacity)) { throw "contexts_cached went $($h0.contexts_cached) -> $($h1.contexts_cached) after a completed generation (capacity $($h0.context_cache_capacity)); expected one more, or the bound" }
+
+        $continue = @{ model = $Backend; stream = $true; temperature = 0; messages = @(
+            @{ role = 'user'; content = $q1 }
+            @{ role = 'assistant'; content = $reply }
+            @{ role = 'user'; content = $q2 }
+        ) } | ConvertTo-Json -Depth 5
+        $hit = Invoke-Sse '/v1/chat/completions' $continue
+        if ($hit.StatusCode -ne 200 -or -not $hit.Done -or $hit.ErrorFrames.Count -gt 0) { throw "continuation: HTTP $($hit.StatusCode) done=$($hit.Done) errors=$($hit.ErrorFrames.Count)" }
+        $h2 = Get-Json '/healthz'
+        if ($h2.context_cache_hits -ne $h1.context_cache_hits + 1 -or $h2.context_cache_misses -ne $h1.context_cache_misses) { throw "continuation: hits $($h1.context_cache_hits)->$($h2.context_cache_hits) misses $($h1.context_cache_misses)->$($h2.context_cache_misses); the continuation of a cached conversation must hit" }
+        if ($h2.contexts_cached -ne $h1.contexts_cached) { throw "contexts_cached went $($h1.contexts_cached) -> $($h2.contexts_cached) on a hit; checkout and store back must leave it unchanged" }
+
+        $control = @{ model = $Backend; stream = $true; temperature = 0; messages = @(
+            @{ role = 'user'; content = $q1 }
+            @{ role = 'assistant'; content = "$reply (edited)" }
+            @{ role = 'user'; content = $q2 }
+        ) } | ConvertTo-Json -Depth 5
+        $miss = Invoke-Sse '/v1/chat/completions' $control
+        if ($miss.StatusCode -ne 200 -or -not $miss.Done -or $miss.ErrorFrames.Count -gt 0) { throw "control: HTTP $($miss.StatusCode) done=$($miss.Done) errors=$($miss.ErrorFrames.Count)" }
+        $h3 = Get-Json '/healthz'
+        if ($h3.context_cache_misses -ne $h2.context_cache_misses + 1 -or $h3.context_cache_hits -ne $h2.context_cache_hits) { throw "control: hits $($h2.context_cache_hits)->$($h3.context_cache_hits) misses $($h2.context_cache_misses)->$($h3.context_cache_misses); an altered assistant turn must miss" }
+
+        $r1 = $reply.Trim(); $r2 = $hit.Content.Trim(); $r3 = $miss.Content.Trim()
+        "hits $($h0.context_cache_hits)->$($h3.context_cache_hits) misses $($h0.context_cache_misses)->$($h3.context_cache_misses) contexts_cached $($h0.contexts_cached)->$($h1.contexts_cached)->$($h2.contexts_cached)->$($h3.contexts_cached) (capacity $($h0.context_cache_capacity))`n" +
+        "first turn:          ttft=$($first.FirstChunkMs)ms total=$($first.TotalMs)ms reply='$($r1.Substring(0, [Math]::Min(60, $r1.Length)))'`n" +
+        "continuation (hit):  ttft=$($hit.FirstChunkMs)ms total=$($hit.TotalMs)ms reply='$($r2.Substring(0, [Math]::Min(60, $r2.Length)))'`n" +
+        "control (miss):      ttft=$($miss.FirstChunkMs)ms total=$($miss.TotalMs)ms reply='$($r3.Substring(0, [Math]::Min(60, $r3.Length)))'"
+    }
+
+    Step 'overflow: an over-length transcript is refused by the preflight, and truncated with --truncate-history' {
+        # Eight exchanges of about two thousand characters each: some 17,000 rendered characters,
+        # past the 13,429 Phi Silica said fit (D55). On a backend with a preflight the refusal must
+        # arrive without a generation and therefore quickly -- the 26 s of D55 was the cost of asking
+        # the generation instead. Then the same transcript against a second server started with
+        # --truncate-history, which must answer, and say in a header how many turns it dropped.
+        $probe = Get-Json '/debug/generate' 'POST' (@{ prompt = 'Say OK.' } | ConvertTo-Json)
+        $hasPreflight = $null -ne $probe.usable_prompt_chars
+        if ($Backend -eq 'fake') { Skip 'the fake backend has no context window, so nothing overflows' }
+
+        $filler = 'The quick brown fox jumps over the lazy dog. ' * 45
+        $messages = [System.Collections.Generic.List[object]]::new()
+        for ($i = 1; $i -le 8; $i++) {
+            $messages.Add(@{ role = 'user'; content = "Note ${i}: $filler" })
+            $messages.Add(@{ role = 'assistant'; content = "Noted ${i}." })
+        }
+        $messages.Add(@{ role = 'user'; content = 'Reply with exactly the word PONG.' })
+        $body = @{ model = $Backend; temperature = 0; messages = $messages.ToArray() } | ConvertTo-Json -Depth 5
+        $chars = ($messages | ForEach-Object { $_.content.Length } | Measure-Object -Sum).Sum
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add("asked: $($messages.Count) messages, $chars characters of content, preflight=$hasPreflight")
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $r = Invoke-WebRequest -Uri "$base/v1/chat/completions" -Method POST -Body $body -ContentType 'application/json' -SkipHttpErrorCheck -TimeoutSec 300
+        $sw.Stop()
+        $verdictMs = $sw.ElapsedMilliseconds
+        if ([int]$r.StatusCode -eq 200) {
+            $lines.Add("main server (no --truncate-history): HTTP 200 after $verdictMs ms -- this backend accepted the whole transcript, so there was no overflow to refuse")
+            Skip ($lines -join "`n")
+        }
+        $e = ($r.Content | ConvertFrom-Json).error
+        if ($hasPreflight) {
+            if ([int]$r.StatusCode -ne 400 -or $e.code -ne 'context_length_exceeded') { throw "expected 400 context_length_exceeded from the preflight; got HTTP $($r.StatusCode) code=$($e.code): $($e.message)" }
+            if ($verdictMs -gt 5000) { throw "the preflight verdict took $verdictMs ms; a refusal that costs a generation (D55) is what the preflight exists to avoid" }
+            $lines.Add("main server: HTTP 400 code=context_length_exceeded after $verdictMs ms, before any generation (D55 closed): '$($e.message)'")
+        }
+        else {
+            $lines.Add("main server (no preflight): HTTP $($r.StatusCode) code=$($e.code) after $verdictMs ms -- the verdict came from the generation: '$($e.message)'")
+        }
+
+        if ($NoStart) {
+            $lines.Add('truncation half skipped: -NoStart is set, and it needs a second server started with --truncate-history')
+            $lines -join "`n"
+            return
+        }
+
+        $auxPort = $Port + 2
+        $aux = Start-AuxServer 'truncate' $auxPort @('--truncate-history')
+        try {
+            $sw.Restart()
+            $t = Invoke-WebRequest -Uri "http://127.0.0.1:$auxPort/v1/chat/completions" -Method POST -Body $body -ContentType 'application/json' -SkipHttpErrorCheck -TimeoutSec 300
+            $sw.Stop()
+            if ([int]$t.StatusCode -ne 200) { throw "--truncate-history server: HTTP $($t.StatusCode): $($t.Content)" }
+            $dropped = $t.Headers['x-npu-bridge-truncated-turns']
+            if (-not $dropped) { throw 'the reply carried no x-npu-bridge-truncated-turns header, so nothing was dropped -- yet the same transcript was refused above' }
+            $c = $t.Content | ConvertFrom-Json
+            $text = $c.choices[0].message.content
+            if (-not $text) { throw "empty content after truncation: $($t.Content)" }
+            $lines.Add("--truncate-history server: HTTP 200 after $($sw.ElapsedMilliseconds) ms, x-npu-bridge-truncated-turns=$dropped, finish=$($c.choices[0].finish_reason), prompt_tokens=$($c.usage.prompt_tokens), reply='$($text.Trim().Substring(0, [Math]::Min(60, $text.Trim().Length)))'")
+        }
+        finally {
+            Stop-AuxServer $aux
+        }
+
+        $lines -join "`n"
     }
 
     if ($ToolProbeRuns -gt 0) {

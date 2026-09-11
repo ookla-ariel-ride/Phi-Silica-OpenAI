@@ -77,6 +77,9 @@ public sealed record HealthResponse(
     int QueueDepth,
     int QueueCapacity,
     int ContextsCached,
+    int ContextCacheCapacity,
+    long ContextCacheHits,
+    long ContextCacheMisses,
     string? Error,
     IReadOnlyDictionary<string, object?> Diagnostics);
 
@@ -114,6 +117,9 @@ internal static class HealthEndpoint
             QueueDepth: 0,
             QueueCapacity: options.QueueCapacity,
             ContextsCached: cache.Count,
+            ContextCacheCapacity: cache.Capacity,
+            ContextCacheHits: cache.Hits,
+            ContextCacheMisses: cache.Misses,
             Error: snapshot.Error,
             Diagnostics: lifecycle.Backend.Diagnostics);
 

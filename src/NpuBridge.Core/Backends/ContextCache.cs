@@ -32,6 +32,8 @@ public sealed class ContextCache : IDisposable
     private readonly LinkedList<Entry> _lru = new();
 
     private bool _disposed;
+    private long _hits;
+    private long _misses;
 
     public ContextCache(int capacity, ILogger<ContextCache>? logger = null)
     {
@@ -42,6 +44,12 @@ public sealed class ContextCache : IDisposable
 
     /// <summary>The bound: <c>--context-cache-size</c>. Zero disables caching.</summary>
     public int Capacity { get; }
+
+    /// <summary>Lookups that checked a context out. Process-wide, for <c>/healthz</c>; the log line says which request.</summary>
+    public long Hits => Interlocked.Read(ref _hits);
+
+    /// <summary>Lookups that found nothing, including lookups with no cacheable prefix at all.</summary>
+    public long Misses => Interlocked.Read(ref _misses);
 
     /// <summary>Contexts currently held, i.e. cached and not checked out. What <c>/healthz</c> reports.</summary>
     public int Count
@@ -78,11 +86,13 @@ public sealed class ContextCache : IDisposable
                 if (_byKey.Remove(prefix.Key, out var node))
                 {
                     _lru.Remove(node);
+                    Interlocked.Increment(ref _hits);
                     return new ContextCheckout(prefix, node.Value.Context);
                 }
             }
         }
 
+        Interlocked.Increment(ref _misses);
         return null;
     }
 

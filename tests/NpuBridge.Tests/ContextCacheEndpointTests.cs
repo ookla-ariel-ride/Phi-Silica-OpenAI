@@ -332,7 +332,15 @@ public class ContextCacheEndpointTests
         await AskAsync(host, stream: false, Msg("user", "a"));
         await AskAsync(host, stream: true, Msg("user", "b"));
 
-        Assert.Equal(2, (await ReadJson(await host.Client.GetAsync("/healthz"))).GetProperty("contexts_cached").GetInt32());
+        var health = await ReadJson(await host.Client.GetAsync("/healthz"));
+        Assert.Equal(2, health.GetProperty("contexts_cached").GetInt32());
+        Assert.Equal(0, health.GetProperty("context_cache_hits").GetInt64());
+        Assert.Equal(2, health.GetProperty("context_cache_misses").GetInt64());
+
+        await AskAsync(host, stream: false, Msg("user", "a"), Msg("assistant", "ok"), Msg("user", "again"));
+        health = await ReadJson(await host.Client.GetAsync("/healthz"));
+        Assert.Equal(1, health.GetProperty("context_cache_hits").GetInt64());
+        Assert.Equal(2, health.GetProperty("context_cache_misses").GetInt64());
 
         await host.DisposeAsync();
         Assert.Equal(2, fake.ContextsDisposed);

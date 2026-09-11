@@ -64,8 +64,11 @@ public sealed class BridgeOptions
 
     public ToolSchemaMode ToolSchema { get; set; } = ToolSchemaMode.Compact;
 
-    /// <summary>Approximate context window in tokens. Declared but not yet read: the context-pressure
-    /// logging it is meant to drive arrives with the context cache in chunk 5.</summary>
+    /// <summary>
+    /// Approximate context window in tokens. A hint, not a measurement: the per-request context-pressure
+    /// warning fires when the transcript reaches nine tenths of it (times four characters per token).
+    /// Where the backend has a preflight, that is the real check.
+    /// </summary>
     public int ContextWindowHint { get; set; } = 4096;
 
     /// <summary>Phi Silica Limited Access Feature token. Optional; never logged.</summary>
