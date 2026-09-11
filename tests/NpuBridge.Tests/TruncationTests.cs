@@ -456,4 +456,58 @@ public class TruncationTests
         var line = capture.Records.Last(r => r.Message.Contains("cache=", StringComparison.Ordinal)).Message;
         Assert.Contains("cache=hit tail_turns=1 truncated_turns=4", line, StringComparison.Ordinal);
     }
+
+    /// <summary>
+    /// The cached branch of the refusal. Without <c>--truncate-history</c> a tail that does not fit
+    /// the cached context is the 400, its message says the tail was the problem, and the context
+    /// goes back into the cache exactly as it came out: the next request that does fit still hits it.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_tail_that_does_not_fit_a_cached_context_is_refused_and_the_context_goes_back_untouched(bool stream)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { MaxPromptChars = 400, Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        // A lone user message renders raw (D71), so the context has absorbed 100 + 2
+        // characters; a tail renders in the marker format, so it costs more than its text.
+        var first = await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = new[] { Msg("user", new string('a', 100)) } });
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        Assert.Equal(1, host.Cache.Count);
+
+        var refused = await host.Client.PostAsJsonAsync(Path, new
+        {
+            model = "fake",
+            stream,
+            messages = new[] { Msg("user", new string('a', 100)), Msg("assistant", "ok"), Msg("user", new string('z', 300)) },
+        });
+        var body = await refused.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.BadRequest, refused.StatusCode);
+        var error = JsonDocument.Parse(body).RootElement.GetProperty("error");
+        Assert.Equal("context_length_exceeded", error.GetProperty("code").GetString());
+        Assert.Contains("tail of 1 new turn(s) on a cached context", error.GetProperty("message").GetString(), StringComparison.Ordinal);
+        Assert.False(refused.Headers.Contains("x-npu-bridge-truncated-turns"));
+
+        // No generation ran, nothing was created or disposed, and the context is back where it was.
+        Assert.Single(fake.Calls);
+        Assert.Equal(1, fake.ContextsCreated);
+        Assert.Equal(0, fake.ContextsDisposed);
+        Assert.Equal(1, host.Cache.Count);
+
+        // A tail that fits hits the very same context, with the first exchange still in it.
+        var fits = await host.Client.PostAsJsonAsync(Path, new
+        {
+            model = "fake",
+            stream,
+            messages = new[] { Msg("user", new string('a', 100)), Msg("assistant", "ok"), Msg("user", "short") },
+        });
+        Assert.Equal(HttpStatusCode.OK, fits.StatusCode);
+        Assert.Equal(2, fake.Calls.Count);
+        Assert.Equal(fake.Calls[0].ContextId, fake.Calls[1].ContextId);
+        Assert.Single(fake.Calls[1].History);
+        Assert.Equal(1, fake.ContextsCreated);
+        host.AssertNoLeak();
+    }
 }

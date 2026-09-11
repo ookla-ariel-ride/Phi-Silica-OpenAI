@@ -14,7 +14,9 @@
   callbacks, which system-prompt placement this model obeys, whether cancelling a generation really
   stops the accelerator, and how an over-length prompt is refused -- how long it takes, and whether
   the verdict lands as an HTTP status or as an in-stream error frame (D52, D55). Those report numbers
-  and never fail the run: a surprising number is a finding, not a broken bridge.
+  and do not fail the run over a surprising number, which is a finding rather than a broken bridge.
+  A measurement that contradicts something the bridge guarantees (a status line arriving after the
+  first keep-alive was due, a placement run that cannot answer) is a failure, though.
 
   For -Backend phi-silica the exe is started by path; it relaunches itself through package activation so
   the process has identity and supervises that instance (scripts/identity.ps1 -Install must have been run
@@ -59,6 +61,16 @@ function Skip([string] $reason) {
     throw [SkipStepException]::new($reason)
 }
 
+# Thrown by an InfoStep body when the measurement contradicts something the bridge guarantees: the
+# numbers stay informational, but a guarantee that did not hold is a failure, not a finding.
+class FailStepException : System.Exception {
+    FailStepException([string] $message) : base($message) {}
+}
+
+function Fail([string] $reason) {
+    throw [FailStepException]::new($reason)
+}
+
 function Step([string] $name, [scriptblock] $body) {
     Write-Host "==> $name" -ForegroundColor Cyan
     try {
@@ -81,6 +93,11 @@ function InfoStep([string] $name, [scriptblock] $body) {
     Write-Host "==> $name" -ForegroundColor Cyan
     try {
         $detail = & $body
+    } catch [FailStepException] {
+        $results.Add([pscustomobject]@{ Step = $name; Result = 'FAIL'; Detail = $_.Exception.Message })
+        Write-Host '    FAIL' -ForegroundColor Red
+        ("$($_.Exception.Message)" -split "`n") | ForEach-Object { Write-Host "      $_" -ForegroundColor Red }
+        return
     } catch {
         $detail = "could not measure: $($_.Exception.Message)"
     }
@@ -231,15 +248,42 @@ function Start-AuxServer([string] $label, [int] $port, [string[]] $extraArgs) {
         }
         throw "$label server not ready after ${ReadyTimeoutSeconds}s; last: $($last | ConvertTo-Json -Compress)"
     } catch {
-        Stop-AuxServer $p
+        Stop-AuxServer $p $port
         throw
     }
 }
 
-function Stop-AuxServer($p) {
-    if ($p -and -not $p.HasExited) {
+# Polls until nothing of a server this script started is left: its own pid, any NpuBridge process that
+# carries --supervisor-pid <that pid> on its command line (the activated child, D37; Win32_Process shows
+# the command line of every process this user owns, and none for another user's, which then cannot
+# match), and the listener on its port. Returns what is still there at the deadline: no survivors and
+# Listening false when all is well. The child stops gracefully once it notices the parent has gone,
+# and a backend still initialising waits out BackendLifecycle's 15 s grace period first, so the
+# deadline has to sit above the host's 30 s shutdown timeout.
+function Wait-ServerGone([int] $serverPid, [int] $port, [int] $seconds = 45) {
+    $pattern = "--supervisor-pid\s+$serverPid(\s|$)"
+    $deadline = (Get-Date).AddSeconds($seconds)
+    while ($true) {
+        $left = @(Get-CimInstance Win32_Process -Filter "Name = 'NpuBridge.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProcessId -eq $serverPid -or ($_.CommandLine -and $_.CommandLine -match $pattern) })
+        $listening = Test-PortListening $port
+        if ((-not $listening -and $left.Count -eq 0) -or (Get-Date) -ge $deadline) {
+            return [pscustomobject]@{ Survivors = $left; Listening = $listening }
+        }
+        Start-Sleep -Milliseconds 250
+    }
+}
+
+function Stop-AuxServer($p, [int] $port) {
+    if (-not $p) { return }
+    if (-not $p.HasExited) {
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 1
+    }
+    # Waited out rather than slept over: the next Start-AuxServer on this port refuses to start while
+    # the previous run's child is still shutting down on it.
+    $gone = Wait-ServerGone $p.Id $port
+    if ($gone.Listening -or $gone.Survivors.Count -gt 0) {
+        Write-Host "    warning: after the aux server on port $port was stopped, listening=$($gone.Listening) and pid(s) $(($gone.Survivors | ForEach-Object ProcessId) -join ',') remain" -ForegroundColor Yellow
     }
 }
 
@@ -274,6 +318,20 @@ try {
             Start-Sleep -Seconds 2
         }
         if (-not $last -or $last.status -ne 'ready') { throw "not ready after ${ReadyTimeoutSeconds}s; last: $($last | ConvertTo-Json -Compress)" }
+
+        # What ready has to mean per backend, so a start without identity, or one whose runtime
+        # bootstrap was skipped, cannot pass as healthy (issue #15). Only phi-silica relaunches through
+        # package activation; the fake and aion run by path and must say so.
+        if ($Backend -eq 'phi-silica') {
+            if ($last.package_identity -ne $true) { throw "phi-silica is ready without package identity (package_identity=$($last.package_identity)); the relaunch through package activation did not happen" }
+            if ($last.diagnostics.bootstrap -ne 'ok') { throw "phi-silica diagnostics.bootstrap='$($last.diagnostics.bootstrap)', expected 'ok'" }
+        }
+        elseif ($last.package_identity -ne $false) { throw "$Backend reports package_identity=$($last.package_identity); only phi-silica runs with identity" }
+
+        # Every chat request below names this id: the served model is the only one accepted (D77), and
+        # it is not the backend selector (aion serves aion-instruct).
+        $script:servedModel = $last.model
+        if ([string]::IsNullOrWhiteSpace($servedModel)) { throw '/healthz carries no model id' }
         "backend=$($last.backend) model=$($last.model) identity=$($last.package_identity) loading=$($last.loading_seconds)s diagnostics=$($last.diagnostics | ConvertTo-Json -Compress)"
     }
 
@@ -294,7 +352,12 @@ try {
 
     Step 'preflight reports the whole short prompt as usable' {
         $g = Get-Json '/debug/generate' 'POST' (@{ prompt = 'Say OK.' } | ConvertTo-Json)
-        if ($null -eq $g.usable_prompt_chars) { 'backend has no preflight (capability absent)' }
+        if ($null -eq $g.usable_prompt_chars) {
+            # Aion has no GetUsablePromptLength (D66). On the two backends that do, a null here is the
+            # preflight silently gone, which is exactly what the overflow step below depends on.
+            if ($Backend -ne 'aion') { throw "usable_prompt_chars is null: $Backend advertises a prompt-length preflight, so the answer must not be missing" }
+            'backend has no preflight (capability absent)'
+        }
         elseif ($g.usable_prompt_chars -ne $g.prompt_chars) { throw "usable=$($g.usable_prompt_chars) prompt=$($g.prompt_chars)" }
         else { "usable=$($g.usable_prompt_chars) == prompt=$($g.prompt_chars)" }
     }
@@ -333,7 +396,7 @@ try {
 
     Step 'POST /v1/chat/completions (non-streaming)' {
         $body = @{
-            model    = $Backend
+            model    = $servedModel
             messages = @(
                 @{ role = 'system'; content = 'You are a terse assistant.' }
                 @{ role = 'user'; content = 'Reply with exactly the word PONG.' }
@@ -365,7 +428,7 @@ try {
 
     Step 'POST /v1/chat/completions (streaming SSE)' {
         $body = @{
-            model          = $Backend
+            model          = $servedModel
             stream         = $true
             stream_options = @{ include_usage = $true }
             messages       = @(
@@ -424,7 +487,7 @@ try {
     # Reported, not asserted -- a slow model is a finding, not a broken bridge.
     InfoStep 'measurement: streaming throughput (estimated tokens per second)' {
         $body = @{
-            model          = $Backend
+            model          = $servedModel
             stream         = $true
             max_tokens     = 128
             stream_options = @{ include_usage = $true }
@@ -450,7 +513,7 @@ try {
         $cap = 8
         $capChars = $cap * 4
         $capBody = @{
-            model          = $Backend
+            model          = $servedModel
             stream         = $true
             max_tokens     = $cap
             stream_options = @{ include_usage = $true }
@@ -475,7 +538,7 @@ try {
         $stop = 'charlie'
         $ask = 'Reply with exactly this line and nothing else: alpha bravo charlie delta'
         $stopBody = @{
-            model    = $Backend
+            model    = $servedModel
             stream   = $true
             stop     = $stop
             messages = @(@{ role = 'user'; content = $ask })
@@ -491,7 +554,7 @@ try {
         # A control run of the same prompt without the cut, so the detail can say whether there was
         # anything to truncate. A model that never emits the stop string would satisfy the assertion
         # above without the feature doing any work, and that is worth knowing rather than assuming.
-        $controlBody = @{ model = $Backend; stream = $true; messages = @(@{ role = 'user'; content = $ask }) } | ConvertTo-Json -Depth 5
+        $controlBody = @{ model = $servedModel; stream = $true; messages = @(@{ role = 'user'; content = $ask }) } | ConvertTo-Json -Depth 5
         $control = Invoke-Sse '/v1/chat/completions' $controlBody
         $confirmed = $control.StatusCode -eq 200 -and $control.Content.Contains($stop)
         $evidence = if ($confirmed) {
@@ -517,8 +580,8 @@ try {
             @{ role = 'system'; content = 'You are a terse assistant.' }
             @{ role = 'user'; content = $prompt }
         )
-        $json = Get-Json '/v1/chat/completions' 'POST' (@{ model = $Backend; temperature = 0; messages = $messages } | ConvertTo-Json -Depth 5)
-        $sse = Invoke-Sse '/v1/chat/completions' (@{ model = $Backend; temperature = 0; stream = $true; messages = $messages } | ConvertTo-Json -Depth 5)
+        $json = Get-Json '/v1/chat/completions' 'POST' (@{ model = $servedModel; temperature = 0; messages = $messages } | ConvertTo-Json -Depth 5)
+        $sse = Invoke-Sse '/v1/chat/completions' (@{ model = $servedModel; temperature = 0; stream = $true; messages = $messages } | ConvertTo-Json -Depth 5)
         if ($sse.StatusCode -ne 200 -or -not $sse.Done) { throw "stream: HTTP $($sse.StatusCode), done=$($sse.Done)" }
 
         $jsonText = $json.choices[0].message.content
@@ -551,14 +614,14 @@ try {
         $q2 = 'Name a different primary colour, again with just the colour.'
         $h0 = Get-Json '/healthz'
 
-        $first = Invoke-Sse '/v1/chat/completions' (@{ model = $Backend; stream = $true; temperature = 0; messages = @(@{ role = 'user'; content = $q1 }) } | ConvertTo-Json -Depth 5)
+        $first = Invoke-Sse '/v1/chat/completions' (@{ model = $servedModel; stream = $true; temperature = 0; messages = @(@{ role = 'user'; content = $q1 }) } | ConvertTo-Json -Depth 5)
         if ($first.StatusCode -ne 200 -or -not $first.Done -or $first.ErrorFrames.Count -gt 0) { throw "first turn: HTTP $($first.StatusCode) done=$($first.Done) errors=$($first.ErrorFrames.Count)" }
         $reply = $first.Content
         $h1 = Get-Json '/healthz'
         if ($h1.context_cache_misses -ne $h0.context_cache_misses + 1 -or $h1.context_cache_hits -ne $h0.context_cache_hits) { throw "first turn: hits $($h0.context_cache_hits)->$($h1.context_cache_hits) misses $($h0.context_cache_misses)->$($h1.context_cache_misses); a new conversation must miss exactly once" }
         if ($h1.contexts_cached -ne [Math]::Min($h0.contexts_cached + 1, $h0.context_cache_capacity)) { throw "contexts_cached went $($h0.contexts_cached) -> $($h1.contexts_cached) after a completed generation (capacity $($h0.context_cache_capacity)); expected one more, or the bound" }
 
-        $continue = @{ model = $Backend; stream = $true; temperature = 0; messages = @(
+        $continue = @{ model = $servedModel; stream = $true; temperature = 0; messages = @(
             @{ role = 'user'; content = $q1 }
             @{ role = 'assistant'; content = $reply }
             @{ role = 'user'; content = $q2 }
@@ -569,7 +632,7 @@ try {
         if ($h2.context_cache_hits -ne $h1.context_cache_hits + 1 -or $h2.context_cache_misses -ne $h1.context_cache_misses) { throw "continuation: hits $($h1.context_cache_hits)->$($h2.context_cache_hits) misses $($h1.context_cache_misses)->$($h2.context_cache_misses); the continuation of a cached conversation must hit" }
         if ($h2.contexts_cached -ne $h1.contexts_cached) { throw "contexts_cached went $($h1.contexts_cached) -> $($h2.contexts_cached) on a hit; checkout and store back must leave it unchanged" }
 
-        $control = @{ model = $Backend; stream = $true; temperature = 0; messages = @(
+        $control = @{ model = $servedModel; stream = $true; temperature = 0; messages = @(
             @{ role = 'user'; content = $q1 }
             @{ role = 'assistant'; content = "$reply (edited)" }
             @{ role = 'user'; content = $q2 }
@@ -603,7 +666,7 @@ try {
             $messages.Add(@{ role = 'assistant'; content = "Noted ${i}." })
         }
         $messages.Add(@{ role = 'user'; content = 'Reply with exactly the word PONG.' })
-        $body = @{ model = $Backend; temperature = 0; messages = $messages.ToArray() } | ConvertTo-Json -Depth 5
+        $body = @{ model = $servedModel; temperature = 0; messages = $messages.ToArray() } | ConvertTo-Json -Depth 5
         $chars = ($messages | ForEach-Object { $_.content.Length } | Measure-Object -Sum).Sum
         $lines = [System.Collections.Generic.List[string]]::new()
         $lines.Add("asked: $($messages.Count) messages, $chars characters of content, preflight=$hasPreflight")
@@ -647,7 +710,7 @@ try {
             $lines.Add("--truncate-history server: HTTP 200 after $($sw.ElapsedMilliseconds) ms, x-npu-bridge-truncated-turns=$dropped, finish=$($c.choices[0].finish_reason), prompt_tokens=$($c.usage.prompt_tokens), reply='$($text.Trim().Substring(0, [Math]::Min(60, $text.Trim().Length)))'")
         }
         finally {
-            Stop-AuxServer $aux
+            Stop-AuxServer $aux $auxPort
         }
 
         $lines -join "`n"
@@ -676,7 +739,7 @@ try {
         # Cross-check only, from a second, separate generation through the real endpoint. Deliberately
         # not folded into the ratio above: two different replies of different lengths would measure
         # that difference, not the estimate-vs-callbacks question this step exists to answer.
-        $chatBody = @{ model = $Backend; messages = @(@{ role = 'user'; content = $prompt }) } | ConvertTo-Json -Depth 5
+        $chatBody = @{ model = $servedModel; messages = @(@{ role = 'user'; content = $prompt }) } | ConvertTo-Json -Depth 5
         $c = Get-Json '/v1/chat/completions' 'POST' $chatBody
         $crossCheck = if ($c.choices[0].finish_reason -eq 'stop') {
             "usage.completion_tokens=$($c.usage.completion_tokens) for a $($c.choices[0].message.content.Length)-char reply"
@@ -708,7 +771,7 @@ not a recollection.
         $system = 'You are Ada. Always answer with exactly the two words: I am Ada.'
         $question = 'What is your name?'
         $chatBody = @{
-            model    = $Backend
+            model    = $servedModel
             messages = @(
                 @{ role = 'system'; content = $system }
                 @{ role = 'user'; content = $question }
@@ -719,6 +782,7 @@ not a recollection.
         $lines.Add("asked (both placements, server restarted between them): system=`"$system`" user=`"$question`"")
 
         $nativeUnsupported = $false
+        $failures = [System.Collections.Generic.List[string]]::new()
         foreach ($placement in 'native', 'prompt') {
             $auxProc = $null
             try {
@@ -742,11 +806,17 @@ not a recollection.
                 $lines.Add("$placement -> got: '$($text.Trim())' obeyed=$obeyed")
             } catch {
                 $lines.Add("$placement -> error: $($_.Exception.Message)")
+                $failures.Add($placement)
             } finally {
-                Stop-AuxServer $auxProc
+                Stop-AuxServer $auxProc $auxPort
             }
         }
 
+        if ($failures.Count -gt 0) {
+            # A run that did not answer 200 (D50's aion-native refusal excepted above) is a server that
+            # failed to start under a supported option, or a request that failed on it: a defect.
+            Fail (($lines + "verdict: the $($failures -join ' and ') run(s) failed; see the error line(s) above") -join "`n")
+        }
         if ($nativeUnsupported) {
             $lines.Add('verdict: only folded placement exists on this backend; the "prompt" line above is whether the model obeys a system prompt rendered into the prompt body, which is the placement auto selects for it.')
         }
@@ -772,8 +842,8 @@ not a recollection.
         $prompt = 'Write a detailed essay of at least 400 words about the history of computing.'
         $earlyCap = 4                   # 16 characters: the cut fires on the first delta or two
         $lateCap = 64                   # 256 characters: enough decode to time, nowhere near the essay
-        $lateBody = @{ model = $Backend; stream = $true; max_tokens = $lateCap; messages = @(@{ role = 'user'; content = $prompt }) } | ConvertTo-Json -Depth 5
-        $earlyBody = @{ model = $Backend; stream = $true; max_tokens = $earlyCap; messages = @(@{ role = 'user'; content = $prompt }) } | ConvertTo-Json -Depth 5
+        $lateBody = @{ model = $servedModel; stream = $true; max_tokens = $lateCap; messages = @(@{ role = 'user'; content = $prompt }) } | ConvertTo-Json -Depth 5
+        $earlyBody = @{ model = $servedModel; stream = $true; max_tokens = $earlyCap; messages = @(@{ role = 'user'; content = $prompt }) } | ConvertTo-Json -Depth 5
 
         $uncapped = Invoke-Sse '/v1/chat/completions' $lateBody
         if ($uncapped.StatusCode -ne 200) { throw "control (max_tokens=$lateCap): HTTP $($uncapped.StatusCode): $($uncapped.Body)" }
@@ -831,18 +901,20 @@ not a recollection.
 
     # --- measurement 4: how long does an over-length prompt take to be refused, and how? -----------
     InfoStep 'measurement: over-length prompt -- verdict latency and where the verdict lands (D52)' {
-        # StreamingOptions.DefaultFirstKeepAliveDelay. Not settable from the command line, so this is
-        # the number shipped code uses. D52 turns on which side of it the verdict lands: the streaming
-        # path writes nothing until the first token or the first keep-alive, and once a keep-alive has
-        # committed the headers a failure can only travel as an in-stream error frame.
-        $firstKeepAliveMs = 1000
+        # StreamingOptions.DefaultFirstKeepAliveDelay, as the running server reports it on /healthz: the
+        # number shipped code uses, not a copy of it that could drift. D52 turns on which side of it
+        # the verdict lands: the streaming path writes nothing until the first token or the first
+        # keep-alive, and once a keep-alive has committed the headers a failure can only travel as an
+        # in-stream error frame.
+        $firstKeepAliveMs = (Get-Json '/healthz').first_keep_alive_ms
+        if ($null -eq $firstKeepAliveMs) { Fail '/healthz carries no first_keep_alive_ms, so the D52 margin cannot be read off the server' }
 
         # As big as is cheap to build rather than marginal, so the verdict is unambiguous. The last line
         # is short on purpose: the fake backend echoes it, and a backend with no context window would
         # otherwise answer with a megabyte of JSON.
         $filler = 'The quick brown fox jumps over the lazy dog. ' * 5000
         $prompt = "$filler`nSummarize the text above in one sentence."
-        $body = @{ model = $Backend; stream = $true; messages = @(@{ role = 'user'; content = $prompt }) } | ConvertTo-Json -Depth 5
+        $body = @{ model = $servedModel; stream = $true; messages = @(@{ role = 'user'; content = $prompt }) } | ConvertTo-Json -Depth 5
 
         $lines = [System.Collections.Generic.List[string]]::new()
         $lines.Add("asked: one user message of $($prompt.Length) chars on the streaming path")
@@ -870,7 +942,11 @@ not a recollection.
                 "uncomfortable: the verdict uses more than half of the ${firstKeepAliveMs} ms first keep-alive, so a slower run would commit the headers and lose the status; raise the default"
             }
             else {
-                "exceeded: the verdict took longer than the ${firstKeepAliveMs} ms first keep-alive, yet the status still arrived -- check the keep-alive path, this should not happen"
+                # Not a contradiction, though it reads like one: the keep-alive timer starts only once a
+                # generation is being waited on, after the cache lookup and the preflight, so a refusal
+                # the preflight took this long over still lands as a status. The streaming tests prove the
+                # timer commits the headers; this number says how slow the preflight verdict was.
+                "exceeded: the status arrived after $verdictMs ms, past the ${firstKeepAliveMs} ms first keep-alive; the verdict came from the preflight, which runs before the keep-alive timer exists, so this measures preflight latency rather than the header deferral"
             }
             $lines.Add("margin: $margin")
         }
@@ -909,11 +985,47 @@ not a recollection.
         $lines -join "`n"
     }
 } finally {
-    if ($proc -and -not $proc.HasExited) {
-        # Stopping the by-path process stops the activated instance it supervises (D37).
-        Write-Host "Stopping server (pid $($proc.Id))"
-        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 1
+    if ($proc) {
+        # Stopping the by-path process stops the activated instance it supervises (D37). That half of
+        # the contract went unchecked on every run until now. On phi-silica the child must be there
+        # before the stop, found by the contract itself (--supervisor-pid <our pid> on its command
+        # line), and nothing of either process may survive it; on the fake and aion there is no child,
+        # so the check is the parent and the port. Runs whether the parent was stopped here or had
+        # already exited on its own (issue #15). -NoStart started nothing and checks nothing.
+        $teardown = if ($Backend -eq 'phi-silica') { 'teardown: the parent and its activated child exit and the port frees' } else { 'teardown: the server exits and the port frees' }
+        $childPattern = "--supervisor-pid\s+$($proc.Id)(\s|$)"
+        $childrenBefore = @(Get-CimInstance Win32_Process -Filter "Name = 'NpuBridge.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and $_.CommandLine -match $childPattern } | ForEach-Object ProcessId)
+
+        if ($proc.HasExited) {
+            Write-Host "Server (pid $($proc.Id)) had already exited with code $($proc.ExitCode)"
+        }
+        else {
+            Write-Host "Stopping server (pid $($proc.Id))"
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        }
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $gone = Wait-ServerGone $proc.Id $Port
+        $sw.Stop()
+        $elapsed = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
+
+        $problems = [System.Collections.Generic.List[string]]::new()
+        if ($Backend -eq 'phi-silica' -and $childrenBefore.Count -eq 0) { $problems.Add("no activated child carrying --supervisor-pid $($proc.Id) existed before the stop") }
+        if ($gone.Listening) { $problems.Add("port $Port still listening after $elapsed s") }
+        if ($gone.Survivors.Count -gt 0) { $problems.Add("NpuBridge pid(s) $(($gone.Survivors | ForEach-Object ProcessId) -join ',') still alive after $elapsed s") }
+
+        if ($problems.Count -gt 0) {
+            $detail = $problems -join '; '
+            $results.Add([pscustomobject]@{ Step = $teardown; Result = 'FAIL'; Detail = $detail })
+            Write-Host "    FAIL $detail" -ForegroundColor Red
+        }
+        else {
+            $child = if ($childrenBefore.Count -gt 0) { " and child pid $($childrenBefore -join ',')" } else { '' }
+            $detail = "pid $($proc.Id)$child gone and port $Port free after $elapsed s"
+            $results.Add([pscustomobject]@{ Step = $teardown; Result = 'PASS'; Detail = $detail })
+            Write-Host "    PASS $detail" -ForegroundColor Green
+        }
     }
 }
 

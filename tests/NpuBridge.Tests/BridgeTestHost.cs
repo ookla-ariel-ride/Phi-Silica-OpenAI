@@ -16,11 +16,12 @@ internal sealed class BridgeTestHost : IAsyncDisposable
 {
     private readonly WebApplication _app;
 
-    private BridgeTestHost(WebApplication app, HttpClient client, ILanguageModelBackend backend)
+    private BridgeTestHost(WebApplication app, HttpClient client, ILanguageModelBackend backend, RequestLedger requests)
     {
         _app = app;
         Client = client;
         Backend = backend;
+        Requests = requests;
     }
 
     public HttpClient Client { get; }
@@ -28,6 +29,13 @@ internal sealed class BridgeTestHost : IAsyncDisposable
     public ILanguageModelBackend Backend { get; }
 
     public FakeBackend Fake => (FakeBackend)Backend;
+
+    /// <summary>
+    /// Every request that ran the whole pipeline, and every exception that escaped it. A handler that
+    /// dies mid-stream is invisible to a client that has already gone and to the log's Error level
+    /// (TestServer has no Kestrel to log it), so this is how a test says "the request ended quietly".
+    /// </summary>
+    public RequestLedger Requests { get; }
 
     public BackendLifecycle Lifecycle => _app.Services.GetRequiredService<BackendLifecycle>();
 
@@ -97,6 +105,23 @@ internal sealed class BridgeTestHost : IAsyncDisposable
         builder.Services.AddNpuBridgeCore(options, _ => backend);
 
         var app = builder.Build();
+        var requests = new RequestLedger();
+        app.Use(async (context, next) =>
+        {
+            try
+            {
+                await next(context);
+            }
+            catch (Exception ex)
+            {
+                requests.Record(ex);
+                throw;
+            }
+            finally
+            {
+                requests.Record(null);
+            }
+        });
         app.Use((context, next) =>
         {
             context.Connection.RemoteIpAddress = remoteAddress;
@@ -105,7 +130,7 @@ internal sealed class BridgeTestHost : IAsyncDisposable
         app.MapNpuBridge();
         await app.StartAsync();
 
-        var host = new BridgeTestHost(app, app.GetTestClient(), backend);
+        var host = new BridgeTestHost(app, app.GetTestClient(), backend, requests);
         if (waitForReady)
         {
             await host.Lifecycle.Initialization;
@@ -119,6 +144,42 @@ internal sealed class BridgeTestHost : IAsyncDisposable
         Client.Dispose();
         await _app.StopAsync();
         await _app.DisposeAsync();
+    }
+}
+
+/// <summary>What the pipeline middleware in <see cref="BridgeTestHost"/> saw: see <see cref="BridgeTestHost.Requests"/>.</summary>
+internal sealed class RequestLedger
+{
+    private readonly List<Exception> _escaped = new();
+    private int _completed;
+
+    /// <summary>Requests whose pipeline has returned, however they ended.</summary>
+    public int Completed => Volatile.Read(ref _completed);
+
+    /// <summary>Exceptions that left the pipeline, in order. Empty is the claim most tests make.</summary>
+    public IReadOnlyList<Exception> Escaped
+    {
+        get
+        {
+            lock (_escaped)
+            {
+                return _escaped.ToArray();
+            }
+        }
+    }
+
+    internal void Record(Exception? escaped)
+    {
+        if (escaped is null)
+        {
+            Interlocked.Increment(ref _completed);
+            return;
+        }
+
+        lock (_escaped)
+        {
+            _escaped.Add(escaped);
+        }
     }
 }
 
@@ -138,6 +199,9 @@ internal sealed class CapturingLoggerProvider : ILoggerProvider
         }
     }
 
+    /// <summary>Called synchronously on the logging thread for every record, so a test can act inside the window a log line marks.</summary>
+    public Action<LogRecord>? OnRecord { get; set; }
+
     public ILogger CreateLogger(string categoryName) => new Capturing(this, categoryName);
 
     public void Dispose()
@@ -150,6 +214,8 @@ internal sealed class CapturingLoggerProvider : ILoggerProvider
         {
             _records.Add(record);
         }
+
+        OnRecord?.Invoke(record);
     }
 
     internal sealed record LogRecord(string Category, LogLevel Level, string Message);

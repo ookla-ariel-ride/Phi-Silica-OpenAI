@@ -825,4 +825,32 @@ public class ChatCompletionsTests
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         return doc.RootElement.Clone();
     }
+
+    /// <summary>
+    /// The converters' error arms. A <c>content</c> or <c>stop</c> of the wrong JSON type, and a body
+    /// that is the literal <c>null</c>, are the client's fault: each is the 400 envelope with all four
+    /// keys, never a 500 from an exception escaping deserialization.
+    /// </summary>
+    [Theory]
+    [InlineData("{\"model\":\"fake\",\"messages\":[{\"role\":\"user\",\"content\":42}]}", "content must be a string")]
+    [InlineData("{\"model\":\"fake\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stop\":42}", "stop must be a string")]
+    [InlineData("{\"model\":\"fake\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stop\":[\"a\",42]}", "stop array entries must be strings")]
+    [InlineData("null", "Request body is required")]
+    public async Task A_wrongly_typed_content_or_stop_or_a_null_body_is_a_400_with_the_envelope(string json, string expectedMessage)
+    {
+        var fake = new FakeBackend();
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        var response = await host.Client.PostAsync(Path, content);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var error = (await ReadJson(response)).GetProperty("error");
+        Assert.Equal("invalid_request_error", error.GetProperty("type").GetString());
+        Assert.Contains(expectedMessage, error.GetProperty("message").GetString(), StringComparison.Ordinal);
+        Assert.True(error.TryGetProperty("param", out _), "param is written even when null (D77)");
+        Assert.True(error.TryGetProperty("code", out _), "code is written even when null (D77)");
+        Assert.Empty(fake.Calls);
+        host.AssertNoLeak();
+    }
 }

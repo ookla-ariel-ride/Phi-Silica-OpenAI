@@ -920,4 +920,175 @@ public class ChatCompletionsStreamingTests
 
     private static IEnumerable<string> Lines(string body) =>
         body.Split('\n').Where(l => l.Length > 0);
+
+    /// <summary>
+    /// A non-positive interval disables keep-alive comments outright, which also removes the only
+    /// thing that commits the headers before the first delta. Two proofs, neither a clock. The
+    /// ordering: the generation has started and the client still has no headers. And the body: with
+    /// a zero first delay the disabling branch is the only thing standing between the loop and
+    /// <c>Task.Delay(TimeSpan.Zero)</c>, which completes at once, so were the branch missing the very
+    /// first wait would write a comment before the gate could open; a negative interval would throw
+    /// there instead. Either way a body with no comment is not luck.
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-5)]
+    public async Task A_non_positive_keep_alive_interval_disables_the_comments_and_the_headers_wait_for_the_first_delta(int intervalMs)
+    {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["Hello"], FirstTokenGate = gate });
+        await using var host = await BridgeTestHost.StartAsync(fake,
+            keepAliveInterval: TimeSpan.FromMilliseconds(intervalMs),
+            firstKeepAliveDelay: TimeSpan.Zero);
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, Path)
+        {
+            Content = JsonContent.Create(Body(model: "fake", stream: true)),
+        };
+        var send = host.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+
+        // The backend is generating, held at its gate, and nothing has committed the headers.
+        await WaitUntilAsync(() => fake.Calls.Count == 1);
+        Assert.False(send.IsCompleted, "the headers were committed before the first delta although keep-alives are disabled");
+
+        gate.SetResult();
+        using var response = await send;
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.DoesNotContain(": keep-alive", body, StringComparison.Ordinal);
+        Assert.StartsWith("data: ", body, StringComparison.Ordinal);
+        Assert.EndsWith("data: [DONE]\n\n", body, StringComparison.Ordinal);
+        host.AssertNoLeak();
+    }
+
+    /// <summary>
+    /// A non-positive first delay falls back to the interval rather than reaching <c>Task.Delay</c>
+    /// with it: a negative span other than the infinite sentinel throws there, and the request would
+    /// fail before its first frame. With the fallback the first keep-alive commits the headers as
+    /// usual. What this cannot pin is that the fallback is the interval and not some other positive
+    /// delay; that needs the keep-alive delays driven by the injected <see cref="TimeProvider"/>, which
+    /// is filed rather than done here.
+    /// </summary>
+    [Fact]
+    public async Task A_non_positive_first_keep_alive_delay_falls_back_to_the_interval()
+    {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["Hello"], FirstTokenGate = gate });
+        await using var host = await BridgeTestHost.StartAsync(fake,
+            keepAliveInterval: TimeSpan.FromMilliseconds(20),
+            firstKeepAliveDelay: TimeSpan.FromMilliseconds(-5));
+
+        using var guard = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var request = new HttpRequestMessage(HttpMethod.Post, Path)
+        {
+            Content = JsonContent.Create(Body(model: "fake", stream: true)),
+        };
+
+        // Completes on the first keep-alive, while the backend is still held at its gate.
+        using var response = await host.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, guard.Token);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("text/event-stream", response.Content.Headers.ContentType?.MediaType);
+
+        gate.SetResult();
+        var body = await response.Content.ReadAsStringAsync(guard.Token);
+        Assert.Contains(": keep-alive", body, StringComparison.Ordinal);
+        Assert.EndsWith("data: [DONE]\n\n", body, StringComparison.Ordinal);
+        host.AssertNoLeak();
+    }
+
+    /// <summary>
+    /// The exit once the client has gone. The stream is open, the generation failed, and nobody is
+    /// there to read the error frame. <c>FailAsync</c> has two arms for that: skip the write when the
+    /// abort has already been observed, or swallow the write's failure when it has not. Which one runs
+    /// depends on when the host signals <c>RequestAborted</c> relative to the write, and TestServer
+    /// completes the response pipe before it signals the token, so the branch taken is a race; the
+    /// contract is not. This pins the contract: nothing reaches the client, the request ends without
+    /// an exception escaping the pipeline, and the context is disposed. The window is opened on
+    /// purpose: the per-request log line is written between classifying the failure and reporting it,
+    /// and the capturing logger aborts the client the moment it sees it. The first delta is read off
+    /// the wire before the failure is allowed to fire, because an aborted TestServer response discards
+    /// whatever was still buffered.
+    /// </summary>
+    [Fact]
+    public async Task A_failure_after_the_client_has_gone_reaches_nobody_and_still_disposes_the_context()
+    {
+        using var release = new ManualResetEventSlim();
+        IEnumerable<string> Tokens()
+        {
+            yield return "one ";
+
+            // Held until the test has read the first delta; the injected failure fires right after. A
+            // stall is a broken test, never a scenario that quietly goes on without the read.
+            if (!release.Wait(TimeSpan.FromSeconds(10)))
+            {
+                throw new TimeoutException("the test never read the first delta off the wire");
+            }
+
+            yield return "two";
+        }
+
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => Tokens(),
+            FailAfterTokens = 1,
+            FailureStatus = GenerationStatus.Error,
+        });
+        var capture = new CapturingLoggerProvider();
+        await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture);
+
+        using var cts = new CancellationTokenSource();
+        capture.OnRecord = record =>
+        {
+            // The line the handler writes between classifying the Error and reporting it.
+            if (record.Message.Contains("status=Error", StringComparison.Ordinal))
+            {
+                cts.Cancel();
+            }
+        };
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, Path)
+        {
+            Content = JsonContent.Create(Body(model: "fake", stream: true)),
+        };
+        using var response = await host.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var received = new System.Text.StringBuilder();
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cts.Token);
+            var buffer = new byte[4096];
+            int read;
+            while ((read = await stream.ReadAsync(buffer, cts.Token)) > 0)
+            {
+                received.Append(System.Text.Encoding.UTF8.GetString(buffer, 0, read));
+                if (received.ToString().Contains("one ", StringComparison.Ordinal))
+                {
+                    // The delta is in hand; now let the generation fail.
+                    release.Set();
+                }
+            }
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or IOException or HttpRequestException)
+        {
+            // The client's own cancellation, surfacing through the response stream.
+        }
+
+        // The request has run to the end of the pipeline: disposal alone would not say that.
+        await WaitUntilAsync(() => host.Requests.Completed == 1);
+        Assert.Empty(host.Requests.Escaped);
+        Assert.Equal(1, fake.ContextsCreated);
+        Assert.Equal(1, fake.ContextsDisposed);
+        Assert.Equal(0, host.Cache.Count);
+
+        // The failure was classified with the stream open (http=200 is "the status line was spent"),
+        // and the client saw the delta and nothing after it.
+        var line = Assert.Single(capture.Records, r => r.Message.Contains("status=Error", StringComparison.Ordinal));
+        Assert.Contains("http=200", line.Message, StringComparison.Ordinal);
+        Assert.Contains("one ", received.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("\"error\"", received.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("[DONE]", received.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(capture.Records, r => r.Level >= LogLevel.Error);
+    }
 }

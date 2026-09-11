@@ -124,7 +124,7 @@ generation's status instead, and with `--truncate-history` the bridge retries af
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/chat/completions` | chat completions, streaming and non-streaming |
-| `GET /healthz` | backend state, load time, package identity, the context cache's count and hit/miss counters, diagnostics. 200 when ready, 503 otherwise |
+| `GET /healthz` | backend state, load time, package identity, the context cache's count and hit/miss counters, the streaming keep-alive timings, diagnostics. 200 when ready, 503 otherwise |
 | `GET /v1/models`, `GET /v1/models/{id}` | the active model id |
 | `POST /debug/generate` | one literal prompt into the backend with timing. Diagnostic, loopback only |
 

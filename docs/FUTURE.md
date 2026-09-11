@@ -36,6 +36,13 @@ gaps, the smoke script's vacuous steps and missing hardware checks, and a CI job
 with the fake backend (blocked on an ARM64 runner). See the three `tech-debt` and `enhancement`
 issues filed that day. `coverlet.collector` is now in the test project; run
 `dotnet test --collect:"XPlat Code Coverage"` for the report.
+The first six unit tests and the smoke script's first three items landed on 2026-09-11 (D79); the
+rest of both issues stays open, as does the CI job.
+- **Keep-alive waits driven by the injected `TimeProvider`.** `WaitForFirstDeltaAsync` calls
+  `Task.Delay` on the wall clock, so a test can prove a non-positive first delay falls back to
+  *some* positive delay but not that it falls back to the interval, and the disabled-interval test
+  leans on `Task.Delay(TimeSpan.Zero)` completing at once. `Task.Delay(TimeSpan, TimeProvider, ...)`
+  with a fake time provider would let both tests pin the exact delay requested (from the D79 reviews).
 
 ## Chunk 5 deferrals (context cache and overflow handling)
 

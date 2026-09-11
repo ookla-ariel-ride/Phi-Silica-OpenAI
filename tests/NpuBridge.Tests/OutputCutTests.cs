@@ -852,4 +852,31 @@ public class OutputCutTests
             await Task.Delay(10);
         }
     }
+
+    /// <summary>
+    /// The newer field on its own. <c>max_completion_tokens</c> without <c>max_tokens</c> is the shape
+    /// current OpenAI clients send, and it has to cap exactly as the deprecated field does. The body
+    /// is built here rather than by <see cref="Body"/>, which would still serialise
+    /// <c>"max_tokens": null</c>: the point is a request in which the old field does not appear at all.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Max_completion_tokens_alone_caps_the_reply_like_max_tokens_does(bool stream)
+    {
+        await using var host = await StartAsync(Reply);
+
+        var completion = await CompleteAsync(host, stream, new
+        {
+            model = "fake",
+            stream,
+            stream_options = stream ? new { include_usage = true } : null,
+            max_completion_tokens = 2,
+            messages = new[] { new { role = "user", content = "say hi" } },
+        });
+
+        Assert.Equal("Hello, w", completion.Content);
+        Assert.Equal("length", completion.FinishReason);
+        Assert.Equal(2, completion.CompletionTokens);
+    }
 }

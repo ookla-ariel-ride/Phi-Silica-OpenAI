@@ -32,6 +32,8 @@ public class HealthzTests
         Assert.Equal(4, json.GetProperty("context_cache_capacity").GetInt32());
         Assert.Equal(0, json.GetProperty("context_cache_hits").GetInt64());
         Assert.Equal(0, json.GetProperty("context_cache_misses").GetInt64());
+        Assert.Equal(1000, json.GetProperty("first_keep_alive_ms").GetInt32());
+        Assert.Equal(15000, json.GetProperty("keep_alive_interval_ms").GetInt32());
         Assert.False(json.GetProperty("first_run_compile_likely").GetBoolean());
         Assert.False(json.TryGetProperty("error", out _), "error should be omitted when null");
         Assert.True(json.GetProperty("diagnostics").GetProperty("fake").GetBoolean());
@@ -133,5 +135,23 @@ public class HealthzTests
         Assert.Equal("application/json", response.Content.Headers.ContentType?.MediaType);
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         return doc.RootElement.Clone();
+    }
+
+    /// <summary>
+    /// The keep-alive timings are read from the registered <c>StreamingOptions</c>, not from the
+    /// defaults: <c>scripts/smoke.ps1</c> reads them off the running server so its D52 margin cannot
+    /// drift from the number the code uses, and that only holds if the endpoint reports what is live.
+    /// </summary>
+    [Fact]
+    public async Task Keep_alive_timings_report_the_registered_streaming_options()
+    {
+        await using var host = await BridgeTestHost.StartAsync(
+            keepAliveInterval: TimeSpan.FromMilliseconds(20),
+            firstKeepAliveDelay: TimeSpan.FromMilliseconds(7));
+
+        var json = await ReadJson(await host.Client.GetAsync("/healthz"));
+
+        Assert.Equal(7, json.GetProperty("first_keep_alive_ms").GetInt32());
+        Assert.Equal(20, json.GetProperty("keep_alive_interval_ms").GetInt32());
     }
 }

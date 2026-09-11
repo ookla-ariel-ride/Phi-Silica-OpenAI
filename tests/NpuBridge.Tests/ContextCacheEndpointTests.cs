@@ -439,4 +439,59 @@ public class ContextCacheEndpointTests
         Assert.Contains("[Assistant]\nclient-side", hit.Prompt, StringComparison.Ordinal);
         Assert.DoesNotContain("one", hit.Prompt, StringComparison.Ordinal);
     }
+
+    /// <summary>
+    /// The exception arm on a hit. A backend that throws mid-generation on a context checked out of
+    /// the cache is the same 502 (or error frame) it is on a fresh one, the per-request line says the
+    /// context was a hit, and the context is disposed rather than returned: the cache never holds a
+    /// context whose generation ended in anything but Complete (D72).
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task An_exception_mid_generation_on_a_cached_context_is_a_502_that_disposes_it(bool stream)
+    {
+        var capture = new CapturingLoggerProvider();
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture);
+
+        await AskAsync(host, stream: false, Msg("user", "hi"));
+        Assert.Equal(1, host.Cache.Count);
+
+        fake.Options.FailAfterTokens = 1;
+        fake.Options.FailureException = new InvalidOperationException("runtime went away");
+        fake.Options.Responder = _ => ["o", "k"];
+        var response = await host.Client.PostAsJsonAsync(Path, new
+        {
+            model = "fake",
+            stream,
+            messages = new[] { Msg("user", "hi"), Msg("assistant", "ok"), Msg("user", "more") },
+        });
+        var body = await response.Content.ReadAsStringAsync();
+
+        if (stream)
+        {
+            // One delta went out, so the failure travels as the error frame before the done marker.
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.EndsWith("data: [DONE]\n\n", body, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        }
+
+        Assert.Contains("\"backend_error\"", body, StringComparison.Ordinal);
+        Assert.Contains("InvalidOperationException", body, StringComparison.Ordinal);
+
+        // It was the cached context, and it is gone.
+        Assert.Equal(1, fake.ContextsCreated);
+        Assert.Equal(fake.Calls[0].ContextId, fake.Calls[1].ContextId);
+        Assert.Equal(1, fake.ContextsDisposed);
+        Assert.Equal(0, host.Cache.Count);
+        host.AssertNoLeak();
+
+        var line = capture.Records.Last(r => r.Message.Contains("cache=", StringComparison.Ordinal));
+        Assert.Contains("cache=hit tail_turns=1", line.Message, StringComparison.Ordinal);
+        Assert.Contains("status=InvalidOperationException", line.Message, StringComparison.Ordinal);
+    }
 }

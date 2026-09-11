@@ -80,6 +80,8 @@ public sealed record HealthResponse(
     int ContextCacheCapacity,
     long ContextCacheHits,
     long ContextCacheMisses,
+    int FirstKeepAliveMs,
+    int KeepAliveIntervalMs,
     string? Error,
     IReadOnlyDictionary<string, object?> Diagnostics);
 
@@ -91,7 +93,8 @@ internal static class HealthEndpoint
         BridgeOptions options,
         IProcessIdentity identity,
         TimeProvider time,
-        ContextCache cache)
+        ContextCache cache,
+        StreamingOptions streaming)
     {
         var snapshot = lifecycle.Snapshot;
         var now = time.GetUtcNow();
@@ -120,6 +123,8 @@ internal static class HealthEndpoint
             ContextCacheCapacity: cache.Capacity,
             ContextCacheHits: cache.Hits,
             ContextCacheMisses: cache.Misses,
+            FirstKeepAliveMs: (int)streaming.FirstKeepAliveDelay.TotalMilliseconds,
+            KeepAliveIntervalMs: (int)streaming.KeepAliveInterval.TotalMilliseconds,
             Error: snapshot.Error,
             Diagnostics: lifecycle.Backend.Diagnostics);
 
