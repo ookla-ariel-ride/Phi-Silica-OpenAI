@@ -5,7 +5,7 @@ below was verified at write time.
 
 ## Where things stand
 
-- `main` is at or after `dff824b`, tree clean, in sync with origin. The repository is now
+- `main` is at or after `cd4efde`, tree clean, in sync with origin. The repository is now
   `ookla-ariel-ride/npu-bridge` (renamed today; the old `Phi-Silica-OpenAI` URL redirects). The local
   folder keeps its old name on purpose: package identity is registered against the build path, and
   renaming it means `identity.ps1 -Install` again.
@@ -15,7 +15,7 @@ below was verified at write time.
 - 496 tests pass. `smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648; the
   last NPU run was on the conformance branch before its review fixes, and the fake run passed on the
   final code.
-- Open issues: #2, #3, #4, #9, #10, #11, #13. Closed today: #1, #12.
+- Open issues: #2, #3, #4, #9, #10, #11, #13, #14, #15, #16. Closed today: #1, #12.
 
 ## What this session did, in order
 
@@ -38,6 +38,12 @@ below was verified at write time.
 5. Six decisions taken by the owner, one at a time (see below); two new issues filed; #12 then
    closed by evidence. The README validated again, given its real layout, two diagrams and a
    references section.
+6. A test coverage audit by three subagents (options against tests, the uncovered lines of a
+   coverlet report, the smoke script). Core: 94.2 % lines, 89.8 % branches over 496 tests; the exe
+   has no unit coverage by construction. Filed as #14 (unit and TestServer gaps, twelve tests named),
+   #15 (the smoke script's vacuous steps, nine additions, a manual checklist) and #16 (a CI job that
+   runs the exe with the fake backend, blocked on an ARM64 runner). `coverlet.collector` is in the
+   test project: `dotnet test --collect:"XPlat Code Coverage"`.
 
 ## Decisions the owner made today
 
@@ -55,6 +61,10 @@ below was verified at write time.
 
 ## Do this next
 
+0. Cheap first: issue #15's first three items (the teardown assertion that the activated child
+   exited and the port freed, `package_identity` and preflight assertions in the readiness step,
+   the never-fail measurements promoted to failures), then issue #14's first six tests. About two
+   hours together, and they remove the smoke script's vacuous passes.
 1. Issue #13. Measure first: tokenize the two prompts D55 and D75 give (the fox filler that fits at
    13,429 characters, the smoke transcript that fits at 13,179) with `LlamaTokenizer` over
    Phi-3.5-mini's `tokenizer.model`. If both land on the same token count within a few tokens, adopt
@@ -118,8 +128,8 @@ below was verified at write time.
 
 ```powershell
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\Phi-Silica-OpenAI
-git status; git log --oneline -3                          # expect main at or after dff824b, tree clean
+git status; git log --oneline -3                          # expect main at or after cd4efde, tree clean
 dotnet build; dotnet test                                 # expect 496 passed
 .\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 1 skipped, 5 informational
-gh issue list                                             # #2, #3, #4, #9, #10, #11, #13 open
+gh issue list                                             # #2, #3, #4, #9, #10, #11, #13, #14, #15, #16 open
 ```

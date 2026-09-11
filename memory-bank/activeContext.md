@@ -3,7 +3,7 @@
 _Last updated: 2026-09-11, late (chunk 5 and the OpenAI conformance pass merged; repository renamed; issue #13 next)_
 
 ## Where we are
-Chunks 1 to 6 are merged on `main` (`dff824b`). Today added chunk 5 (context cache and overflow
+Chunks 1 to 6 are merged on `main` (`cd4efde`). Today added chunk 5 (context cache and overflow
 handling, D71 to D76), the OpenAI conformance pass (D77) and D78, which closed issue #12 without a
 change. Chunk 6, the Aion Instruct Preview adapter, is merged but code-verified only: build 29648
 never appends `WIN://SYSAPPID` for a main-package dynamic dependency, so the Qualcomm QNN provider
@@ -41,6 +41,10 @@ Feature Rollout with a registry key, retail in November with Phi Silica removed,
   allowlists for docs removed (notes are scanned; a full-history scan is clean).
 
 ## Open threads
+- Issues #14, #15, #16 (the 2026-09-11 coverage audit): unit and TestServer gaps, the smoke
+  script's vacuous steps and missing hardware checks, and a CI run of the exe with the fake backend.
+  Core is at 94.2 % lines and 89.8 % branches; the exe is verified only by the smoke script and a
+  few recorded manual checks. The cheap first step is #15's teardown and identity assertions.
 - Issue #13: real token counts with the Phi-3 tokenizer, measured against the preflight first. The
   SDK has no tokenizer (checked in the 2.4.4 and 2.4.8-experimental metadata). `tokenizer.model` is
   to be vendored; chars/4 stays as the fallback for Aion.
@@ -59,4 +63,5 @@ Feature Rollout with a registry key, retail in November with Phi Silica removed,
    chunk 5 section of `docs/FUTURE.md`.
 2. `dotnet build; dotnet test` (496). `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298` should
    pass every step (1 skipped, 5 informational). Do not build while a smoke server is running.
-3. Issue #13, then #9, then chunk 7 (issue #3). Read the issue and its comments before starting.
+3. Issue #15's first three items and #14's first six tests, then issue #13, then #9, then chunk 7
+   (issue #3). Read the issue and its comments before starting.
