@@ -271,22 +271,26 @@ rest of both issues stays open, as does the CI job.
 
 ## 2026-09-10 whole-project review notes
 
-Found by a read of the merged tree after chunk 4, none load-bearing, none fixed in that session:
+Found by a read of the merged tree after chunk 4, none load-bearing, none fixed in that session.
+**All three are done (issue #10, D82, 2026-09-11)**; kept here because one of them was not what it
+said it was.
 
-- **The JSON path lets a non-client cancellation escape as a bare 500.** `ChatCompletionsEndpoint`'s
-  catch excludes `OperationCanceledException`, while its streaming sibling deliberately catches one
-  (with a test) for the case where an adapter breaks the contract and lets the cut's own cancellation
-  out while the client is still connected. On the JSON path the same event is an unhandled exception:
-  HTTP 500 with no OpenAI envelope. The fake obeys the contract, so it is unreachable today; fix by
-  catching it when `http.RequestAborted` is not set and mapping it through `GenerationFailure`.
-- **`SseStream.Started` flips before the first write has succeeded.** If that write throws for a
-  reason other than the client leaving, the failure path believes the status line is spent and tries
-  to write an error frame instead of returning a plain HTTP error. `HttpResponse.HasStarted` answers
-  the actual question. Only reachable on a write failure with the client still present.
-- **`identity.ps1 -Install` removes the old registration before adding the new one.** A failing
-  `Add-AppxPackage` leaves no package registered, and the next `--backend phi-silica` start fails with
-  "no package is registered". Register first and remove the previous full name afterwards, or remove
-  only after a successful add. Not observed; every install so far has succeeded.
+- ~~**The JSON path lets a non-client cancellation escape as a bare 500.**~~ Fixed. The catch now
+  mirrors the streaming path's pair exactly: one clause filtered on `RequestAborted` that returns
+  nothing and logs `http=0`, then an unfiltered one that reports through `GenerationFailure`. One test
+  per clause, each checked against the old filter, where both fail. Reaching the client-gone clause
+  needs more arrangement than it looks — see D82.
+- ~~**`SseStream.Started` flips before the first write has succeeded.**~~ Changed, but the premise was
+  wrong, so nothing was fixed. `HttpResponse.WriteAsync` calls `StartAsync` before it writes a byte,
+  so by the time a body write or flush fails the response really has started and the old flag was
+  right about it; the two answers part only when starting the response is itself what fails.
+  `Started` is now `HasStarted`, which removes state that could contradict the response, and that is
+  all it does. See D82 — do not re-file this as a defect.
+- ~~**`identity.ps1 -Install` removes the old registration before adding the new one.**~~ Fixed: add
+  first, remove the previous package full name afterwards only if it differs. `Add-AppxPackage`
+  updates a same-identity registration in place, so a re-run after a rebuild now removes nothing;
+  verified against the live registration. Remove-then-add survives only as a fallback for a refused
+  in-place update.
 
 ## Chunk 3 review deferrals
 

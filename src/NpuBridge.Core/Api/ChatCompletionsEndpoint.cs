@@ -274,7 +274,25 @@ internal sealed class ChatCompletionsEndpoint
 
             return Results.Json(body, JsonDefaults.Options);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (http.RequestAborted.IsCancellationRequested)
+        {
+            // The client is gone, so there is nobody to hand a body to and this is not an error --
+            // the same answer the returned-Cancelled check above gives, for the thrown form. http=0
+            // says so, as it does on the streaming path. The finally still disposes.
+            ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
+                status: ex is OperationCanceledException ? nameof(GenerationStatus.Cancelled) : ex.GetType().Name,
+                finish: "-", httpStatus: 0,
+                cache: lease is null ? "-" : lease.CacheHit ? "hit" : "miss", tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns);
+            return Results.Empty;
+        }
+        // Unfiltered, so that the two clauses together really are exhaustive -- the same pair, in the
+        // same order, as the streaming path. Excluding OperationCanceledException here left the case
+        // "cancelled, but not by the client" uncaught: an adapter that breaks the
+        // ILanguageModelBackend rule about swallowing the runtime's cancellation lets one out of the
+        // cut's own linked token, RequestAborted is not set, the filter above does not match, and the
+        // request died as an unhandled exception -- HTTP 500 with no OpenAI envelope, where the stream
+        // answered the identical event with a 502 and the ordinary error body.
+        catch (Exception ex)
         {
             var failure = GenerationFailure.FromException(ex);
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,

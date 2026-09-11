@@ -545,18 +545,32 @@ internal sealed class ChatCompletionsStreamEndpoint
     }
 
     /// <summary>
-    /// The response plus one fact: whether anything has gone out on it yet. The SSE headers are set by
-    /// the first write rather than up front, so <see cref="Started"/> is exactly the question "is the
-    /// status code still mine to choose?" — the boundary the whole error story turns on.
+    /// The response, plus the SSE framing and the one-time header assignment. The headers go on with
+    /// the first write rather than up front, which is what makes <see cref="Started"/> the question
+    /// "is the status code still mine to choose?" — the boundary the whole error story turns on. The
+    /// answer is the response's, not this class's; only the "have the fields been assigned yet" book-
+    /// keeping lives here.
     /// </summary>
     private sealed class SseStream
     {
         private readonly HttpResponse _response;
+        private bool _headersPrepared;
 
         public SseStream(HttpResponse response) => _response = response;
 
-        /// <summary>True once a frame has been written, i.e. once 200 and <c>text/event-stream</c> are the answer.</summary>
-        public bool Started { get; private set; }
+        /// <summary>
+        /// True once the response has actually begun, i.e. once 200 and <c>text/event-stream</c> are
+        /// the answer and nothing can change them. The question every caller asks it is "is the status
+        /// code still mine to choose?", so it is the response's own <c>HasStarted</c> rather than a
+        /// flag this class raises when it assigns the header fields — assigning them commits nothing.
+        ///
+        /// <c>HttpResponse.WriteAsync</c> calls <c>StartAsync</c> before it writes a byte, so by the
+        /// time a body write or flush fails the response really has started, and the flag this
+        /// replaced was right about that case. The two part only when starting the response is itself
+        /// what fails — a failing response-starting callback, or an already-cancelled token, since
+        /// <c>StartAsync</c> observes one — and there this answer is the right one.
+        /// </summary>
+        public bool Started => _response.HasStarted;
 
         public Task WriteChunkAsync(ChatCompletionChunk chunk, CancellationToken cancellationToken) =>
             WriteAsync($"data: {JsonSerializer.Serialize(chunk, JsonDefaults.Options)}\n\n", cancellationToken);
@@ -567,15 +581,21 @@ internal sealed class ChatCompletionsStreamEndpoint
         /// </summary>
         public async Task WriteAsync(string frame, CancellationToken cancellationToken)
         {
-            if (!Started)
+            if (!_headersPrepared)
             {
+                // Assigned once and only while the response is still mutable. A failed first write
+                // leaves them assigned on a response that never started, which is harmless: the
+                // ordinary error result the caller returns instead overwrites the status and the
+                // content type, no-cache is right on that reply too, and the X-Accel-Buffering that
+                // survives means nothing to a proxy handling a JSON error.
+                //
                 // X-Accel-Buffering defeats nginx's response buffering, which would otherwise hold the
                 // whole stream and deliver it as one lump.
                 _response.StatusCode = StatusCodes.Status200OK;
                 _response.ContentType = "text/event-stream";
                 _response.Headers.CacheControl = "no-cache";
                 _response.Headers["X-Accel-Buffering"] = "no";
-                Started = true;
+                _headersPrepared = true;
             }
 
             await _response.WriteAsync(frame, cancellationToken).ConfigureAwait(false);

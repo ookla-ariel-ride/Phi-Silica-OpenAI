@@ -784,6 +784,121 @@ public class ChatCompletionsTests
         Assert.DoesNotContain(capture.Records, r => r.Level >= LogLevel.Error);
     }
 
+    /// <summary>
+    /// A cancellation that is not the client's, on the shape that used to let it escape. The catch
+    /// excluded <see cref="OperationCanceledException"/> outright, so "cancelled, but
+    /// <c>RequestAborted</c> is not set" matched no clause and died as an unhandled request exception:
+    /// HTTP 500 with no OpenAI envelope, where the streaming sibling answered the identical event with
+    /// a 502 and the ordinary error body. An adapter that breaks the contract about swallowing the
+    /// runtime's own cancellation produces it, and the cut's linked token makes it reachable without
+    /// the client going anywhere. The streaming counterpart is
+    /// <c>A_cancellation_that_is_not_the_clients_is_reported_rather_than_escaping</c>.
+    /// </summary>
+    [Fact]
+    public async Task A_cancellation_that_is_not_the_clients_is_reported_rather_than_escaping()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => ["Hello", " world"],
+            FailAfterTokens = 1,
+            FailureException = new OperationCanceledException("adapter let the runtime's cancellation escape"),
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync(Path, ChatBody.User());
+
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        var error = (await ReadJson(response)).GetProperty("error");
+        Assert.Equal("backend_error", error.GetProperty("code").GetString());
+        Assert.Equal("server_error", error.GetProperty("type").GetString());
+
+        Assert.Empty(host.Requests.Escaped);
+        await TestWait.UntilAsync(() => fake.ActiveContexts == 0);
+        Assert.Equal(1, fake.ContextsDisposed);
+        host.AssertNoLeak();
+    }
+
+    /// <summary>
+    /// The client-gone clause is the other half of that pair, and it must not report anything: a
+    /// request whose caller has already given up gets no body and logs <c>http=0</c>, on this shape as
+    /// on the stream. What distinguishes it from the <c>Cancelled</c>-status branch inside the try —
+    /// which a client disconnect ordinarily takes, because both real adapters and the fake *return*
+    /// that status rather than throwing (the <c>ILanguageModelBackend</c> contract requires it) — is
+    /// the logged status: <c>InvalidOperationException</c>, not <c>Cancelled</c>. Asserting that is the
+    /// only way to tell which of the two answered, and the first draft of this test did not, so it
+    /// passed against the old filter while never reaching the clause it named.
+    ///
+    /// The ordering, which is the whole difficulty: the throw has to be observed with
+    /// <c>RequestAborted</c> already set, or the request is a 502 instead. A shut
+    /// <c>CancellationGate</c> makes the fake ignore the token, so it keeps generating after the client
+    /// leaves; the responder is an iterator that parks before the failing token until this test
+    /// releases it, so the throw follows the abort instead of racing token delays against it (D54).
+    /// <c>CancelAsync</c> runs the registration TestServer uses to abort the request before it
+    /// completes, so the abort has landed by the time it returns — and the <c>http=0</c> assertion is
+    /// what proves that: without it the handler would have reported <c>http=502</c>.
+    ///
+    /// The release cannot wait for the client's task to throw, tempting though that is as a stronger
+    /// signal: TestServer does not complete the client's task while the handler is still inside the
+    /// pipeline, and the handler is parked in the responder, so waiting for it deadlocks.
+    /// </summary>
+    [Fact]
+    public async Task A_throw_after_the_client_has_gone_is_logged_as_http_zero_and_not_reported()
+    {
+        var capture = new CapturingLoggerProvider();
+        var atSecondToken = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => ParkBeforeSecondToken(atSecondToken, release),
+            // Never completed, so the generation never looks at the token: a runtime whose in-flight
+            // operation cannot be stopped on demand, which is what makes a throw-after-abort reachable.
+            CancellationGate = new TaskCompletionSource(),
+            FailAfterTokens = 1,
+            FailureException = new InvalidOperationException("backend fell over after the client left"),
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture);
+
+        using var cts = new CancellationTokenSource();
+        var post = host.Client.PostAsJsonAsync(Path, ChatBody.User(), cts.Token);
+
+        await atSecondToken.Task;
+        await cts.CancelAsync();
+
+        // Only now can the backend reach the token it fails on.
+        release.SetResult();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => post);
+
+        await TestWait.UntilAsync(() => fake.ActiveContexts == 0);
+        var line = await CapturedRequestLineAsync(capture);
+        Assert.Contains("http=0", line, StringComparison.Ordinal);
+        Assert.Contains("status=InvalidOperationException", line, StringComparison.Ordinal);
+        Assert.Empty(host.Requests.Escaped);
+        Assert.DoesNotContain(capture.Records, r => r.Level >= LogLevel.Error);
+        host.AssertNoLeak();
+    }
+
+    /// <summary>
+    /// Yields one token, then parks inside <c>MoveNext</c> until released — so the generation is held
+    /// at a point the backend reached on its own, before it looks at its cancellation token again and
+    /// before the injected failure fires. Blocking is the point: the fake drives its responder
+    /// synchronously, and a gate would not do, because every gate in the fake observes the token and
+    /// would answer the cancel with a <c>Cancelled</c> status instead of the throw this test is about.
+    /// </summary>
+    private static IEnumerable<string> ParkBeforeSecondToken(TaskCompletionSource parked, TaskCompletionSource release)
+    {
+        yield return "one ";
+        parked.SetResult();
+        release.Task.GetAwaiter().GetResult();
+        yield return "two ";
+    }
+
+    /// <summary>The one per-request metric line, once it has been emitted.</summary>
+    private static async Task<string> CapturedRequestLineAsync(CapturingLoggerProvider capture)
+    {
+        await TestWait.UntilAsync(() => capture.Records.Any(r => r.Message.StartsWith("req=chatcmpl-", StringComparison.Ordinal)));
+        return Assert.Single(capture.Records, r => r.Message.StartsWith("req=chatcmpl-", StringComparison.Ordinal)).Message;
+    }
+
     private static BridgeOptions Options(SystemPromptPlacement placement) =>
         new() { Backend = BackendKind.Fake, SystemPromptPlacement = placement };
 

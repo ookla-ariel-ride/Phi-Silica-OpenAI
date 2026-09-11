@@ -242,14 +242,37 @@ switch ($PSCmdlet.ParameterSetName) {
         & $signtool sign /fd SHA256 /sha1 $cert.Thumbprint $msixPath | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)." }
 
+        # Register first, remove the old registration afterwards. The other order -- which this was --
+        # leaves the machine with no package at all whenever Add-AppxPackage fails, and then
+        # `--backend phi-silica` cannot start ("no package is registered") until someone works out that
+        # the install is what broke it. Add-AppxPackage updates a registration of the same identity in
+        # place, so the usual path never removes anything; the remove below is for the case where the
+        # new package full name differs from the old one (a version bump), which leaves both.
         $existing = Get-RegisteredPackage
-        if ($existing) {
-            Write-Step "Removing previously registered $($existing.PackageFullName)"
+        Write-Step "Registering package with external location $BinDir"
+        try {
+            Add-AppxPackage -Path $msixPath -ExternalLocation $BinDir -ErrorAction Stop
+        } catch {
+            if (-not $existing) { throw }
+
+            # An in-place update was refused. Falling back to remove-then-add is the window the old
+            # order was always in, entered here only after the safe path has already failed -- and if
+            # the retry fails too, it throws with the original registration gone, which is the outcome
+            # that was previously guaranteed rather than merely possible.
+            Write-Warn2 "Add-AppxPackage refused an in-place update ($($_.Exception.Message))."
+            Write-Warn2 "Removing $($existing.PackageFullName) and registering again."
             Remove-AppxPackage -Package $existing.PackageFullName
+            Add-AppxPackage -Path $msixPath -ExternalLocation $BinDir -ErrorAction Stop
+            $existing = $null
         }
 
-        Write-Step "Registering package with external location $BinDir"
-        Add-AppxPackage -Path $msixPath -ExternalLocation $BinDir
+        if ($existing) {
+            $current = Get-RegisteredPackage
+            if ($current -and $current.PackageFullName -ne $existing.PackageFullName) {
+                Write-Step "Removing superseded $($existing.PackageFullName)"
+                Remove-AppxPackage -Package $existing.PackageFullName
+            }
+        }
 
         Show-Status
         $pfn = (Get-RegisteredPackage).PackageFamilyName

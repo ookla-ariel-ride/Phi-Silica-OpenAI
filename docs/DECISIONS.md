@@ -1270,3 +1270,77 @@ still behaves as it did.
 **Coverage the new test file claimed and did not have.** A `Complete` that the handler had also
 cancelled, and a status the mapping has never heard of, are now pinned rather than asserted in a doc
 comment. 655 tests.
+
+**D82. The three low-severity notes from the 2026-09-10 review, and what one of them turned out to
+be.** Issue #10. All three were recorded in `docs/FUTURE.md` after chunk 4 as "none load-bearing,
+none fixed in that session", and each was a small contained change. Taken now rather than folded into
+chunk 7, because two of the three live in the two endpoint files D81 had just rewritten.
+
+**The JSON path let a non-client cancellation escape as a bare 500.** Its catch was
+`when (ex is not OperationCanceledException)`, so "cancelled, but `RequestAborted` is not set" matched
+no clause and died as an unhandled request exception: HTTP 500 with no OpenAI envelope, where the
+streaming sibling answered the identical event with a 502 and the ordinary error body. An adapter that
+breaks the `ILanguageModelBackend` rule about swallowing the runtime's own cancellation produces it,
+and the cut's linked token makes it reachable without the client going anywhere. The shape is now the
+streaming path's exactly: a first clause filtered on `RequestAborted` that returns nothing and logs
+`http=0`, then an unfiltered one that reports through `GenerationFailure`. One test per clause, and
+each was checked to fail against the old filter.
+
+Getting the second of those tests to reach its clause took three attempts and is worth recording,
+because the obvious arrangement does not work. A client disconnect does not ordinarily reach either
+catch at all: both real adapters and the fake *return* `Cancelled` rather than throwing, as the
+`ILanguageModelBackend` contract requires, so the disconnect lands on the status check inside the
+try. To make a *throw* arrive with `RequestAborted` set, the fake's `CancellationGate` is held shut so
+the generation ignores its token, and the responder is an iterator that parks inside `MoveNext` before
+the token the injected failure fires on. No gate would do for that park: every gate in the fake awaits
+with the caller's token and would answer the cancel with a `Cancelled` status instead of the throw.
+The release cannot wait for the client's own task to throw either, tempting as that is as the stronger
+ordering signal — TestServer does not complete the client's task while the handler is still in the
+pipeline, and the handler is parked, so waiting for it deadlocks. What makes the ordering sound is
+that `CancelAsync` runs TestServer's abort registration before it returns; what proves it is the
+`http=0` assertion, since a throw observed too early is reported as 502. The first draft asserted
+neither the exception name nor the clause, so it passed against the old filter while never reaching
+the new one — an adversarial review caught that, with a standalone probe of the fake to prove it.
+
+**`SseStream.Started` is the response's `HasStarted` rather than a flag of its own — and the note's
+premise was wrong.** The note said a first write that throws for a reason other than the client
+leaving would leave the flag raised, so the failure path would believe the status line was spent and
+write an error frame into a response that had never begun. That cannot happen the way it describes:
+`HttpResponse.WriteAsync` calls `StartAsync` before it writes a byte, so by the time a body write or
+flush fails the response really has started and the old flag was right. The two answers part only
+when starting the response is itself what fails, and there the new one is right. So this is a
+simplification — there is no longer any state here that can contradict the response — and not the bug
+fix it was filed as. No test: the only way to reach the difference is to make `StartAsync` fail, and
+then the ordinary error result the caller returns instead fails to start for the same reason. The
+client sees nothing either way; what does differ on that path is the server log, since the old code
+swallowed the second failure inside the stream's own error-writing catch and the new one lets it reach
+the pipeline as an unhandled request exception. Said plainly here because the note will otherwise read
+as an open defect.
+
+**`identity.ps1 -Install` no longer destroys the working registration on the path where the install
+succeeds.** It removed the old package and then added the new one, so the registration was gone for
+the duration of every install, and a failing `Add-AppxPackage` left the machine with nothing
+registered and `--backend phi-silica` failing with "no package is registered" — nothing in that
+message says the install is what broke it. Be clear about how much this fixes: the fallback below
+retries remove-then-add for *any* add failure, so for the likeliest causes — an expired certificate, a
+mis-edited manifest, a broken signtool — the retry fails identically and the end state is what it
+always was. What changes is that the successful path, which is every install so far, no longer has a
+window at all, and the failing path's window is no longer entered before anything has been tried. The
+order is reversed:
+add first, and remove the previous package full name afterwards only if it differs from the new one.
+`Add-AppxPackage` updates a registration of the same identity in place, which is what a re-run after a
+rebuild always is, so the usual path now removes nothing at all; verified by re-running `-Install`
+over the live registration, which went straight through with no removal step and left
+`NpuBridge_0.1.0.0_arm64__jtas4mnxdyzpe` registered throughout. The remove-then-add order survives
+only as a fallback for a refused in-place update, entered after the safe path has already failed —
+so the window that was previously guaranteed is now merely possible.
+Two further defects in that script came out of the same review and are issue #19, both unreachable
+while the manifest stays at 0.1.0.0: `Get-RegisteredPackage` sorts `Version` as the string it is, so
+`0.9.0.0` outranks `0.10.0.0` and a version bump can leave two registrations; and the superseded
+removal is unguarded under `$ErrorActionPreference = 'Stop'`, so if a bump replaces the registration
+rather than adding to it, the removal fails "not found" and kills the script after the install has
+already succeeded.
+
+657 tests. `smoke.ps1 -Backend phi-silica -Port 5298` passed every step again afterwards, which is
+what says the reordered install still grants identity: the run relaunches through package activation
+and reports `identity=True`.
