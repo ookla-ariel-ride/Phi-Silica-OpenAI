@@ -144,6 +144,9 @@ internal sealed class OutputCutter
     /// <summary>Text generated but not yet emitted: the held tail, plus whatever the last delta added.</summary>
     private string _pending = string.Empty;
 
+    /// <summary>Everything emitted so far, for the token count of what the client received (D80).</summary>
+    private readonly System.Text.StringBuilder _emittedText = new();
+
     private int _emitted;
 
     public OutputCutter(OutputLimits limits)
@@ -160,6 +163,9 @@ internal sealed class OutputCutter
 
     /// <summary>Characters emitted so far — the length of the completion the client will have received.</summary>
     public int ContentLength => _emitted;
+
+    /// <summary>The completion the client will have received, exactly the concatenation of every release.</summary>
+    public string EmittedText => _emittedText.ToString();
 
     /// <summary>
     /// Takes one backend delta and returns the text that is now safe to send, which may be empty (it is
@@ -282,6 +288,7 @@ internal sealed class OutputCutter
             var release = _pending[..safe];
             _pending = _pending[safe..];
             _emitted += safe;
+            _emittedText.Append(release);
             return release;
         }
 
@@ -289,6 +296,7 @@ internal sealed class OutputCutter
         var cut = _pending[..cutAt];
         _pending = string.Empty;
         _emitted += cutAt;
+        _emittedText.Append(cut);
         return cut;
     }
 

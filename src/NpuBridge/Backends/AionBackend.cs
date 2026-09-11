@@ -57,6 +57,9 @@ internal sealed class AionBackend : ILanguageModelBackend
     /// </summary>
     public BackendCapabilities Capabilities => BackendCapabilities.None;
 
+    /// <summary>The preview model's tokenizer is unpublished and no generation has run here to measure it against: chars/4 (D44, D80).</summary>
+    public NpuBridge.Tokenizers.ITokenCounter TokenCounter => NpuBridge.Tokenizers.CharEstimateTokenCounter.Instance;
+
     public IReadOnlyDictionary<string, object?> Diagnostics => _diagnostics;
 
     public async Task InitializeAsync(CancellationToken cancellationToken)

@@ -168,6 +168,8 @@ public class DebugGenerateTests
 
         public BackendCapabilities Capabilities => BackendCapabilities.None;
 
+        public NpuBridge.Tokenizers.ITokenCounter TokenCounter => NpuBridge.Tokenizers.CharEstimateTokenCounter.Instance;
+
         public IReadOnlyDictionary<string, object?> Diagnostics { get; } = new Dictionary<string, object?>();
 
         public Task InitializeAsync(CancellationToken cancellationToken) => Task.CompletedTask;

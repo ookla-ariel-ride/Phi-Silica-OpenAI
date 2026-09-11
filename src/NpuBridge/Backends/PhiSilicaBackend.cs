@@ -57,6 +57,13 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
         | BackendCapabilities.PromptLengthPreflight
         | BackendCapabilities.Cancellation;
 
+    /// <summary>
+    /// Phi-3.5-mini's tokenizer: measured to be this runtime's own vocabulary (the preflight lands on
+    /// 3581 of its tokens at every ASCII boundary tested, D80). When Aion Instruct arrives as a model
+    /// swap behind this API, re-run the D80 measurement before trusting it for that model.
+    /// </summary>
+    public NpuBridge.Tokenizers.ITokenCounter TokenCounter => NpuBridge.Tokenizers.Phi3TokenCounter.Instance;
+
     public IReadOnlyDictionary<string, object?> Diagnostics => _diagnostics;
 
     public async Task InitializeAsync(CancellationToken cancellationToken)
@@ -149,15 +156,12 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
         ArgumentNullException.ThrowIfNull(prompt);
         var model = Model();
         var ctx = Own(context).Context;
-        // The runtime returns the char index where the context window fills; clamp to the prompt length and
-        // round down off a surrogate pair so callers can slice safely.
-        var usable = (int)Math.Min(Guarded(() => model.GetUsablePromptLength(ctx, prompt), "GetUsablePromptLength"), (ulong)prompt.Length);
-        if (usable > 0 && usable < prompt.Length && char.IsLowSurrogate(prompt[usable]))
-        {
-            usable--;
-        }
-
-        return usable;
+        // The runtime answers in UTF-8 bytes, not UTF-16 chars: identical for ASCII, and up to three
+        // times too large for CJK if read as a char index (measured against the Phi-3 tokenizer, D80).
+        // The conversion rounds down to a character boundary and never splits a surrogate pair, so
+        // callers can slice the prompt at the answer.
+        var bytes = Guarded(() => model.GetUsablePromptLength(ctx, prompt), "GetUsablePromptLength");
+        return Utf8Offsets.CharIndexAtByteOffset(prompt, bytes > long.MaxValue ? long.MaxValue : (long)bytes);
     }
 
     public async Task<GenerationResult> GenerateAsync(

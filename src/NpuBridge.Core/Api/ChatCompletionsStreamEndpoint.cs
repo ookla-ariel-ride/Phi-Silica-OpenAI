@@ -308,14 +308,14 @@ internal sealed class ChatCompletionsStreamEndpoint
             await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
                 new ChatCompletionDelta(null, null), finishReason), aborted).ConfigureAwait(false);
 
-            // Usage, same chars/4 estimate on both sides as the non-streaming path (D44): the
-            // progress-callback count is not a token count. Counted off the cutter rather than the
-            // backend's returned text, always: after a cut that text runs past what was sent, after a
-            // filtered reply it is empty while deltas did go out, and the cutter is the only thing that
-            // knows exactly how many characters reached the client. The prompt side is the whole
-            // transcript the model holds, not the tail sent on a cache hit, as on the JSON path.
-            var promptTokens = ChatRequestMetrics.EstimateTokens(lease.TranscriptChars);
-            var completionTokens = ChatRequestMetrics.EstimateTokens(cutter.ContentLength);
+            // Usage, in the backend's own count on both sides, as on the non-streaming path (D80; never
+            // the progress-callback count, D44). Counted off the cutter rather than the backend's
+            // returned text, always: after a cut that text runs past what was sent, after a filtered
+            // reply it is empty while deltas did go out, and the cutter is the only thing that knows
+            // exactly what reached the client. The prompt side is the whole transcript the model holds,
+            // not the tail sent on a cache hit, as on the JSON path.
+            var promptTokens = lease.TranscriptTokens;
+            var completionTokens = prepared.Backend.TokenCounter.Count(cutter.EmittedText);
 
             if (includeUsage)
             {

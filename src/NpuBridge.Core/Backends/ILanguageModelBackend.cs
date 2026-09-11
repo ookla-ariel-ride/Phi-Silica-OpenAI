@@ -38,6 +38,13 @@ public interface ILanguageModelBackend : IAsyncDisposable
     BackendCapabilities Capabilities { get; }
 
     /// <summary>
+    /// How this backend's tokens are counted, for <c>usage</c> and the <c>max_tokens</c> budget (D80):
+    /// the runtime's own vocabulary where it is known (Phi Silica), the chars/4 estimate otherwise.
+    /// Never null; the preflight, not the counter, decides what fits.
+    /// </summary>
+    Tokenizers.ITokenCounter TokenCounter { get; }
+
+    /// <summary>
     /// Backend-specific facts surfaced verbatim in <c>/healthz</c> (for example <c>laf_status</c>).
     /// Keys are snake_case; values must be JSON-serialisable.
     /// </summary>

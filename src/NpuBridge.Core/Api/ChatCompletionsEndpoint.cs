@@ -306,12 +306,13 @@ internal sealed class ChatCompletionsEndpoint
                 lease.Keep(result.Text);
             }
 
-            // 9. Usage. Both numbers are chars/4 estimates, not a tokenizer's output; the progress
-            // callback count is not usable (Phi Silica batches several tokens per callback). The prompt
-            // side is the whole transcript the model holds, not the tail sent on a cache hit: a client
-            // budgeting its context wants the former, and the number must not change with a cache hit.
-            var promptTokens = ChatRequestMetrics.EstimateTokens(lease.TranscriptChars);
-            var completionTokens = ChatRequestMetrics.EstimateTokens(content.Length);
+            // 9. Usage, in the backend's own count (D80): Phi-3 tokens on Phi Silica, chars/4 where the
+            // tokenizer is unpublished; never the progress-callback count (Phi Silica batches several
+            // tokens per callback, D44). The prompt side is the whole transcript the model holds, not the
+            // tail sent on a cache hit: a client budgeting its context wants the former, and the number
+            // must not change with a cache hit.
+            var promptTokens = lease.TranscriptTokens;
+            var completionTokens = backend.TokenCounter.Count(content);
 
             var body = new ChatCompletionResponse(
                 Id: requestId,

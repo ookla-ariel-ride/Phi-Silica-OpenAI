@@ -36,6 +36,8 @@ public sealed partial class FakeBackend : ILanguageModelBackend
 
     public BackendCapabilities Capabilities => _options.Capabilities;
 
+    public Tokenizers.ITokenCounter TokenCounter => _options.TokenCounter;
+
     public IReadOnlyDictionary<string, object?> Diagnostics { get; }
 
     public bool IsInitialized => _initialized;
@@ -311,6 +313,13 @@ public sealed class FakeBackendOptions
         | BackendCapabilities.SystemPromptContext
         | BackendCapabilities.PromptLengthPreflight
         | BackendCapabilities.Cancellation;
+
+    /// <summary>
+    /// The counter behind <c>usage</c> and the <c>max_tokens</c> budget. chars/4 by default, so a test
+    /// that asserts usage numbers reads them as D44 defined them; a test of the counted path sets one
+    /// no estimate could mimic.
+    /// </summary>
+    public Tokenizers.ITokenCounter TokenCounter { get; set; } = Tokenizers.CharEstimateTokenCounter.Instance;
 
     /// <summary>Produces the token stream for a request. Defaults to <see cref="FakeBackend.DefaultResponder"/>.</summary>
     public Func<FakeGenerationRequest, IEnumerable<string>>? Responder { get; set; }

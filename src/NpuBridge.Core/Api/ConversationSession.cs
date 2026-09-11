@@ -35,6 +35,7 @@ internal sealed class ContextLease : IDisposable
         int tailTurns,
         int promptChars,
         int transcriptChars,
+        int transcriptTokens,
         string? systemText,
         IReadOnlyList<ChatMessage> turns)
     {
@@ -48,6 +49,7 @@ internal sealed class ContextLease : IDisposable
         TailTurns = tailTurns;
         PromptChars = promptChars;
         TranscriptChars = transcriptChars;
+        TranscriptTokens = transcriptTokens;
     }
 
     public IModelContext Context { get; }
@@ -63,8 +65,11 @@ internal sealed class ContextLease : IDisposable
     /// <summary>Characters the model sees on this request: the prompt, plus native system text on a miss. The log line's <c>prompt_chars</c>.</summary>
     public int PromptChars { get; }
 
-    /// <summary>Characters of the whole transcript as the model holds it after this request's prompt. What <c>usage.prompt_tokens</c> estimates from.</summary>
+    /// <summary>Characters of the whole transcript as the model holds it after this request's prompt: the overflow message and the pressure check.</summary>
     public int TranscriptChars { get; }
+
+    /// <summary>The same transcript in the backend's tokens (native system text included): <c>usage.prompt_tokens</c>, the same on a hit and a miss (D74, D80).</summary>
+    public int TranscriptTokens { get; }
 
     /// <summary>
     /// The generation ended Complete and <paramref name="reply"/> is the text the client received,
@@ -304,6 +309,11 @@ internal sealed class ConversationSession
         var transcriptChars = full.Prompt.Length + (nativeSystem?.Length ?? 0);
         LogPressure(transcriptChars);
 
+        // usage.prompt_tokens, in the backend's own count (D80). The native system text is counted on
+        // its own: the runtime holds it in the context, outside the prompt string.
+        var counter = backend.TokenCounter;
+        var transcriptTokens = counter.Count(full.Prompt) + (nativeSystem is null ? 0 : counter.Count(nativeSystem));
+
         var checkout = _cache.CheckoutLongest(ConversationKey.PrefixKeys(systemText, _turns));
         if (checkout is not null)
         {
@@ -319,12 +329,12 @@ internal sealed class ConversationSession
             }
 
             return new ContextLease(_cache, checkout.Context, prompt, cacheHit: true, checkout.Prefix.Key,
-                tailTurns: tail.Count, promptChars: prompt.Length, transcriptChars, systemText, _turns);
+                tailTurns: tail.Count, promptChars: prompt.Length, transcriptChars, transcriptTokens, systemText, _turns);
         }
 
         var context = backend.CreateContext(nativeSystem);
         return new ContextLease(_cache, context, full.Prompt, cacheHit: false, cacheKey: null,
-            tailTurns: _turns.Count, promptChars: transcriptChars, transcriptChars, systemText, _turns);
+            tailTurns: _turns.Count, promptChars: transcriptChars, transcriptChars, transcriptTokens, systemText, _turns);
     }
 
     private List<ChatMessage> Transcript()
