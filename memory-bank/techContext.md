@@ -12,7 +12,7 @@ machine; the NPU is here.
   version-constants source) + CsWinRT 2.3.1 (direct) + `Microsoft.Windows.SDK.BuildTools` 10.0.26100.4948
   (makeappx/signtool; also used by `identity.ps1`). CsWinRT reads Windows metadata from the
   `Microsoft.Windows.SDK.NET.Ref` 10.0.26100.57 NuGet, so no Windows SDK install is needed.
-- Tests: xunit 2.9.3, `Microsoft.AspNetCore.TestHost` 10.0.11. 496 tests, about 1 s.
+- Tests: xunit 2.9.3, `Microsoft.AspNetCore.TestHost` 10.0.11. 512 tests, about 1 s.
 - gitleaks 8.30.1 (pre-commit hook + CI workflow) with project rules for LAF tokens. Docs and the
   memory bank are scanned like code (the path allowlists were removed 2026-09-11; the placeholder
   attestation format is excused by regex). When testing a rule, use random-looking secrets: the

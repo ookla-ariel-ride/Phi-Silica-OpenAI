@@ -1,21 +1,21 @@
-# Session handoff, 2026-09-11, end of the late session
+# Session handoff, 2026-09-11, after the D79 merge
 
-Supersedes the handoff written after the chunk 5 merge earlier today (in git history). Everything
+Supersedes the handoff written after the coverage audit earlier today (in git history). Everything
 below was verified at write time.
 
 ## Where things stand
 
-- `main` is at or after `cd4efde`, tree clean, in sync with origin. The repository is now
+- `main` is at or after `908cb7a`, tree clean, in sync with origin. The repository is
   `ookla-ariel-ride/npu-bridge` (renamed today; the old `Phi-Silica-OpenAI` URL redirects). The local
   folder keeps its old name on purpose: package identity is registered against the build path, and
   renaming it means `identity.ps1 -Install` again.
-- Chunks 1 to 6 are merged. Chunk 5 (context cache and overflow, D71 to D76) and the OpenAI
-  conformance pass (D77) both landed today; D78 closed issue #12 without a change. Chunk 6 stays
-  code-verified only (D70; issue #2 open).
-- 496 tests pass. `smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648; the
-  last NPU run was on the conformance branch before its review fixes, and the fake run passed on the
-  final code.
-- Open issues: #2, #3, #4, #9, #10, #11, #13, #14, #15, #16. Closed today: #1, #12.
+- Chunks 1 to 6 are merged. Chunk 5 (context cache and overflow, D71 to D76), the OpenAI
+  conformance pass (D77), D78 (issue #12 closed without a change) and D79 (test hardening from the
+  coverage audit) all landed today. Chunk 6 stays code-verified only (D70; issue #2 open).
+- 512 tests pass. `smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648 on the
+  final `main` code, with four teardown rows (the main server and the three auxiliary servers).
+- Open issues: #2, #3, #4, #9, #10, #11, #13, #14, #15, #16. Closed today: #1, #12. Progress on #14
+  and #15 is recorded in comments on each.
 
 ## What this session did, in order
 
@@ -44,6 +44,17 @@ below was verified at write time.
    #15 (the smoke script's vacuous steps, nine additions, a manual checklist) and #16 (a CI job that
    runs the exe with the fake backend, blocked on an ARM64 runner). `coverlet.collector` is in the
    test project: `dotnet test --collect:"XPlat Code Coverage"`.
+7. D79 on the branch `test-hardening`: issue #15's first three items (readiness says what ready
+   means per backend, the preflight step refuses a null answer, teardown proves the activated child
+   and the port are gone, `InfoStep` may fail on a contradiction, `/healthz` reports the keep-alive
+   timings) and issue #14's first six tests. Two whole-branch reviews (a Claude subagent and Codex):
+   the auxiliary servers' teardown was a warning and is now a row per server, the script header
+   contradicted the D52 step, the client-gone test could block the handler's thread, two test
+   summaries claimed more than they pinned, the `-NoStart` identity check belonged to launch
+   provenance, a failing process query read as "nothing left", and the 45 s deadline had no margin
+   over the 30 s plus 15 s shutdown worst case. All applied. Two NPU runs: the first hit the
+   model-runtime RPC fault on the first generation (second time today), the re-run and the run on
+   the final code passed. Fast-forward merged; both issues stay open with comments.
 
 ## Decisions the owner made today
 
@@ -61,10 +72,6 @@ below was verified at write time.
 
 ## Do this next
 
-0. Cheap first: issue #15's first three items (the teardown assertion that the activated child
-   exited and the port freed, `package_identity` and preflight assertions in the readiness step,
-   the never-fail measurements promoted to failures), then issue #14's first six tests. About two
-   hours together, and they remove the smoke script's vacuous passes.
 1. Issue #13. Measure first: tokenize the two prompts D55 and D75 give (the fox filler that fits at
    13,429 characters, the smoke transcript that fits at 13,179) with `LlamaTokenizer` over
    Phi-3.5-mini's `tokenizer.model`. If both land on the same token count within a few tokens, adopt
@@ -94,8 +101,18 @@ below was verified at write time.
 - Do not run `dotnet build` while `smoke.ps1` has a server up: the exe is locked and the copy fails.
 - Under package activation the server's console output is not in the smoke log; `/healthz` and the
   response are the evidence.
-- The model runtime can fail its RPC channel on the first generation after start; one such run
-  today left nothing in the Application log and the re-run was clean.
+- The model runtime can fail its RPC channel on the first generation after start; two such runs
+  today ("The remote procedure call failed", then "The RPC server is unavailable" on every later
+  call in that process), nothing in the Application log, and the re-run was clean each time. A
+  smoke run that fails that way on its first generation is the flake, not the branch.
+- The smoke script's teardown reads the activated child off `Win32_Process` by the
+  `--supervisor-pid <parent>` argument; a child exits within about half a second of its parent.
+  A `Stop-AuxServer` row per auxiliary server is where D37's child half is exercised repeatedly.
+- The D52 "exceeded" branch is not a failure and must not be promoted: the keep-alive timer starts
+  after the body parse, the cache lookup and the preflight (D79).
+- `Task.Run` awaited in the fake can continue synchronously on the caller's thread; a test that
+  blocks synchronously inside a `Responder` iterator must put an async hop (`FirstTokenDelay`)
+  before it, or it can block the handler before it enters its wait.
 
 ## Machine facts (do not re-discover)
 
@@ -128,8 +145,8 @@ below was verified at write time.
 
 ```powershell
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\Phi-Silica-OpenAI
-git status; git log --oneline -3                          # expect main at or after cd4efde, tree clean
-dotnet build; dotnet test                                 # expect 496 passed
+git status; git log --oneline -3                          # expect main at or after 908cb7a, tree clean
+dotnet build; dotnet test                                 # expect 512 passed
 .\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 1 skipped, 5 informational
 gh issue list                                             # #2, #3, #4, #9, #10, #11, #13, #14, #15, #16 open
 ```

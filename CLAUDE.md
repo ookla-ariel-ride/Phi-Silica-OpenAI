@@ -28,16 +28,20 @@ dependency, so the Qualcomm QNN provider that Windows ML 1.8 needs cannot be ima
 DISM, ACLs, drivers and package identity are all ruled out; only another Windows build or a Feedback
 Hub report remains. Also merged 2026-09-11: the OpenAI conformance pass (D77: required-but-nullable
 fields written as nulls, `model` required and served-only, schema ranges enforced) and D78 (no
-suffix lookup for truncated conversations; the follow-up turn already hits). Next is issue #13 (the
-Phi-3 tokenizer, measured against the preflight first), then issue #9 (consolidate the duplicated
-post-generation pipeline), then chunk 7 (tool-call emulation, issue #3). The repository is
+suffix lookup for truncated conversations; the follow-up turn already hits) and D79 (test hardening
+from the coverage audit: the smoke script's readiness step says what ready means per backend, its
+teardown proves the activated child exited and every auxiliary server gets a teardown row, an
+`InfoStep` may fail on a contradiction, `/healthz` reports the keep-alive timings, and issue #14's
+first six tests landed; 512 tests). Issues #14 and #15 stay open for their remaining items. Next is
+issue #13 (the Phi-3 tokenizer, measured against the preflight first), then issue #9 (consolidate the
+duplicated post-generation pipeline), then chunk 7 (tool-call emulation, issue #3). The repository is
 `ookla-ariel-ride/npu-bridge`; the local folder keeps its old name because package identity is
 registered against the build path.
 All four defects from the 2026-09-10 code review (#5 to #8) are fixed and merged (D62 to D65). The
 Insider flight to build 29661 broke Phi Silica and was rolled back to 29648; if it is offered again,
 expect the same (workload packages fail to register, model `NotReady`). An empty
 `Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'` listing is not proof of breakage on 29648;
-`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D78 so
+`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D79 so
 far); `docs/FUTURE.md` holds deferred work. Update both whenever a chunk changes a choice or defers
 something.
 

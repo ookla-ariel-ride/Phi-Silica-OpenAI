@@ -3,7 +3,7 @@
 ## Works today (verified)
 | Area | Status | Evidence |
 |---|---|---|
-| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; 496 xunit tests green (chunk 5, the D77 conformance pass and D78 merged 2026-09-11) |
+| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; 512 xunit tests green (chunk 5, the D77 conformance pass, D78 and the D79 test hardening merged 2026-09-11) |
 | `/healthz`, `/v1/models`, `/v1` fallback | ✅ | TestServer tests + live curl on the exe |
 | Config precedence json < local < env < CLI | ✅ | real-file test + live probes |
 | CLI verbs `run`, `service`, `task`, `help`, `version` | ✅ | tests + live exit codes |
@@ -79,3 +79,10 @@
   disagreeing on `param`, both fixed with tests. Fast-forward merged.
 - D78 (2026-09-11): issue #12 (suffix lookup for truncated conversations) closed without a change
   after the test written first showed the follow-up turn already hits the truncated context.
+- D79 (2026-09-11, branch `test-hardening`): the smoke script's vacuous steps from the coverage
+  audit (issue #15's first three items) and issue #14's first six tests. Two whole-branch reviews
+  (a Claude subagent and Codex) found the auxiliary servers' teardown demoted to a warning, the
+  script header contradicting the D52 step, a thread-scheduling race in the client-gone test, two
+  test summaries claiming more than they pinned, and a `-NoStart` identity check that belonged to
+  launch provenance; all applied, 512 tests, the NPU smoke run passed with four teardown rows.
+  Fast-forward merged. Both issues stay open for their remaining items.
