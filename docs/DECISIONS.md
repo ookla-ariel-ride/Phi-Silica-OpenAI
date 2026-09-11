@@ -749,3 +749,24 @@ the sample's #1 (family absent on retail 26200) and Foundry Local #393 (duplicat
 26220). Repair options that remain are the owner's: an elevated `sfc /scannow` and
 `DISM /Online /Cleanup-Image /RestoreHealth` to repair inbox components, a Feedback Hub report under
 Developer Platform, or a different build. (chunk 6)
+
+Proof and the one remaining lead, later the same night. Reading the process token's security
+attributes (kernel `TOKEN_SECURITY_ATTRIBUTE_V1` form) from a plain Arm64 process shows only
+`TSA://ProcUnique` and `APPID://PATH`, and exactly the same set after `AddPackageDependency` on the
+provider main package returns `S_OK` and again after adding a framework package: no `WIN://SYSAPPID`
+attribute is ever added, so the conditional execute ACE on the provider folder can never match. That
+attribute can only be written by Windows with TCB privilege; `kernelbase.dll` on this build references
+both `WIN://SYSAPPID` and `AddPackageDependency`, and `AppXDeploymentServer.dll` references
+`WIN://SYSAPPID` and `DependencyTarget`, so the server is the component expected to append it, and its
+verbose log for the call shows only the trust-label validation. Public sources confirm the design but
+not the failure: the conditional ACE and the attribute are documented by security researchers and by
+the Inside MSIX blog ("only Windows can write it, and only select code paths"); the Python project hit
+the same wall in August 2026 for the Store Python main package and closed it as not planned. The one
+lead: the in-box *framework* variant `WindowsWorkload.EP.Qualcomm.QNN.Framework.1.8` 1.8.46.0 is
+staged on disk with an unconditional read-and-execute grant, and every DLL in it loads from a plain
+process; but it declares the `com.microsoft.windowsmlruntime.osexecutionprovider` extension, while the
+1.8 Windows ML runtime Aion uses (`Microsoft.Windows.AI.MachineLearning.dll` in Windows App Runtime
+1.8) contains only the `...windowsmlruntime.executionprovider` string plus the `MicrosoftCorporationII.WinML`
+and `WindowsWorkload.EP` family prefixes, so registering the framework variant for the user would not
+be discovered by that runtime. The main package in use, 1.8.30.0, is the one Windows Update ships as
+KB5078978. (chunk 6)
