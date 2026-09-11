@@ -93,6 +93,47 @@ concurrent requests for one conversation never share a context: the second misse
 (`MaxPromptChars`), and full call recording (`Calls`, per-context `History`). Tests that pass against
 it should not pass vacuously on the NPU.
 
+## Test conventions (D43, D54, D79)
+- Never assert on wall-clock timing. Order events with `FirstTokenGate` (held after the prompt
+  verdict, before the first token) and `InitGate`, and assert on what had or had not happened when
+  the gate opened. The keep-alive waits still run on `Task.Delay`, so two keep-alive tests can pin
+  less than they would with a fake `TimeProvider` (`docs/FUTURE.md`).
+- Count contexts on every new generation path: `BridgeTestHost.AssertNoLeak` checks created equals
+  disposed plus cached, and cached equals the fake's active contexts. A context is in the cache or
+  disposed, never both, never neither.
+- `BridgeTestHost.Requests` is a request ledger (a middleware counting completed requests and
+  recording exceptions that escaped the pipeline), because TestServer has no Kestrel to log one.
+  `CapturingLoggerProvider.OnRecord` lets a test act inside the window a log line marks (the
+  client-gone test aborts the client the moment the failure is classified).
+- A branch that is a race under TestServer (it completes the response pipe before it signals
+  `RequestAborted`) gets a test that pins the contract and accepts either arm, and the summary says
+  so; a test that could pass for the wrong reason states its window in its summary.
+- A `Responder` iterator that blocks synchronously must run behind an async hop
+  (`FirstTokenDelay`), because an awaited `Task.Run` can continue on the caller's thread and would
+  then block the handler before it enters its first-delta wait.
+
+## Smoke script conventions (`scripts/smoke.ps1`, D79)
+- `Step` rows PASS, FAIL or SKIP and set the exit code; `InfoStep` rows report measurements and
+  never fail on a surprising number, but a body may call `Fail` for a contradiction of something the
+  bridge guarantees (a placement run that cannot answer 200, `/healthz` without the keep-alive
+  timings). The D52 "exceeded" branch is deliberately not a failure: the keep-alive timer starts
+  after the body parse, the cache lookup and the preflight, so it measures pre-generation latency.
+- Readiness means: `package_identity` true and `diagnostics.bootstrap == ok` on phi-silica, whoever
+  started it; `package_identity` false on fake and aion when the script started them by path
+  (`-NoStart` tests a server as found). The served model id is read off `/healthz`, never spelled
+  from the backend selector (aion serves `aion-instruct`). The preflight step requires a non-null
+  answer on every backend with a preflight.
+- Teardown runs whenever the script started the server. On phi-silica an activated child carrying
+  `--supervisor-pid <parent>` on its command line (read through `Win32_Process`) must exist before
+  the stop, and parent, child and the port's listener must be gone within 60 s (the 30 s host
+  shutdown budget plus the 15 s disposal grace a still-initialising backend can take). A failing
+  process query is a teardown FAIL, never "nothing left". Every auxiliary server (`--truncate-history`,
+  both placement runs) gets a teardown row of its own; on phi-silica those are where D37's
+  child-exit half is exercised repeatedly. A parent that died on its own is reported as that.
+- Output goes through `Write-Host`; redirect with `6>&1`. Under package activation the child's
+  console output is not in the log, so `/healthz` and the responses are the evidence. Do not
+  `dotnet build` while a smoke server is up.
+
 ## Configuration
 One composition (`BridgeConfiguration`): `appsettings.json` < `appsettings.local.json` (secrets,
 gitignored) < `NPU_BRIDGE_*` environment (custom source that maps `LAF_TOKEN` → `LafToken`) < command
@@ -118,7 +159,11 @@ service/task verbs bind through the same code.
 - JSON is snake_case, nulls omitted; errors are `{"error":{"message","type","param","code"}}` with
   OpenAI's types (`invalid_request_error` for 404s, `rate_limit_error`, `server_error`).
 - `/healthz`: 200 only when ready; 503 with `Retry-After: 10` while loading;
-  `first_run_compile_likely` after 60 s; backend diagnostics passed through verbatim.
+  `first_run_compile_likely` after 60 s; `package_identity` and `package_family_name`;
+  `contexts_cached`, `context_cache_capacity`, `context_cache_hits`, `context_cache_misses` (D74);
+  `first_keep_alive_ms` and `keep_alive_interval_ms` (D79, so the smoke script reads the D52 margin
+  off the server); `queue_depth`/`queue_capacity` (reported, nothing queues yet); backend
+  diagnostics passed through verbatim.
 - `/v1/{**}` fallback: 405 with `Allow` for a wrong method on a known path, otherwise 404.
 - `/debug/generate`: raw prompt into the backend with timing; diagnostic only.
 
@@ -129,4 +174,8 @@ whole-branch review → fast-forward merge to `main` → update `CLAUDE.md`, `do
 `docs/SESSION-HANDOFF.md` and this folder in the same session → close the issue from the merge
 commit. Chunk 6 was built by a forked subagent and reviewed by the parent session; hardware
 verification is part of an adapter chunk's definition of done and, when the machine cannot provide it,
-the chunk merges labelled code-verified only with the issue left open (chunk 6, D70).
+the chunk merges labelled code-verified only with the issue left open (chunk 6, D70). Work between
+chunks (D77 to D79) follows the same loop on its own branch; a partial pass over an issue (D79 over
+#14 and #15) leaves the issue open with a comment saying what landed, what each test pins and does
+not, and what remains. The smoke run is repeated on the final code of a branch that touched the
+script or the exe, and a first-generation RPC fault is re-run once before it counts as a failure.

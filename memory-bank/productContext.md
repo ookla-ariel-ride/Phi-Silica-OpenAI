@@ -16,9 +16,12 @@ so those tools can run fully local, offline, and free.
 - **Drop-in.** Change a base URL and a model id; nothing else in the client changes.
 - **Honest.** When the model cannot do something (context overflow, unsupported parameter, tool call
   it did not follow), the response says so in OpenAI's error format rather than silently degrading.
-- **Observable.** `/healthz` answers "is the model loaded, why not, how long has it been loading";
-  every request logs backend, prompt size, time to first token, tokens/s and outcome; `--verbose`
-  shows the exact prompt the model saw.
+- **Observable.** `/healthz` answers "is the model loaded, why not, how long has it been loading",
+  whether the process has package identity, the context cache's count and hit/miss counters, the
+  streaming keep-alive timings, and the backend's own diagnostics (bootstrap outcome, ready state,
+  the text-contract counters `text_mismatches` and `late_deltas`); every request logs backend,
+  prompt size, cache hit or miss, time to first token, tokens/s and outcome; `--verbose` shows the
+  exact prompt the model saw.
 - **Boring to operate.** One exe, one settings file, a logon task or service for auto-start, secrets in
   a gitignored local file, no admin needed to run.
 
@@ -58,3 +61,10 @@ so those tools can run fully local, offline, and free.
   Phi Silica's progress callbacks undercount tokens roughly threefold. The owner decided on
   2026-09-11 to adopt the Phi-3 tokenizer for real counts if a measurement against the preflight
   agrees (issue #13).
+- The Phi Silica runtime can fail its first generation after a start with an RPC fault (seen twice
+  on 2026-09-11); the request is a 502 `backend_error`, every later request in that process fails
+  the same way, and a restart clears it. The bridge does not recreate the model on its own yet
+  (`docs/FUTURE.md`). The README tells users this.
+- The smoke script is the user-facing statement of what "works on hardware" means: since D79 it
+  fails when a Phi Silica server is ready without identity, when the preflight answers nothing, or
+  when the relaunched child or the port outlives a stop.

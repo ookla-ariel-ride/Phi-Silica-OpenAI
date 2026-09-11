@@ -13,6 +13,11 @@ machine; the NPU is here.
   (makeappx/signtool; also used by `identity.ps1`). CsWinRT reads Windows metadata from the
   `Microsoft.Windows.SDK.NET.Ref` 10.0.26100.57 NuGet, so no Windows SDK install is needed.
 - Tests: xunit 2.9.3, `Microsoft.AspNetCore.TestHost` 10.0.11. 512 tests, about 1 s.
+  `coverlet.collector` is referenced: `dotnet test --collect:"XPlat Code Coverage"` (Core was at
+  94.2 % lines and 89.8 % branches on 2026-09-11 before D79). TestServer completes the response pipe
+  before it signals `RequestAborted`, so a "client gone" write usually attempts and fails rather
+  than being skipped. The host's shutdown timeout is the .NET default (30 s); `BackendLifecycle`
+  adds a 15 s disposal grace for a backend still initialising.
 - gitleaks 8.30.1 (pre-commit hook + CI workflow) with project rules for LAF tokens. Docs and the
   memory bank are scanned like code (the path allowlists were removed 2026-09-11; the placeholder
   attestation format is excused by regex). When testing a rule, use random-looking secrets: the
@@ -50,10 +55,19 @@ machine; the NPU is here.
 - LAF: `LimitedAccessFeatures.TryUnlockFeature("com.microsoft.windows.ai.languagemodel", token, attestation)`;
   stable → `Unavailable` without token; experimental works regardless.
 - Measured: model create 15.7 s to 23.6 s cold across two runs on 2026-09-05 (10 s was one earlier
-  chunk-2 recording; it varies), about 50 ms warm; about 10 tok/s counted by progress callbacks (the
-  chars/4 estimate reads about 35, D44 and D75); first token in 1.1 s to 1.7 s
-  (`/debug/generate`); a full non-streaming `/v1/chat/completions` reply in 677 ms to 899 ms; progress
-  delivers multiple tokens per callback.
+  chunk-2 recording; it varies); on 2026-09-11 three starts in a row measured `create_ms` 34, 38
+  and 8,221 (0.2 s, 0.2 s and 8.5 s to ready), so a warm start is under a second when the Windows
+  runtime still holds the model and about 8 s when it does not; about 10 tok/s counted by progress
+  callbacks (the chars/4 estimate reads 34.5 to 35, D44 and D75); first token in 1.1 s to 1.7 s
+  (`/debug/generate`) in 2026-09-05 runs and 256 ms to 378 ms through `/v1/chat/completions` on
+  2026-09-11; a full non-streaming one-word reply in 415 ms to 453 ms (677 ms to 899 ms in earlier
+  runs); an early cut (`max_tokens=4`) ended in 472 ms against 2,703 ms for a late cut of the same
+  prompt (D53 holds); progress delivers multiple tokens per callback.
+- **Runtime RPC fault (seen twice on 2026-09-11):** the first generation after a start can fail
+  with `COMException: The remote procedure call failed`, after which every call in that process
+  fails with `The RPC server is unavailable (0x800706BA)`. Nothing in the Application log. A restart
+  clears it; the bridge does not recreate the model (`docs/FUTURE.md`). In a smoke run this shows as
+  ten failed steps starting at `/debug/generate`; re-run once before treating it as a branch defect.
 - `--system-prompt-placement auto|native|prompt` (new in chunk 3, default `auto`): native context when
   the backend advertises the capability. Measured on this NPU: both placements produce the instructed
   reply under the chunk 3 template; only bare `/debug/generate` ignores system text (D45).
@@ -112,11 +126,20 @@ and the `WindowsWorkload.LanguageModel.*` packages as *staged only* (registered 
 ```powershell
 dotnet build ; dotnet test
 .\scripts\identity.ps1 -Install|-Status|-Uninstall
-.\scripts\smoke.ps1 -Backend phi-silica|fake [-Port 5298]
+.\scripts\smoke.ps1 -Backend phi-silica|fake [-Port 5298] 6>&1 | Tee-Object -FilePath smoke.log
 NpuBridge.exe --backend fake --listen http://127.0.0.1:5299 --verbose
 NpuBridge.exe task install|status|uninstall        # elevated for install/uninstall
 NpuBridge.exe service install|start|stop|uninstall # elevated; aion/fake only
 ```
+
+## Repository file facts
+- `scripts/smoke.ps1` is CRLF in the working tree (`.gitattributes` `eol=crlf`), LF in the index;
+  `.cs` and `.md` files are LF both ways. The Edit tool preserves that; `git ls-files --eol` shows it.
+- No `python` on the machine. `perl` exists in Git Bash. Multi-line shell heredocs have mangled
+  `\u` sequences before; commit messages through `git commit -F -` with a heredoc work.
+- A safety hook blocks a command that combines a delete with a `C:\Program Files` path; split it.
+- Ports used by the smoke script: the main server on `-Port`, auxiliary servers on `-Port + 1`
+  (placement runs) and `-Port + 2` (`--truncate-history`).
 
 ## Aion model family (researched 2026-09-10)
 - **Aion 1.0 Instruct**: the Phi Silica successor, announced at Build 2026 on 2026-06-02. Preview SDK

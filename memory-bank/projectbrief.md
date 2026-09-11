@@ -66,12 +66,20 @@ LoRA adapters, Microsoft Store publication. Tracked in `docs/FUTURE.md`.
 7. Tool-calling emulation.
 8. Concurrency/queueing, `/v1/completions`, client docs.
 
+Between chunks 6 and 7 (all 2026-09-11): the OpenAI conformance pass (D77), D78 (issue #12 closed
+by evidence) and the test hardening from the coverage audit (D79; issues #14 and #15 part-done).
+Before chunk 7: issue #13 (Phi-3 tokenizer for real token counts, measured against the preflight
+first) and issue #9 (consolidate the duplicated post-generation pipeline).
+
 ## Repository
 `https://github.com/ookla-ariel-ride/npu-bridge` (renamed from `Phi-Silica-OpenAI` on 2026-09-11; the
 old URL redirects). Public, MIT.
 
 ## Owner
-Jim Siebengartner. Working agreement: plan first, chunked delivery, adversarial review after each
-chunk (in-session reviewer plus Codex), decisions and deferrals written down, commit per chunk.
-Decisions that are the owner's to make are put to them one at a time with a recommendation, and
-recorded in `docs/SESSION-HANDOFF.md` and the relevant issue.
+Jim Siebengartner. Working agreement: plan first, chunked delivery on a branch, adversarial review
+after each chunk (in-session reviewer plus Codex), a whole-branch review before the fast-forward
+merge, decisions and deferrals written down, commit per chunk. GitHub issues are the work tracker:
+each remaining chunk, defect and cleanup is an issue, and progress a later session needs goes into
+a comment on it. Decisions that are the owner's to make are put to them one at a time with a
+recommendation, and recorded in `docs/SESSION-HANDOFF.md` and the relevant issue. After a merge,
+`CLAUDE.md`, the handoff and this folder are updated in the same session.

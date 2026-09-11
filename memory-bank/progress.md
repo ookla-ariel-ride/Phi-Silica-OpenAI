@@ -4,14 +4,15 @@
 | Area | Status | Evidence |
 |---|---|---|
 | Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; 512 xunit tests green (chunk 5, the D77 conformance pass, D78 and the D79 test hardening merged 2026-09-11) |
-| `/healthz`, `/v1/models`, `/v1` fallback | ✅ | TestServer tests + live curl on the exe |
+| `/healthz`, `/v1/models`, `/v1` fallback | ✅ | TestServer tests + live curl on the exe; `/healthz` carries identity, cache counters (D74), keep-alive timings (D79) and backend diagnostics, and a test pins that the registered options, not defaults, are reported |
+| Smoke script trust (`scripts/smoke.ps1`) | ✅ | D79: readiness requires identity and bootstrap `ok` on phi-silica, the preflight step refuses a null answer, teardown proves the activated child and the port are gone (60 s), each auxiliary server has its own teardown row, `InfoStep` may fail on a contradiction. Run on the NPU 2026-09-11: all steps passed, 1 skipped, 5 informational, four teardown rows |
 | Config precedence json < local < env < CLI | ✅ | real-file test + live probes |
 | CLI verbs `run`, `service`, `task`, `help`, `version` | ✅ | tests + live exit codes |
 | Fake backend with faults/threads/init rules | ✅ | tests |
 | Sparse package identity (`identity.ps1`) | ✅ | registered; PFN `NpuBridge_jtas4mnxdyzpe` |
 | Self-relaunch via package activation + supervision | ✅ | child had identity, saw shell env, died with the parent |
 | Phi Silica adapter (experimental SDK) | ✅ | smoke passed 2026-09-11 on build 29648 (generate, preflight, system prompt, disconnect drain, text contract: `text_mismatches=0 late_deltas=0`, D65). Insider flight 29661 broke it on 2026-09-10 (workload packages fail to register, model `NotReady`); rolled back |
-| `/v1/chat/completions` non-streaming | ✅ | `ChatCompletionsTests`; smoke on the real NPU: 677 ms to 899 ms across runs, correct shape and usage |
+| `/v1/chat/completions` non-streaming | ✅ | `ChatCompletionsTests`; smoke on the real NPU: 415 ms to 453 ms for a one-word reply on 2026-09-11 (677 ms to 899 ms in earlier runs), correct shape and usage |
 | `/v1/chat/completions` streaming (SSE) | ✅ | `ChatCompletionsStreamingTests` (framing, error event, keep-alive, disconnect drain); smoke streaming step on the NPU |
 | Client-side cut: `max_tokens`, `max_completion_tokens`, `stop` | ✅ | `OutputCutTests` on both shapes; smoke shows the cut cancels the NPU (D53) |
 | PromptTemplate (message flattening) | ✅ | exact-string tests; both system-prompt placements measured on hardware |
@@ -36,6 +37,14 @@
 - Scheduler, 429 queue, client docs (chunk 8)
 
 ## Known issues and caveats
+- The Phi Silica runtime can fail its first generation after a start with an RPC fault, after which
+  every generation in that process fails (`The RPC server is unavailable`). Seen twice on
+  2026-09-11; a restart clears it; the bridge does not recreate the model (`docs/FUTURE.md`, README
+  "Things that will surprise you"). A smoke run that fails this way is re-run once.
+- Two keep-alive tests pin less than they claim to a reader of their names until the keep-alive
+  waits go through the injected `TimeProvider` (`docs/FUTURE.md`); their summaries say so.
+- Issues #14 and #15 are part-done: `honours a system prompt` and the chat steps in the smoke
+  script still assert nothing about the text; the exe has no unit coverage by construction.
 - Experimental Windows App SDK channel in use (no LAF token); APIs may change between releases.
 - Phi Silica returns multi-token progress chunks → callback-based token counts undercount by roughly
   3x, so `usage` uses `ceil(chars/4)` on both sides instead (D44).

@@ -8,8 +8,8 @@ The model is small. Microsoft describes Phi Silica with a 4K-token context, and 
 Elite the runtime accepts roughly 13,400 characters of prompt and decodes at about 35 tokens per
 second by the bridge's own estimate (four characters per token). Short conversations work well, and a
 continuing conversation is cheap because the bridge keeps the model's context between turns. Long
-agent loops with a dozen tools will not fit, and the bridge says so in OpenAI's error format rather
-than hiding it.
+agent loops with a dozen tools will not fit, and the bridge answers with OpenAI's
+`context_length_exceeded` error instead of dropping turns on its own.
 
 ## Backends
 
@@ -22,8 +22,8 @@ than hiding it.
 Aion 1.0 Instruct, Microsoft's Phi Silica replacement, ships in October and November 2026 as a model
 swap behind the same `Microsoft.Windows.AI.Text` API, so the `phi-silica` backend is the path that will
 serve it. The preview SDK adapter is a stopgap. Aion 1.0 Plan, the 14B reasoning model with a 32K
-window and native tool calling, is a separate model with no SDK yet; it is tracked as an issue, not a
-backend.
+window and native tool calling, is a separate model with no SDK yet; a GitHub issue tracks it until
+one exists.
 
 ## Requirements
 
@@ -70,7 +70,8 @@ dependency, with one elevation prompt.
 .\src\NpuBridge\bin\Debug\net10.0-windows10.0.26100.0\win-arm64\NpuBridge.exe --backend phi-silica
 ```
 
-The first load takes up to about 25 seconds (8 seconds once the model is warm). Watch for
+The first load takes up to about 25 seconds. Later starts take anywhere from under a second to
+about 8 seconds, depending on whether the Windows runtime still holds the model. Watch for
 `"status":"ready"` from `curl.exe http://127.0.0.1:5273/healthz`, then send the same request with
 `"model":"phi-silica"`.
 
@@ -92,8 +93,11 @@ There is no authentication. The client library insists on a key, so pass anythin
 and it streams over server-sent events like any other OpenAI provider.
 
 `scripts/smoke.ps1 -Backend phi-silica` checks the whole surface against the hardware in three to
-five minutes, including the context cache and the overflow handling. Re-run `identity.ps1 -Install`
-whenever the build output folder or the manifest changes.
+five minutes: health with identity, both response shapes, the cut, the context cache, the overflow
+refusal and `--truncate-history` on a second server, and at the end that the relaunched child
+process exited and the port is free. It starts and tears down three helper servers along the way,
+each with its own pass or fail row. Re-run `identity.ps1 -Install` whenever the build output folder
+or the manifest changes.
 
 ## How a request travels
 
@@ -175,11 +179,12 @@ matched case-insensitively); any other id is a 404 with code `model_not_found`, 
 and the reply always names the model that served it. `temperature`, `top_p` and `top_k` reach Phi
 Silica, and `temperature` and `top_p` are range-checked as OpenAI's schema states. `max_tokens`,
 `max_completion_tokens` and `stop` are enforced by the bridge, since neither Windows API offers them:
-output is cut at the limit and the generation cancelled, which really does stop the accelerator rather
-than only the client. An assistant message's `tool_calls` are carried and distinguish conversations
-in the cache, but tool calling itself is not emulated yet: `tools`, `tool_choice` and a few other
-parameters are accepted and ignored with one warning each per process. `n` above 1 is a 400, and so
-is `stream_options` without `stream: true`.
+output is cut at the limit and the generation cancelled, and cancelling stops the accelerator.
+Measured on the streaming path, a prompt cut after four tokens finished in about a fifth of the time
+the same prompt took with a generous cap. An assistant message's `tool_calls` are carried and
+distinguish conversations in the cache, but tool calling itself is not emulated yet: `tools`,
+`tool_choice` and a few other parameters are accepted and ignored with one warning each per process.
+`n` above 1 is a 400, and so is `stream_options` without `stream: true`.
 
 The response and chunk objects carry every field OpenAI's schema requires, including the nullable ones
 (`logprobs`, `refusal`, a `finish_reason` on every streamed choice, and `"usage": null` on the chunks
@@ -198,7 +203,7 @@ everything.
 | `--listen <url[;url]>` | `http://127.0.0.1:5273` | localhost only unless you change it, and no auth |
 | `--context-cache-size <n>` | `4` | conversations whose model context is kept between turns; `0` disables |
 | `--truncate-history` | off | drop the oldest exchanges on overflow instead of returning 400 |
-| `--context-window-hint <tokens>` | `4096` | a warning is logged when a conversation reaches nine tenths of it; the model's own answer, not this hint, decides overflow |
+| `--context-window-hint <tokens>` | `4096` | a warning is logged when a conversation reaches nine tenths of it; overflow itself is decided by the model's preflight |
 | `--system-prompt-placement auto\|native\|prompt` | `auto` | deliver the system message through the backend's own context, or fold it into the prompt text |
 | `--self-relaunch on\|off` | on | see the note below on why the process relaunches |
 | `--install-model` | off | let Phi Silica fetch its model through Windows Update if missing, several gigabytes |
@@ -240,17 +245,22 @@ generating, which is why it arrives in milliseconds. A backend without that pref
 preview SDK) can only say so by failing the generation, and with `--truncate-history` the bridge
 retries after that failure too.
 
-**Token counts are estimates**, characters over four on both sides, not a tokenizer's output. The
-SDK exposes no tokenizer, and progress callbacks would undercount by about three times on this
-hardware. On a cache hit `prompt_tokens` still counts the whole conversation, not only the turns that
-were sent.
+**Token counts are estimates**: characters divided by four, on both `prompt_tokens` and
+`completion_tokens`. The SDK exposes no tokenizer, and progress callbacks would undercount by about
+three times on this hardware. On a cache hit `prompt_tokens` still counts the whole conversation,
+including the turns that were not sent. An open issue evaluates the Phi-3 tokenizer for real counts.
 
-**One request at a time is intent, not enforcement.** Nothing serializes concurrent generations against
-the single model handle, and concurrent requests on hardware are untested.
+**Concurrent requests are not serialized.** Nothing queues generations against the single model
+handle, and concurrent requests on hardware are untested. A request queue is planned.
 
-**System prompts work, but the rendering is why.** A bare prompt through `/debug/generate` gets
-ignored; the same instruction inside the rendered transcript is obeyed. A finding from the diagnostic
-endpoint is a finding about the raw model, not about this API.
+**System prompts work because of the rendering.** The same instruction is ignored when sent bare
+through `/debug/generate` and obeyed when it arrives inside the rendered transcript. Use the
+diagnostic endpoint to learn about the raw model, and the chat endpoint to learn about this API.
+
+**The model runtime can fail its first generation after a start.** Twice in one day the first
+request after start answered 502 with `The remote procedure call failed`, and every later request in
+that process answered `The RPC server is unavailable`. Nothing is logged by Windows. Restarting the
+bridge clears it; the bridge does not yet recreate the model on its own.
 
 ## Repository layout
 
@@ -275,8 +285,10 @@ nuget-local/               where the Aion SDK nupkg goes (gitignored; the adapte
 
 Start with `docs/PLAN.md` for the design and the order remaining work lands in, `docs/DECISIONS.md`
 for why things are the way they are, and `docs/FUTURE.md` for what is deliberately not done.
-Remaining work is tool-call emulation and a request queue with `/v1/completions`; each is a GitHub
-issue.
+Remaining work, in order: real token counts from the Phi-3 tokenizer, a consolidation of the two
+endpoints' shared pipeline, tool-call emulation, then a request queue with `/v1/completions`. Each is
+a GitHub issue. The tests run against the fake backend and need no NPU; the smoke script is the
+hardware check.
 
 ## References
 

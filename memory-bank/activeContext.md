@@ -50,7 +50,11 @@ generation after start (seen twice now, 2026-09-11); the re-run is clean.
   under TestServer. Deferred: keep-alive waits through the injected `TimeProvider`.
 - The README rewritten for chunk 5 and validated again (real layout, two Mermaid diagrams, a
   references section, no contributing section); a humanizer pass over the docs; the gitleaks path
-  allowlists for docs removed (notes are scanned; a full-history scan is clean).
+  allowlists for docs removed (notes are scanned; a full-history scan is clean). After D79 the
+  README was updated again (what the smoke script proves, the start-time range measured today, the
+  RPC-fault surprise, the work order) with a second humanizer pass, and the whole memory bank was
+  refreshed: test and smoke-script conventions in `systemPatterns.md`, today's measurements and the
+  RPC fault in `techContext.md`, the smoke-trust row in `progress.md`.
 
 ## Open threads
 - Issues #14, #15, #16 (the 2026-09-11 coverage audit): #14's items 7 to 12 and its "move into
@@ -69,6 +73,10 @@ generation after start (seen twice now, 2026-09-11); the re-run is clean.
   (the owner kept 4096); the header is lost on a stream that truncates after a keep-alive.
 - Aion's overflow status is unmeasured; the status-driven truncation path (D73) is exercised by the
   fake only and must be re-checked when any Aion generation runs.
+- The runtime RPC fault after a start leaves the bridge serving a dead model handle
+  (`docs/FUTURE.md`). A candidate `bug` issue: recreate the `LanguageModel` and drop the cache when a
+  generation fails with an RPC-class HRESULT, or at least turn `/healthz` to 503. Not filed yet; the
+  owner decides.
 - Do not re-investigate the Aion blocker on this machine (D70).
 
 ## How to resume

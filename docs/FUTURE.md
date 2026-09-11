@@ -38,6 +38,13 @@ issues filed that day. `coverlet.collector` is now in the test project; run
 `dotnet test --collect:"XPlat Code Coverage"` for the report.
 The first six unit tests and the smoke script's first three items landed on 2026-09-11 (D79); the
 rest of both issues stays open, as does the CI job.
+- **Recreate the model after a runtime RPC fault.** Twice on 2026-09-11 the first generation after a
+  Phi Silica start failed with `COMException: The remote procedure call failed`, and every later
+  generation in that process failed with `The RPC server is unavailable (0x800706BA)`; nothing in the
+  Application log, and a restart cleared it. The bridge maps both to 502 `backend_error` and keeps
+  serving a dead handle. `PhiSilicaBackend` could dispose and recreate the `LanguageModel` (and drop
+  every cached context) when a generation fails with an RPC-class HRESULT, or `/healthz` could at
+  least turn 503 after one. Needs a decision on whether to retry the request that hit the fault.
 - **Keep-alive waits driven by the injected `TimeProvider`.** `WaitForFirstDeltaAsync` calls
   `Task.Delay` on the wall clock, so a test can prove a non-positive first delay is accepted but not
   what it falls back to (zero or any non-negative span would pass), and the disabled-interval test's
