@@ -117,11 +117,22 @@ internal sealed class ChatCompletionsEndpoint
             // shapes answer the same backend status differently.
             var cancelledByCut = 0;
 
+            // How the callback tells this task that the cut fired. The callback never cancels anything
+            // itself: it runs on the backend's thread, and cancelling from there is wrong twice over. A
+            // straight Cancel() can complete the generation's await inline and re-enter the adapter while
+            // it is still inside this callback (Phi Silica then spins draining a callback that cannot
+            // finish until we return); and CancelAfter(0) moves the cancel onto a timer thread, where a
+            // throwing registration -- CsWinRT's IAsyncInfo.Cancel() on the live operation is one -- is
+            // rethrown with nothing above it to catch it, and the process terminates. So the callback
+            // sets this and the request task, awaiting below, cancels on its own thread inside a try.
+            // RunContinuationsAsynchronously keeps that continuation off the callback thread too.
+            var cutSignal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
             // 7. A fresh context per request, disposed in the finally: D11 says a context whose generation
             // did not end Complete has indeterminate state, and there is no cache to return it to yet.
             context = backend.CreateContext(prepared.NativeSystem);
 
-            var result = await backend.GenerateAsync(
+            var generation = backend.GenerateAsync(
                 context,
                 prepared.Rendered.Prompt,
                 prepared.Sampling,
@@ -152,17 +163,31 @@ internal sealed class ChatCompletionsEndpoint
                     if (cut)
                     {
                         Volatile.Write(ref cancelledByCut, 1);
-
-                        // Deliberately not a straight Cancel(): this runs on the backend's callback
-                        // thread, and cancelling there can complete the generation's own await inline —
-                        // re-entering the adapter while it is still inside this callback (Phi Silica
-                        // then spins draining a callback that cannot finish until we return). Zero delay
-                        // moves the cancellation onto a timer thread, which costs a delta or two of
-                        // overshoot and nothing else: the cut itself is applied to the final text.
-                        generationCts.CancelAfter(TimeSpan.Zero);
+                        cutSignal.TrySetResult();
                     }
                 },
-                generationCts.Token).ConfigureAwait(false);
+                generationCts.Token);
+
+            // Whichever comes first. When it is the cut, cancel here -- on this thread, guarded -- and
+            // then wait for the generation to end as it would have anyway. The overshoot is a delta or
+            // two and costs nothing: the cut itself is applied to the final text below. Cancelling
+            // faults when a registration on the token throws, and that is a Debug line here rather than
+            // a failure, because the generation still ends, the text is still cut, and the finally still
+            // disposes the context -- exactly as the streaming path treats its own cancel.
+            if (!ReferenceEquals(await Task.WhenAny(generation, cutSignal.Task).ConfigureAwait(false), generation))
+            {
+                try
+                {
+                    await generationCts.CancelAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogDebug(ex, "req={RequestId} cancelling the generation at the cut threw; waiting for it to end anyway.",
+                        requestId);
+                }
+            }
+
+            var result = await generation.ConfigureAwait(false);
 
             stopwatch.Stop();
             var totalMs = stopwatch.Elapsed.TotalMilliseconds;

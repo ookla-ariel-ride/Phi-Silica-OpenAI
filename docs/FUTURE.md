@@ -93,12 +93,10 @@ land here instead of widening the chunk. Each entry says where it came from and 
   `ChatRequestPreparation` guards `ReadFromJsonAsync` for `JsonException` and `InvalidOperationException`
   only. Pre-existing and identical on main — the extraction merely moved it — but the streaming path now
   shares it.
-- **The non-streaming callback can touch a disposed `CancellationTokenSource`.** `CancelAfter` runs on
-  the backend's progress thread, and `PhiSilicaBackend.DrainCallbacks()` bounds its wait for in-flight
-  callbacks at 5 s then continues anyway; a straggler past that bound calls `CancelAfter` on a source the
-  request has already disposed. Harmless today only because the adapter wraps `onDelta` in a try/catch
-  whose result is by then never read. The streaming path is immune by construction — its sink touches
-  only `Interlocked` and a channel writer.
+- ~~**The non-streaming callback can touch a disposed `CancellationTokenSource`.**~~ Resolved with #5
+  (2026-09-10, D63): the callback no longer cancels anything. It sets a `TaskCompletionSource`, which
+  has no disposal to race, and the request task cancels on its own thread. The same change removed the
+  timer-thread crash that a throwing cancellation registration caused.
 - **No backpressure on a slow client.** The delta channel is unbounded, which is right for keeping the
   WinRT thread non-blocking, but a client that is slow rather than gone stalls the writer while the
   backend keeps generating into memory, and nothing signals the backend to slow down. Bounded by the

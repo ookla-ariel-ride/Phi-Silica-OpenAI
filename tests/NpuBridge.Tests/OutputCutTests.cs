@@ -512,6 +512,37 @@ public class OutputCutTests
         await WaitUntilAsync(() => fake.ActiveContexts == 0);
     }
 
+    /// <summary>
+    /// The cut cancels the generation, and cancelling runs the token's registrations; CsWinRT registers
+    /// one that calls <c>IAsyncInfo.Cancel()</c> on the live WinRT operation, a COM call that can throw.
+    /// The JSON path issued that cancel with <c>CancelAfter(0)</c> from the backend's callback, so the
+    /// throw surfaced on a timer thread where nothing could catch it and the process terminated; the
+    /// stream's in-loop cancel was unguarded too, so its fault took the unfiltered catch and the client
+    /// got the capped content followed by an error event instead of <c>finish_reason: "length"</c>.
+    /// Only the stream's finally was guarded, and the only test with a throwing registration streamed
+    /// with no limits at all, so neither cut branch was ever exercised.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_throwing_cancellation_registration_does_not_break_the_cut(bool stream)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => ["Hello", " world"],
+            ThrowFromCancellationRegistration = true,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var completion = await CompleteAsync(host, stream, Body(stream, maxTokens: 1));
+
+        Assert.Equal("Hell", completion.Content);
+        Assert.Equal("length", completion.FinishReason);
+        Assert.Equal(1, completion.CompletionTokens);
+
+        await WaitUntilAsync(() => fake.ActiveContexts == 0);
+    }
+
     // ------------------------------------------------------------- the cutter itself
 
     [Fact]

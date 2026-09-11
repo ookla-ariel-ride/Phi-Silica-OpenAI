@@ -155,7 +155,7 @@ internal sealed class ChatCompletionsStreamEndpoint
                         // finally's cancel-drain-dispose then runs unchanged, so the context is still
                         // disposed exactly once and only after the generation task has ended.
                         cancelledByCut = true;
-                        await generationCts.CancelAsync().ConfigureAwait(false);
+                        await CancelGuardedAsync(generationCts, logger, requestId, "at the cut").ConfigureAwait(false);
                         break;
                     }
                 }
@@ -303,20 +303,10 @@ internal sealed class ChatCompletionsStreamEndpoint
             // while that task runs is a use-after-dispose, not merely an unobserved task. Cancelling
             // first is what keeps the wait short; awaiting is what makes the disposal safe.
             // Guarded because this was the one statement in the method outside a try, and it stands
-            // between a failure and the disposal below. CancelAsync faults when a registration on the
-            // token throws, and CsWinRT registers one that calls IAsyncInfo.Cancel() on the live WinRT
-            // operation -- a COM call that can fail rather than no-op. Letting it escape would skip both
-            // the drain and Dispose(), leaking exactly the handle D43 guarantees is released: worse than
-            // the D51 defect, which disposed too early rather than never.
-            try
-            {
-                await generationCts.CancelAsync().ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                logger.LogDebug(ex, "req={RequestId} cancelling the generation threw; draining and disposing anyway.",
-                    requestId);
-            }
+            // between a failure and the disposal below: letting a throw escape would skip both the drain
+            // and Dispose(), leaking exactly the handle D43 guarantees is released -- worse than the D51
+            // defect, which disposed too early rather than never.
+            await CancelGuardedAsync(generationCts, logger, requestId, "on the way out").ConfigureAwait(false);
 
             if (generation is not null)
             {
@@ -334,6 +324,27 @@ internal sealed class ChatCompletionsStreamEndpoint
             }
 
             context?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Cancels the generation without letting the cancel itself fail the request. <c>CancelAsync</c>
+    /// faults when a registration on the token throws, and CsWinRT registers one that calls
+    /// <c>IAsyncInfo.Cancel()</c> on the live WinRT operation — a COM call that can fail rather than
+    /// no-op. Both places this handler cancels, the cut and the exit, go on to await the generation and
+    /// dispose the context regardless, so a throw here is a Debug line and nothing more. Cancelling a
+    /// source twice is a no-op, so calling this at the cut and again on the way out is fine.
+    /// </summary>
+    private static async Task CancelGuardedAsync(CancellationTokenSource generationCts, ILogger logger, string requestId, string where)
+    {
+        try
+        {
+            await generationCts.CancelAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "req={RequestId} cancelling the generation {Where} threw; draining and disposing anyway.",
+                requestId, where);
         }
     }
 
