@@ -23,8 +23,9 @@ machine; the NPU is here.
 - Sparse package `NpuBridge_0.1.0.0_arm64__jtas4mnxdyzpe` registered for
   `src\NpuBridge\bin\Debug\net10.0-windows10.0.26100.0\win-arm64`; cert `CN=npu-bridge-dev` in
   `CurrentUser\My`, trusted in `LocalMachine\TrustedPeople`.
-- Not yet installed: Aion framework MSIX (chunk 6; 1.4 GB from the sample repo's releases) and its
-  SDK NuGet in `nuget-local/`.
+- Installed 2026-09-11: the Aion framework MSIX (1.3 GB, from the sample repo's v1.0.0.0 release), its
+  SDK NuGet in `nuget-local/` (gitignored), and the two Qualcomm QNN provider packages (see "Aion
+  facts" below for why they cannot be loaded here).
 
 ## Phi Silica facts (SDK 2.4)
 - `LanguageModel.CreateAsync`, `CreateContext()` / `CreateContext(system)` / `(system, filter)`,

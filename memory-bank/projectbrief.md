@@ -58,9 +58,11 @@ LoRA adapters, Microsoft Store publication. Tracked in `docs/FUTURE.md`.
 1. Skeleton, fake backend, `/healthz`, `/v1/models`, service verbs, identity packaging script. **Done.**
 2. Phi Silica adapter, self-relaunch via activation, logon-task verbs, smoke script. **Done.**
 3. Non-streaming chat completions with message flattening. **Done.**
-4. SSE streaming with cancellation and mid-stream error handling.
-5. Context cache, overflow mapping, optional history truncation.
-6. Aion adapter.
+4. SSE streaming with cancellation and mid-stream error handling. **Done.**
+5. Context cache, overflow mapping, optional history truncation. **Next.**
+6. Aion adapter. **Done, code-verified only** (this machine's OS blocks the provider load, D70). Note
+   that Aion Instruct itself ships in October/November 2026 as a model swap behind the Phi Silica API,
+   so the flag change in goal 2 may end up being no change at all.
 7. Tool-calling emulation.
 8. Concurrency/queueing, `/v1/completions`, client docs.
 

@@ -3,7 +3,7 @@
 ## Works today (verified)
 | Area | Status | Evidence |
 |---|---|---|
-| Solution, build, tests | ✅ | `dotnet build` clean, 387 xunit tests green (review bugs #5/#6/#8 merged 2026-09-10) |
+| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; 404 xunit tests green (chunk 6 merged 2026-09-11) |
 | `/healthz`, `/v1/models`, `/v1` fallback | ✅ | TestServer tests + live curl on the exe |
 | Config precedence json < local < env < CLI | ✅ | real-file test + live probes |
 | CLI verbs `run`, `service`, `task`, `help`, `version` | ✅ | tests + live exit codes |

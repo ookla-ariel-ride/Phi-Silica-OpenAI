@@ -31,8 +31,10 @@ so those tools can run fully local, offline, and free.
 
 ## Known user-facing behaviours (decided)
 - Default listener `http://127.0.0.1:5273`; default backend `phi-silica`.
-- Model ids: `phi-silica` and `fake` today; `aion-instruct` is planned for chunk 6, when the Aion
-  adapter lands — no backend emits it yet.
+- Model ids: `phi-silica`, `aion-instruct` and `fake`. `/v1/models` lists `aion-instruct` whenever
+  `--backend aion` starts, but on this machine `/healthz` reports the backend as failed (the OS cannot
+  load the QNN provider, D70), so every generation answers 503 `model_unavailable`. When the SDK NuGet
+  is absent at build time the adapter is compiled out and `/healthz` says so (D66).
 - `POST /v1/chat/completions` works end to end on both response shapes: a non-streaming client gets a
   correct OpenAI-shaped response with message content, `finish_reason` and a `usage` block; `stream:
   true` gets server-sent events (one `chat.completion.chunk` per delta, keep-alive comments while the

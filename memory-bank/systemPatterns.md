@@ -3,28 +3,33 @@
 ## Shape
 ```
 NpuBridge (exe, ARM64)          NpuBridge.Core (net10.0, no WinRT)          NpuBridge.Tests
-  Program.cs (CLI, host)  --->    Api/        endpoints, OpenAI DTOs, errors     TestServer + FakeBackend
-  Backends/PhiSilica*              Backends/   ILanguageModelBackend, Lifecycle, Fake
+  Program.cs (CLI, host)  --->    Api/        endpoints (JSON + SSE shapes, shared   TestServer + FakeBackend
+  Backends/PhiSilica*                          preparer), OpenAI DTOs, errors, cut
+  Backends/Aion* (AION_SDK)        Backends/   ILanguageModelBackend, Lifecycle, Fake,
+  Backends/PackageDependency                   DeltaAccumulator (shared by both adapters)
   PackageActivation.cs             Configuration/ options, binder, CLI, sources
   ServiceCommands/TaskCommands     Hosting/    sc.exe + schtasks builders, identity
   ProcessIdentity.cs               Prompting/  PromptTemplate (message flattening)
-                                    (not yet)   Context/, Streaming/, Tools/
+                                    (not yet)   Context/ (chunk 5), Tools/ (chunk 7)
 ```
 Logic lives in Core so it is testable without the NPU; the exe holds only wiring, WinRT adapters and
-Windows-specific glue. Tests boot the real endpoint pipeline in-process. `Context/` (cache, chunk 5),
-`Streaming/` (SSE, chunk 4) and `Tools/` (tool-call emulation, chunk 7) don't exist yet; there is no
-separate `Engine/` folder — the request pipeline below lives in `Api/ChatCompletionsEndpoint`.
+Windows-specific glue. Tests boot the real endpoint pipeline in-process. `Context/` (cache, chunk 5)
+and `Tools/` (tool-call emulation, chunk 7) don't exist yet; streaming lives in
+`Api/ChatCompletionsStreamEndpoint` beside the JSON shape, not in a separate folder. `AionBackend`
+compiles only when `nuget-local/` holds the Aion nupkg (`AionSdkAvailable`, D66); CI builds without it.
 
-## Request flow (as built through chunk 3)
-`ChatCompletionsEndpoint.PostAsync` does, in order: parse the JSON body (malformed body → 400, no
-context created) → validate the DTO against what the deserializer can actually produce, not just what
-the type declares (400 on failure, no context created) → check the backend is `Ready` (503 if not, no
-context created) → warn once per process on any accepted-but-ignored parameter → render the prompt
-(`PromptTemplate`, chooses native vs. prompt-folded system placement) → create the context → generate,
-in a `finally` that disposes the context on every path that reached this point (success, overflow,
-content filter, backend `Error`/`Cancelled`, a thrown exception, client abort) → shape the OpenAI
-response JSON → log the outcome. There is no context cache yet (chunk 5): every request creates and
-disposes its own context.
+## Request flow (as built through chunk 6)
+`ChatRequestPreparer` does the shared part for both shapes, in order: parse the JSON body (malformed
+body → 400, no context created) → validate the DTO against what the deserializer can actually produce,
+not just what the type declares (400 on failure, no context created) → check the backend is `Ready`
+(503 if not, no context created) → warn once per process on any accepted-but-ignored parameter →
+choose the system-prompt placement → render the prompt (`PromptTemplate`) → compute the output limits
+(`max_tokens`/`stop`, D53). Then `ChatCompletionsEndpoint` (JSON) or `ChatCompletionsStreamEndpoint`
+(SSE) creates the context → generates, watching deltas for the cut → disposes the context in a
+`finally` on every path that reached this point (success, overflow, content filter, backend
+`Error`/`Cancelled`, a thrown exception, client abort; the stream cancels → drains → disposes, D51) →
+shapes the OpenAI response → logs the outcome. There is no context cache yet (chunk 5): every request
+creates and disposes its own context.
 
 ## Conventions this chunk established
 - **Validate what the deserializer can produce, not just what the type says.** `System.Text.Json` will
@@ -51,8 +56,19 @@ disposes its own context.
   `GenerationResult(Text, Status, Detail)`. Cancellation is `GenerationStatus.Cancelled` with partial
   text, never an escaping exception.
 - `Capabilities` flags (SamplingOptions, SystemPromptContext, PromptLengthPreflight, Cancellation) tell
-  the pipeline what to branch on. Aion lacks the first three; Phi Silica has all four.
+  the pipeline what to branch on. Phi Silica has all four; the Aion adapter advertises `None` until a
+  cut measurement on hardware earns `Cancellation` (D68). `AionCapabilityProfileTests` pins what the
+  pipeline does under that profile (system text folded into the prompt, sampling dropped with one
+  warning, no preflight 400, overflow learned only from the generation).
 - Status enums are mapped by name per adapter (`Error` is 6 on Phi Silica, 2 on Aion).
+- **The text contract (D65):** `GenerationResult.Text` is the concatenation of the deltas delivered,
+  on every status (empty on `ContentFiltered`), so the JSON shape and the stream cut the same
+  characters. Both adapters get it from one Core class, `DeltaAccumulator` (D67): append and deliver
+  under one lock; drain in-flight callbacks in a `finally` on every exit (D69); a callback after the
+  barrier is dropped, counted as `late_deltas` only when the generation had *completed* (judged at
+  the barrier, not by the token, because the stream endpoint cancels the token on every path); a
+  runtime text that disagrees with the deltas counts `text_mismatches`. Both counters are in `/healthz`
+  and the smoke test asserts they stay zero. The delta sink must never block (chunks 7 and 8).
 - A context whose generation ended in anything but `Complete` is disposed, never reused.
 
 ## Fake backend as the contract's executable spec
@@ -77,6 +93,11 @@ service/task verbs bind through the same code.
   refuse secrets on the command line.
 - Windows App SDK auto-bootstrap is off; the adapter calls `Bootstrap.TryInitialize` with
   `OnPackageIdentity_NOOP` and records the outcome in `/healthz`.
+- Aion needs no identity: `PackageDependency` adds the Aion framework and Windows App Runtime 1.8 to
+  the process graph with the OS dynamic-dependency API (`TryCreatePackageDependency` +
+  `AddPackageDependency`, Arm64). Framework packages work that way anywhere; a *main* package (the
+  Qualcomm QNN provider Windows ML 1.8 loads) also needs the OS to append `WIN://SYSAPPID` to the
+  token, which this Insider build never does (D70), and package identity does not change that.
 
 ## HTTP conventions
 - JSON is snake_case, nulls omitted; errors are `{"error":{"message","type","param","code"}}` with
@@ -88,4 +109,9 @@ service/task verbs bind through the same code.
 
 ## Review loop
 Each chunk: build + tests green → adversarial review (in-session subagent, then Codex) → fix in-scope
-findings → defer the rest to `docs/FUTURE.md` → append to `docs/DECISIONS.md` → commit.
+findings test-first → defer the rest to `docs/FUTURE.md` → append to `docs/DECISIONS.md` →
+whole-branch review → fast-forward merge to `main` → update `CLAUDE.md`, `docs/PLAN.md`,
+`docs/SESSION-HANDOFF.md` and this folder in the same session → close the issue from the merge
+commit. Chunk 6 was built by a forked subagent and reviewed by the parent session; hardware
+verification is part of an adapter chunk's definition of done and, when the machine cannot provide it,
+the chunk merges labelled code-verified only with the issue left open (chunk 6, D70).
