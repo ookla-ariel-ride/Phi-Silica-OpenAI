@@ -15,6 +15,15 @@ public sealed record DebugGenerateRequest(
     float? TopP,
     int? TopK);
 
+/// <summary>Request body for <c>POST /debug/tokenize</c>.</summary>
+public sealed record DebugTokenizeRequest(string? Text);
+
+/// <summary>The backend's token count of a literal text (D80). Not an OpenAI shape; for diagnostics and the smoke test.</summary>
+/// <param name="Counter">Which counter answered: <c>phi-3</c> or <c>chars/4</c>.</param>
+/// <param name="Chars">UTF-16 length of the text, the unit the preflight's answer is reported in.</param>
+/// <param name="Tokens">Tokens as the backend counts them, without framing tokens such as BOS.</param>
+public sealed record DebugTokenizeResponse(string Counter, int Chars, int Tokens);
+
 /// <summary>Raw backend result with timing. Not an OpenAI shape; for diagnostics and the smoke test.</summary>
 /// <param name="ProgressCallbacks">Number of delta callbacks. On Phi Silica each may carry several tokens.</param>
 /// <param name="Chars">Characters generated; <c>chars / 4</c> is the usual token estimate.</param>
@@ -44,7 +53,30 @@ public static class DebugEndpoints
     {
         ArgumentNullException.ThrowIfNull(app);
         app.MapPost("/debug/generate", GenerateAsync);
+        app.MapPost("/debug/tokenize", Tokenize);
         return app;
+    }
+
+    /// <summary>
+    /// The backend's token count of a literal text, so the smoke script can put the preflight's boundary
+    /// beside the tokenizer's count per build (D80). Needs no model: it answers while the backend is
+    /// still loading. Loopback only, like everything under <c>/debug</c>.
+    /// </summary>
+    private static IResult Tokenize(DebugTokenizeRequest? request, BackendLifecycle lifecycle, HttpContext http)
+    {
+        var remote = http.Connection.RemoteIpAddress;
+        if (remote is null || !IPAddress.IsLoopback(remote))
+        {
+            return OpenAiError.Result(StatusCodes.Status403Forbidden, "The debug endpoint accepts loopback connections only.", OpenAiError.InvalidRequest, code: "loopback_only");
+        }
+
+        if (request?.Text is null)
+        {
+            return OpenAiError.BadRequest("Body must be JSON with a 'text' string.", code: "missing_text", param: "text");
+        }
+
+        var counter = lifecycle.Backend.TokenCounter;
+        return Results.Json(new DebugTokenizeResponse(counter.Name, request.Text.Length, counter.Count(request.Text)), JsonDefaults.Options);
     }
 
     private static async Task<IResult> GenerateAsync(

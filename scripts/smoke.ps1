@@ -737,6 +737,47 @@ try {
         $lines -join "`n"
     }
 
+    # The D80 measurement, repeated per build: the preflight is the runtime's own tokenizer answering
+    # "this many characters fit", so if the bridge's counter is the runtime's, every text's fitting
+    # prefix counts the same number of tokens. Three texts with very different characters per token;
+    # the preflight is read off the 400 a lone over-length user message earns, which is passed to the
+    # model raw (D71), with no generation. A fake or a backend that counts chars/4 has nothing to compare.
+    Step 'tokenizer: the preflight boundary is the same token count for every text (D80)' {
+        $t = Get-Json '/debug/tokenize' 'POST' (@{ text = 'probe' } | ConvertTo-Json -Compress)
+        if ($t.counter -eq 'chars/4') { Skip "$Backend counts chars/4: no measured tokenizer to compare with the preflight" }
+        $probe = Get-Json '/debug/generate' 'POST' (@{ prompt = 'Say OK.' } | ConvertTo-Json -Compress)
+        if ($null -eq $probe.usable_prompt_chars) { Skip "$Backend has no preflight to compare the tokenizer with" }
+
+        $fox = ('The quick brown fox jumps over the lazy dog. ' * 5000) + "`nSummarize the text above in one sentence."
+        $json = '[' + ((1..3000 | ForEach-Object { "{`"id`":$_,`"value`":$(($_ * 7919) % 10007),`"tag`":`"item-$_`"}" }) -join ',') + ']'
+        $cjk = (-join (0x673A, 0x5668, 0x5B66, 0x4E60, 0x662F, 0x4EBA, 0x5DE5, 0x667A, 0x80FD, 0x7684, 0x4E00, 0x4E2A, 0x5206, 0x652F, 0x3002 | ForEach-Object { [char]$_ })) * 3000
+        $texts = [ordered]@{ 'fox filler' = $fox; 'json objects' = $json; 'cjk' = $cjk }
+
+        $rows = foreach ($name in $texts.Keys) {
+            $text = $texts[$name]
+            $body = @{ model = $servedModel; messages = @(@{ role = 'user'; content = $text }) } | ConvertTo-Json -Compress -Depth 5 -EscapeHandling EscapeNonAscii
+            $e = Get-Json '/v1/chat/completions' 'POST' $body -expect 400
+            $m = [regex]::Match([string]$e.error.message, 'can take (\d+) characters of the (\d+)-character prompt')
+            if (-not $m.Success) { throw "${name}: expected the preflight refusal, got: $($e.error.message)" }
+            if ([int]$m.Groups[2].Value -ne $text.Length) { throw "${name}: the message says the prompt is $($m.Groups[2].Value) characters but the lone user message is $($text.Length); it was not passed raw" }
+            $usable = [int]$m.Groups[1].Value
+            $c = Get-Json '/debug/tokenize' 'POST' (@{ text = $text.Substring(0, $usable) } | ConvertTo-Json -Compress -EscapeHandling EscapeNonAscii)
+            [pscustomobject]@{ Name = $name; Usable = $usable; Tokens = [int]$c.tokens; CharsPerToken = [Math]::Round($usable / [Math]::Max(1, [int]$c.tokens), 2) }
+        }
+
+        $max = ($rows | Measure-Object Tokens -Maximum).Maximum
+        $min = ($rows | Measure-Object Tokens -Minimum).Minimum
+        $spread = $max - $min
+        $lines = @($rows | ForEach-Object { "$($_.Name): $($_.Usable) chars fit = $($_.Tokens) $($t.counter) tokens ($($_.CharsPerToken) chars/token)" })
+        # Two per cent covers the punctuation-cluster drift measured on 2026-09-11 (about 1 %); a
+        # different vocabulary, or the preflight read in the wrong units (bytes as chars puts CJK at
+        # three times the count), lands far outside it.
+        if ($spread -gt [Math]::Ceiling($max * 0.02)) {
+            throw (($lines + "the counts differ by $spread tokens, more than 2 % of ${max}: the runtime's tokenizer is not the bridge's counter, or the preflight is being read in the wrong units") -join '; ')
+        }
+        ($lines + "spread $spread tokens; the usable window of an empty context is about $max $($t.counter) tokens") -join "`n"
+    }
+
     if ($ToolProbeRuns -gt 0) {
         Step "tool-call compliance probe ($ToolProbeRuns runs)" {
             Skip 'tool calling arrives in chunk 7; tools/tool_choice are accepted and ignored in chunk 3'
