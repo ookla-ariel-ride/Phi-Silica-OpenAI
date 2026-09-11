@@ -29,15 +29,15 @@ land here instead of widening the chunk. Each entry says where it came from and 
 
 ## Chunk 5 deferrals (context cache and overflow handling)
 
-- **After a truncation, every later request in that conversation misses and truncates again.** The
-  context is stored under the key of the *truncated* transcript plus the reply; the client keeps
-  sending the full transcript, whose prefixes never match it. The result is correct (the reply is
-  right and the turns dropped are the same ones), but each request replays the whole transcript and
-  pays the preflight rounds again. Two ways out, both with a catch: also try the suffixes of the
-  transcript as lookup keys when `--truncate-history` is on (a suffix hit is exactly what truncation
-  produced, but only under that switch, since otherwise it would hand a cached context to a longer
-  history it never saw), or remember per stored context how many leading turns it lacks. Either needs
-  a test that a suffix hit is never taken without the switch.
+- **After a truncation, the next request in that conversation pays refused preflight rounds before it
+  hits (corrected 2026-09-11, D78).** This entry first said every later request misses and replays.
+  It does not: the truncation loop drops the same exchanges again and the shortened transcript's own
+  prefix keys are the stored key, so the follow-up hits the truncated context with only the new turn
+  rendered. `TruncationTests.The_turn_after_a_truncation_finds_the_truncated_context_without_a_replay`
+  pins it. The remaining cost is one fresh context, one preflight and one disposal per exchange dropped
+  before the hit, milliseconds on Phi Silica. A suffix lookup on the first pass was considered and
+  rejected: it would match a cached shorter conversation against a longer one that still fits, and
+  truncate it for nothing.
 - **Mixed formats on a hit after a raw first turn.** The common `curl` case sends one bare user
   message, which is passed through raw; its continuation is rendered as a marker-format tail on the
   same context, so the model sees a raw string followed by `### Conversation so far`. The smoke test

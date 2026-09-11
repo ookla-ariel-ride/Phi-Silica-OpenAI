@@ -15,7 +15,7 @@ Only `main` exists.
 Feature Rollout with a registry key, retail in November with Phi Silica removed, no LAF token.
 `PhiSilicaBackend` is therefore the production Aion path. Details in `techContext.md`.
 
-495 tests pass. `scripts/smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648,
+496 tests pass. `scripts/smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648,
 including the two chunk 5 steps. D77 (same day) made the wire shapes follow OpenAI's schema: `model`
 is required and must be the served id, and the required-but-nullable fields are written as nulls. `/healthz` is the readiness check, not the package list.
 
@@ -65,6 +65,6 @@ is required and must be the served id, and the required-but-nullable fields are 
 ## How to resume
 1. Read `CLAUDE.md`, then `docs/DECISIONS.md` (D71 to D76 for chunk 5) and the chunk 5 section of
    `docs/FUTURE.md`.
-2. `dotnet build; dotnet test` (495). `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298` should pass
+2. `dotnet build; dotnet test` (496). `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298` should pass
    every step (1 skipped, 5 informational). Do not build while a smoke server is running.
 3. Issue #9, then chunk 7 (issue #3). Read the issue and its comments before starting.

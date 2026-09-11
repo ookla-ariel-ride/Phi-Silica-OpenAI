@@ -2,9 +2,11 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
+using NpuBridge.Api;
 using NpuBridge.Backends;
 using NpuBridge.Backends.Fake;
 using NpuBridge.Configuration;
+using NpuBridge.Prompting;
 
 namespace NpuBridge.Tests;
 
@@ -29,14 +31,14 @@ public class TruncationTests
     /// Three exchanges of filler plus the question: 7 turns, 399 rendered characters. Dropping one
     /// exchange leaves 298, two leave 197, three leave 96 -- so a 250-character window fits after two.
     /// </summary>
-    private static object[] LongConversation() =>
+    private static object[] LongConversation(int turnChars = 40) =>
     [
-        Msg("user", new string('a', 40)),
-        Msg("assistant", new string('b', 40)),
-        Msg("user", new string('c', 40)),
-        Msg("assistant", new string('d', 40)),
-        Msg("user", new string('e', 40)),
-        Msg("assistant", new string('f', 40)),
+        Msg("user", new string('a', turnChars)),
+        Msg("assistant", new string('b', turnChars)),
+        Msg("user", new string('c', turnChars)),
+        Msg("assistant", new string('d', turnChars)),
+        Msg("user", new string('e', turnChars)),
+        Msg("assistant", new string('f', turnChars)),
         Msg("user", "final question"),
     ];
 
@@ -408,5 +410,50 @@ public class TruncationTests
         Assert.Equal(2, fake.Calls.Count);
         Assert.Equal(2, fake.ContextsCreated);
         Assert.Equal(2, fake.ContextsDisposed);
+    }
+
+    [Fact]
+    public async Task The_turn_after_a_truncation_finds_the_truncated_context_without_a_replay()
+    {
+        // Request 1 overflows and is answered after two exchanges are dropped; its context is stored
+        // under the truncated transcript's key. Request 2 sends the full transcript plus the reply and
+        // a new question. Its own prefixes miss, the preflight refuses the whole thing again, and the
+        // truncation loop drops the same two exchanges, at which point the shortened transcript's
+        // prefix keys are exactly the stored key: a hit, on the same context, with only the new turn
+        // rendered. The cost is the refused preflight rounds, never a second generation of the history.
+        var capture = new CapturingLoggerProvider();
+        // 200-character turns: the whole render is 1,359 characters, 517 after two exchanges are
+        // dropped; the fake counts what a context has absorbed plus the incoming prompt, so a
+        // 640-character window leaves room for the 90-character tail of the follow-up on the cached
+        // context. (With 40-character turns and a 250 window the tail did not fit and a third
+        // exchange went, which is the fake being tiny, not the lookup failing.)
+        var fake = new FakeBackend(new FakeBackendOptions { MaxPromptChars = 640, Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture,
+            options: new BridgeOptions { Backend = BackendKind.Fake, TruncateHistory = true });
+
+        var first = await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = LongConversation(200) });
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        Assert.Equal("4", Assert.Single(first.Headers.GetValues("x-npu-bridge-truncated-turns")));
+        var contextsAfterFirst = fake.ContextsCreated;
+
+        var followUp = LongConversation(200).Concat([Msg("assistant", "ok"), Msg("user", "one more")]).ToArray();
+        var second = await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = followUp });
+        Assert.True(second.StatusCode == HttpStatusCode.OK, await second.Content.ReadAsStringAsync());
+        Assert.Equal("4", Assert.Single(second.Headers.GetValues("x-npu-bridge-truncated-turns")));
+
+        // Same context, one prior exchange in its history, and only the new question rendered.
+        Assert.Equal(2, fake.Calls.Count);
+        Assert.Equal(fake.Calls[0].ContextId, fake.Calls[1].ContextId);
+        Assert.Single(fake.Calls[1].History);
+        Assert.Equal(PromptTemplate.RenderTail([new ChatMessage("user", ChatMessageContent.FromText("one more"), null, null)]), fake.Calls[1].Prompt);
+
+        // What it cost: fresh contexts created for the refused preflight rounds and released again, no
+        // generation on any of them; the hit counter moved by one.
+        Assert.Equal(1, host.Cache.Count);
+        Assert.Equal(1, host.Cache.Hits);
+        Assert.Equal(fake.ContextsCreated - 1, fake.ContextsDisposed);
+        Assert.True(fake.ContextsCreated > contextsAfterFirst, "the follow-up paid at least one refused preflight round on a fresh context");
+        var line = capture.Records.Last(r => r.Message.Contains("cache=", StringComparison.Ordinal)).Message;
+        Assert.Contains("cache=hit tail_turns=1 truncated_turns=4", line, StringComparison.Ordinal);
     }
 }

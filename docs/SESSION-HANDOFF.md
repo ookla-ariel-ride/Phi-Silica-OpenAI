@@ -23,7 +23,7 @@ time.
 |---|---|
 | OS build | 29648 |
 | `dotnet build` | clean, 0 warnings, both with the Aion SDK and `-p:AionSdkAvailable=false` |
-| `dotnet test` | 495 passed, 0 failed |
+| `dotnet test` | 496 passed, 0 failed |
 | `smoke.ps1 -Backend phi-silica -Port 5298` | all steps passed, 1 skipped, 5 informational, twice today (before and after the review fixes) |
 | Branches | only `main`, locally and on origin (the chunk 5 branch was deleted after the fast-forward) |
 | GitHub issues | #1 closed by the merge; #2 open (hardware half of chunk 6); #3, #4, #9, #10, #11 open |
@@ -66,7 +66,8 @@ time.
 ## Do this next
 
 Decisions the owner made on 2026-09-11, in order of work: (1) the suffix lookup so a truncated
-conversation is found again (a new issue); (2) the Phi-3 tokenizer for real token counts, measured
+conversation is found again, withdrawn the same evening because the follow-up already hits (D78,
+issue #12 closed with the test as evidence); (2) the Phi-3 tokenizer for real token counts, measured
 against the preflight first and adopted only if the vocabularies agree, `tokenizer.model` vendored
 (a new issue); (3) issue #9; (4) chunk 7. Also settled: the strict `model` policy of D77 stays; the
 `--context-window-hint` default stays 4096; the repository was renamed to `npu-bridge`.
@@ -116,7 +117,7 @@ against the preflight first and adopted only if the vocabularies agree, `tokeniz
 ```powershell
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\Phi-Silica-OpenAI
 git status; git log --oneline -3                          # expect main at or after ef29693, tree clean
-dotnet build; dotnet test                                 # expect 495 passed
+dotnet build; dotnet test                                 # expect 496 passed
 .\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 1 skipped, 5 informational
 gh issue list                                             # #2, #3, #4, #9, #10, #11 open
 ```

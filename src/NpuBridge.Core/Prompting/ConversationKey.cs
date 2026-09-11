@@ -5,10 +5,16 @@ using NpuBridge.Api;
 
 namespace NpuBridge.Prompting;
 
-/// <summary>One cacheable prefix of a transcript: the first <see cref="TurnCount"/> turns, keyed.</summary>
-/// <param name="TurnCount">How many leading turns the prefix covers. The last of them is an assistant turn.</param>
-/// <param name="Key">The conversation key of <c>(system, turn_0 … turn_{TurnCount-1})</c>.</param>
-public sealed record ConversationPrefix(int TurnCount, string Key);
+/// <summary>
+/// One cacheable prefix of a transcript: <see cref="TurnCount"/> turns starting <see cref="Offset"/>
+/// turns in, keyed. The offset is zero for the transcript's own prefixes and positive only for the
+/// suffix candidates a session tries under <c>--truncate-history</c>, where a cached context holds a
+/// transcript whose oldest exchanges were dropped (issue #12).
+/// </summary>
+/// <param name="TurnCount">How many turns the prefix covers, counted from <see cref="Offset"/>. The last of them is an assistant turn.</param>
+/// <param name="Key">The conversation key of <c>(system, turn_offset … turn_{offset+TurnCount-1})</c>.</param>
+/// <param name="Offset">Leading turns of the transcript that the prefix does not cover.</param>
+public sealed record ConversationPrefix(int TurnCount, string Key, int Offset = 0);
 
 /// <summary>
 /// The context cache's identity function (PLAN section 2.5): SHA-256 over a canonical encoding of

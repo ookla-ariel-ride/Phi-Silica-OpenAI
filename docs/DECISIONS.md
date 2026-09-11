@@ -945,3 +945,18 @@ re-run passed every step). A Codex review added two more schema rules: `message.
 required-but-nullable and is now written as a null, and the `/v1/models/{id}` 404 now carries
 `param: null` like the chat endpoint's. The null-usage dictionary is allocated per chunk rather than
 shared. 495 tests.
+
+**D78. No suffix lookup for truncated conversations: the truncation loop already finds them.** Issue
+#12 asked for a lookup that tries the transcript's suffixes so a context stored under a truncated
+transcript is found again. Written as a test first, the follow-up turn hit the truncated context on
+the unchanged code: the loop drops the same exchanges, and the shortened transcript's prefix keys are
+the stored key. The only cost is the refused preflight rounds before the hit (a fresh context, one
+preflight, a disposal per dropped exchange), which the test pins beside the hit. The first version of
+the test used 40-character turns and a 250-character window and saw a third exchange dropped; that
+was the fake's window counting the tail's headings against what the context had absorbed, not a
+lookup failure, and it is why the test uses 200-character turns. A suffix lookup on the first pass
+would have been worse than nothing: a cached shorter conversation would match the tail of a longer
+one that still fits, and the longer one would lose its oldest turns for no reason. The
+`docs/FUTURE.md` entry that prompted the issue overstated the cost ("replays the whole transcript")
+and is corrected. `ConversationPrefix` gained an `Offset` field while this was being explored; it is
+always zero and stays for the record of what was tried.
