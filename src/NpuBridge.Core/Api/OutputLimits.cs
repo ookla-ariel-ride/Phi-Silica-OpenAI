@@ -144,8 +144,11 @@ internal readonly record struct CutResult(string Text, string? FinishReason);
 /// can move when text arrives: a merge can reach into the word still being written, and a run of one
 /// character can retokenize from its start when one more arrives (twenty hyphens are "----" first,
 /// twenty-one are "-" first), so nothing inside the trailing whitespace-free run is settled (D80).
-/// SentencePiece pieces never span a whitespace boundary, so everything before the whitespace run
-/// that precedes the last word is. Near the budget (within <see cref="NearBudgetReserveTokens"/>
+/// A SentencePiece piece carries its leading word-boundary marker and does not run on past a space,
+/// so everything before the whitespace run that precedes the last word is settled. (Thirty-seven of
+/// the 32,000 pieces do contain a carriage return or a no-break space, which <see cref="TrailingWordStart"/>
+/// treats as a boundary too; a merge across one of those can only lower the settled prefix's count,
+/// never raise it, so the budget is not overshot.) Near the budget (within <see cref="NearBudgetReserveTokens"/>
 /// tokens of it) the stream releases only settled text and commits the cap only once its index is
 /// settled, or the generation ends; far from the budget a provisional count cannot matter and text
 /// flows as it arrives. A reply with no whitespace at all (CJK) never settles, so its exact cut is
@@ -382,8 +385,9 @@ internal sealed class OutputCutter
 
     /// <summary>
     /// Steps an index back one when it would fall between the two halves of a surrogate pair. Neither
-    /// <see cref="OutputLimits.Holdback"/> (longest stop minus one) nor <see cref="OutputLimits.MaxChars"/>
-    /// (tokens times four) has any relationship to character boundaries, so both can land mid-pair.
+    /// <see cref="OutputLimits.Holdback"/> (longest stop minus one) nor the budget's index (a token
+    /// boundary, which the counters report raw) has any relationship to character boundaries, so both
+    /// can land mid-pair.
     ///
     /// Stepping back matters because the halves do not merely arrive late, they are destroyed: each
     /// slice is serialized as its own JSON string, and <c>System.Text.Json</c> writes a lone surrogate

@@ -142,6 +142,12 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
         var stopwatch = Stopwatch.StartNew();
         _model = await Guarded(() => LanguageModel.CreateAsync().AsTask(cancellationToken), "CreateAsync").ConfigureAwait(false);
         _diagnostics["create_ms"] = stopwatch.ElapsedMilliseconds;
+
+        // The Phi-3 counter parses its 500 KB model on first use (D80). Pay that here, while the backend
+        // is still loading, rather than on the first request after /healthz says ready.
+        stopwatch.Restart();
+        _ = TokenCounter.Count("warm");
+        _diagnostics["tokenizer_load_ms"] = stopwatch.ElapsedMilliseconds;
     }
 
     public IModelContext CreateContext(string? systemPrompt)

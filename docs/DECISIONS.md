@@ -422,7 +422,9 @@ guard, not a measurement. Verified by running the whole suite twenty times in pa
 individual runs from 2 s to 18 s and stayed green.
 
 **D55. Phi Silica does not report an over-length prompt as over-length, and takes 26 s to say
-anything; chunk 5 must use the preflight instead.** Measured on this machine by `scripts/smoke.ps1
+anything; chunk 5 must use the preflight instead.** (Amended by D80: a prompt moderately over the
+window does get `PromptLargerThanContext`, in about 600 ms; the 225 KB prompt below is the case that
+gets the generic error. The preflight stays the decision, and it answers in UTF-8 bytes.) Measured on this machine by `scripts/smoke.ps1
 -Backend phi-silica` with a 225,042-character prompt, and confirmed directly outside the script. Three
 facts, all from that run:
 
@@ -1124,3 +1126,13 @@ about 3 % of a five-second reply), with no encoding at all once the stop has bee
 `prompt_tokens` under chars/4 now rounds the native system text and the prompt separately, which can
 read one token higher than the old `ceil((system + prompt) / 4)`, accepted as immaterial for an
 estimate. 630 tests.
+The second reviewer (a Claude subagent) reached the same two findings independently, with a fuzz over
+twelve corpora: 480 randomised stream trials with the real counter never went over budget, the
+largest re-merge shift seen was two tokens (the reserve is eight), and the stream and whole-text cuts
+disagreed only on runs of one character, exactly the case the settled rule now excludes. It added a
+nuance recorded in the cutter's comment: thirty-seven of the 32,000 pieces contain a carriage return
+or a no-break space, so "a piece never spans whitespace" is not literally true; a merge across one of
+those can only lower the settled prefix's count, so the budget still cannot be overshot. Also from
+that review: the Phi-3 counter is warmed during the adapter's initialization rather than on the first
+request; the tokenizer smoke step no longer spends a generation to learn whether the preflight exists;
+folded system placement has a usage test; D55 carries a pointer to the amendment.

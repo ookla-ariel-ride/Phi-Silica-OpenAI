@@ -102,6 +102,44 @@ public class TokenUsageTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
+    public async Task Prompt_usage_under_folded_placement_counts_the_system_text_once_inside_the_prompt(bool stream)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => ["Blue"],
+            TokenCounter = new TenPerCharCounter(),
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake, new Configuration.BridgeOptions
+        {
+            Backend = Configuration.BackendKind.Fake,
+            SystemPromptPlacement = Configuration.SystemPromptPlacement.Prompt,
+        });
+
+        const string system = "Answer in one word.";
+        var usage = await UsageAsync(host, stream, new
+        {
+            model = "fake",
+            stream,
+            stream_options = stream ? new { include_usage = true } : null,
+            messages = new object[]
+            {
+                new { role = "system", content = system },
+                new { role = "user", content = "Name a colour." },
+            },
+        });
+
+        // Folded: the system text travels inside the prompt and the context gets none, so the prompt
+        // alone is the whole transcript and the system text is counted exactly once.
+        var call = Assert.Single(fake.Calls);
+        Assert.Null(call.SystemPrompt);
+        Assert.Contains(system, call.Prompt, StringComparison.Ordinal);
+        Assert.Equal(call.Prompt.Length * 10, usage.PromptTokens);
+        host.AssertNoLeak();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
     public async Task Prompt_usage_on_a_cache_hit_counts_the_whole_transcript_not_the_tail(bool stream)
     {
         static FakeBackend Fake() => new(new FakeBackendOptions

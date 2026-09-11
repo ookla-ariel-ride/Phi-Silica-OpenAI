@@ -239,7 +239,7 @@ rest of both issues stays open, as does the CI job.
   only if the hint is set below the measured 3581-token window. Deferred with the chunk 5 note on the
   default hint (from D80).
 - **`usage` disagrees between the shapes on a filtered reply.** Extends the content asymmetry above: the
-  stream counts what it actually sent (`cutter.ContentLength`) while the JSON path counts the blanked
+  stream counts what it actually sent (the cutter's emitted text) while the JSON path counts the blanked
   content, so the same filtered generation reports N completion tokens streamed and 0 as JSON. No test
   asserts either number, so the divergence is unpinned.
 - **A client that disconnects while uploading its body throws an unhandled `OperationCanceledException`.**

@@ -750,10 +750,11 @@ try {
     # the preflight is read off the 400 a lone over-length user message earns, which is passed to the
     # model raw (D71), with no generation. A fake or a backend that counts chars/4 has nothing to compare.
     Step 'tokenizer: the preflight boundary is the same token count for every text (D80)' {
+        # Only a backend with a measured tokenizer gets here, and every such backend has the preflight the
+        # tokenizer was measured against; a missing preflight shows up below as a non-400 or a message
+        # without the preflight's numbers, so no generation is spent finding out first.
         $t = Get-Json '/debug/tokenize' 'POST' (@{ text = 'probe' } | ConvertTo-Json -Compress)
         if ($t.counter -eq 'chars/4') { Skip "$Backend counts chars/4: no measured tokenizer to compare with the preflight" }
-        $probe = Get-Json '/debug/generate' 'POST' (@{ prompt = 'Say OK.' } | ConvertTo-Json -Compress)
-        if ($null -eq $probe.usable_prompt_chars) { Skip "$Backend has no preflight to compare the tokenizer with" }
 
         $fox = ('The quick brown fox jumps over the lazy dog. ' * 5000) + "`nSummarize the text above in one sentence."
         $json = '[' + ((1..3000 | ForEach-Object { "{`"id`":$_,`"value`":$(($_ * 7919) % 10007),`"tag`":`"item-$_`"}" }) -join ',') + ']'

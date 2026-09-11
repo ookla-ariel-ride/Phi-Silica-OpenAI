@@ -377,7 +377,7 @@ public class TokenBudgetCutTests
         });
         await using var host = await BridgeTestHost.StartAsync(fake);
 
-        // Seven tokens: The, quick, brown, fox, j, umps... measured against the reference tokenizer.
+        // Seven tokens (The | quick | brown | fo | x | j | umps), measured against the reference tokenizer.
         var (content, finish, completionTokens) = await CompleteAsync(host, stream, maxTokens: 7);
 
         Assert.Equal("The quick brown fox jumps", content);
