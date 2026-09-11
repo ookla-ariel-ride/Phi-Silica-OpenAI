@@ -10,7 +10,7 @@
 | Fake backend with faults/threads/init rules | ✅ | tests |
 | Sparse package identity (`identity.ps1`) | ✅ | registered; PFN `NpuBridge_jtas4mnxdyzpe` |
 | Self-relaunch via package activation + supervision | ✅ | child had identity, saw shell env, died with the parent |
-| Phi Silica adapter (experimental SDK) | ⚠️ | smoke passed the morning of 2026-09-10 (generate, preflight, system prompt, disconnect drain); **unusable since the 29661 Insider flight that evening** (workload packages fail to register, model `NotReady`); #7's text-contract change is on `review-fixes`, build-verified only |
+| Phi Silica adapter (experimental SDK) | ✅ | smoke passed 2026-09-11 on build 29648 (generate, preflight, system prompt, disconnect drain, text contract: `text_mismatches=0 late_deltas=0`, D65). Insider flight 29661 broke it on 2026-09-10 (workload packages fail to register, model `NotReady`); rolled back |
 | `/v1/chat/completions` non-streaming | ✅ | `ChatCompletionsTests`; smoke on the real NPU: 677 ms–899 ms across runs, correct shape and usage |
 | `/v1/chat/completions` streaming (SSE) | ✅ | `ChatCompletionsStreamingTests` (framing, error event, keep-alive, disconnect drain); smoke streaming step on the NPU |
 | Client-side cut: `max_tokens`, `max_completion_tokens`, `stop` | ✅ | `OutputCutTests` on both shapes; smoke shows the cut cancels the NPU (D53) |
