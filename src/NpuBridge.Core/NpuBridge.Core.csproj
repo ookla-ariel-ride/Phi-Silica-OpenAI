@@ -16,6 +16,13 @@
   <ItemGroup>
     <!-- Endpoint mapping lives here so TestServer-based tests cover the real HTTP surface. -->
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <!-- Phi-3 token counts for usage and the max_tokens budget on Phi Silica (D80). Managed only. -->
+    <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Phi-3.5-mini's SentencePiece model, MIT; see Tokenizers/Phi3/README.md for provenance. -->
+    <EmbeddedResource Include="Tokenizers\Phi3\tokenizer.model" LogicalName="NpuBridge.Tokenizers.Phi3.tokenizer.model" />
   </ItemGroup>
 
   <ItemGroup>
