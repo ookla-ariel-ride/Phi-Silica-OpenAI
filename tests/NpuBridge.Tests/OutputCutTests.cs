@@ -472,6 +472,46 @@ public class OutputCutTests
         Assert.Equal(fake.ContextsCreated, fake.ContextsDisposed);
     }
 
+    /// <summary>
+    /// "The cut caused this cancellation" has to be a fact the handler recorded when it cancelled, not
+    /// something inferred from the cutter afterwards. The two shapes inferred it from different inputs:
+    /// the JSON path from the whole-text cut, which includes a cap committed by the flush, the stream
+    /// from <c>IsCut</c> before its flush. So a backend that reported <c>Cancelled</c> on its own, with
+    /// a reply ending inside the lookahead window, was HTTP 200 <c>length</c> on one shape and a 502
+    /// on the other. Neither handler cancelled here — eight characters is four past the budget, less
+    /// than the holdback of nine — so this is a failure on both.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_backend_cancelled_the_handler_did_not_ask_for_is_a_failure_even_when_the_flush_commits_a_cap(bool stream)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => ["abcd", "efgh"],
+            FailAfterTokens = 2,
+            FailureStatus = GenerationStatus.Cancelled,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync(Path, Body(stream, maxTokens: 1, stop: "ZZZZZZZZZZ"));
+        var body = await response.Content.ReadAsStringAsync();
+
+        if (stream)
+        {
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Contains("\"error\"", body, StringComparison.Ordinal);
+            Assert.DoesNotContain("\"finish_reason\":\"length\"", body, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+            Assert.Contains("\"error\"", body, StringComparison.Ordinal);
+        }
+
+        await WaitUntilAsync(() => fake.ActiveContexts == 0);
+    }
+
     // ------------------------------------------------------------- the cutter itself
 
     [Fact]

@@ -109,6 +109,14 @@ internal sealed class ChatCompletionsEndpoint
             // Null when the request set no limits, which is the ordinary case and costs nothing.
             var watcher = limits.IsEmpty ? null : new OutputCutter(limits);
 
+            // Set when this handler cancels the generation because the watcher tripped a limit, and
+            // read when the status comes back: a Cancelled this handler asked for is the cut, any
+            // other Cancelled is a failure. Recorded as a fact rather than inferred from the cutter
+            // afterwards, because the whole-text cut below can commit a cap the watcher never
+            // cancelled for, and the stream reads a different cutter — so inferring it made the two
+            // shapes answer the same backend status differently.
+            var cancelledByCut = 0;
+
             // 7. A fresh context per request, disposed in the finally: D11 says a context whose generation
             // did not end Complete has indeterminate state, and there is no cache to return it to yet.
             context = backend.CreateContext(prepared.NativeSystem);
@@ -143,6 +151,8 @@ internal sealed class ChatCompletionsEndpoint
 
                     if (cut)
                     {
+                        Volatile.Write(ref cancelledByCut, 1);
+
                         // Deliberately not a straight Cancel(): this runs on the backend's callback
                         // thread, and cancelling there can complete the generation's own await inline —
                         // re-entering the adapter while it is still inside this callback (Phi Silica
@@ -185,12 +195,13 @@ internal sealed class ChatCompletionsEndpoint
             // Cancelled now reaches here legitimately whenever a limit fired.
             var filtered = result.Status is GenerationStatus.ContentFiltered or GenerationStatus.BlockedByPolicy;
 
-            // Only a Cancelled may be attributed to the cut. Gating the whole mapping on "a cut fired"
-            // suppressed every failure status, which is a regression against main: an Error that used to
-            // be a 502 became HTTP 200 with truncated text and finish_reason "length". Worse here than
-            // on the stream, because the whole-text cut can report a cap the watcher never cancelled
-            // for, so the suppression did not even need a cancellation to have happened.
-            var selfCancelled = cut.FinishReason is not null && result.Status is GenerationStatus.Cancelled;
+            // Only a Cancelled may be attributed to the cut, and only one this handler asked for. Gating
+            // the whole mapping on "a cut fired" suppressed every failure status, which was a regression
+            // against main: an Error that used to be a 502 became HTTP 200 with truncated text and
+            // finish_reason "length". And deciding "did the cut fire" from the whole-text cut was wrong
+            // too: it can report a cap the watcher never cancelled for, so a backend that reported
+            // Cancelled on its own was a success here and a failure on the stream.
+            var selfCancelled = Volatile.Read(ref cancelledByCut) == 1 && result.Status is GenerationStatus.Cancelled;
 
             if (!filtered && !selfCancelled && GenerationFailure.FromStatus(result) is { } failure)
             {

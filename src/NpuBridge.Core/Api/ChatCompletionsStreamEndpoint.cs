@@ -83,6 +83,12 @@ internal sealed class ChatCompletionsStreamEndpoint
         // chunk before the finish chunk.
         var roleSent = false;
 
+        // Set when this handler cancels the generation because a limit fired while streaming, and read
+        // when the status comes back. A fact recorded at the cancel, not inferred from the cutter
+        // afterwards: the JSON path infers it from a different cutter state, and the two shapes
+        // answered a backend's unprompted Cancelled differently (D62).
+        var cancelledByCut = false;
+
         IModelContext? context = null;
         Task<GenerationResult>? generation = null;
 
@@ -148,6 +154,7 @@ internal sealed class ChatCompletionsStreamEndpoint
                         // Stop consuming and stop the model. Whatever is still queued is discarded; the
                         // finally's cancel-drain-dispose then runs unchanged, so the context is still
                         // disposed exactly once and only after the generation task has ended.
+                        cancelledByCut = true;
                         await generationCts.CancelAsync().ConfigureAwait(false);
                         break;
                     }
@@ -185,10 +192,10 @@ internal sealed class ChatCompletionsStreamEndpoint
             // generic Error. Suppressing it hands the client HTTP 200, a truncated reply and
             // finish_reason "stop", with nothing to say the generation faulted.
             //
-            // IsCut is read before the flush deliberately: a cut this handler committed while streaming
-            // is the only kind that could have caused the cancellation, and one established later by
-            // Flush() cannot have, because nothing cancelled for it.
-            var selfCancelled = cutter.IsCut && result.Status is GenerationStatus.Cancelled;
+            // "The cut caused it" is the flag set beside the CancelAsync above, not the cutter's state:
+            // a cut established later by Flush() cannot have caused anything, because nothing cancelled
+            // for it, and a Cancelled the handler never asked for is a failure on both shapes.
+            var selfCancelled = cancelledByCut && result.Status is GenerationStatus.Cancelled;
             if (!selfCancelled && GenerationFailure.FromStatus(result) is { } failure)
             {
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
