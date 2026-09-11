@@ -817,7 +817,8 @@ public class OutputCutTests
             }
 
             var chunk = JsonDocument.Parse(payload).RootElement;
-            if (chunk.TryGetProperty("usage", out var usage))
+            // Every chunk carries "usage": null once usage was asked for; only the usage chunk has the object.
+            if (chunk.TryGetProperty("usage", out var usage) && usage.ValueKind == JsonValueKind.Object)
             {
                 completionTokens = usage.GetProperty("completion_tokens").GetInt32();
             }

@@ -316,7 +316,7 @@ internal sealed class ChatCompletionsEndpoint
             var body = new ChatCompletionResponse(
                 Id: requestId,
                 Created: time.GetUtcNow().ToUnixTimeSeconds(),
-                Model: prepared.Request.Model ?? backend.ModelId,
+                Model: backend.ModelId,
                 Choices: [new ChatCompletionChoice(0, new ChatCompletionResponseMessage("assistant", content), finishReason)],
                 Usage: new CompletionUsage(promptTokens, completionTokens, promptTokens + completionTokens));
 

@@ -909,3 +909,34 @@ note is in `docs/FUTURE.md`. Ten tests were added for the branches the reviews n
 the Phi Silica smoke run was repeated after the fixes with every step passing (hit TTFT 274 ms
 against a 417 ms replay; the preflight refusal again in 31 ms; the truncated request answered with
 the header after 16.1 s).
+
+## 2026-09-11 — OpenAI conformance pass
+
+Issue-less: a request from the owner to check the API against OpenAI's published schema and fix what
+was missing or out of place. Built on `openai-conformance`, checked against the `openai-openapi`
+repository's `openapi.yaml` (the `CreateChatCompletionResponse`, `CreateChatCompletionStreamResponse`,
+`ChatCompletionStreamResponseDelta`, `CompletionUsage`, `Error`, `Model` and `ListModelsResponse`
+schemas and the `CreateChatCompletionRequest` constraints).
+
+**D77. The wire shapes follow the schema's required-but-nullable fields, `model` is required and must
+be the served id, and the request constraints the schema states are enforced.** Six changes, each a
+schema rule. (a) `choices[].logprobs` and `message.refusal` are required on a chat completion and
+`choices[].finish_reason` on every streamed chunk; the serializer omits nulls everywhere else, so
+these three (and `logprobs` on chunks, which OpenAI's streams carry as null) are marked to be written
+as explicit nulls. (b) With `stream_options.include_usage`, every chunk before the usage chunk carries
+`"usage": null`, as OpenAI's do; without it the field is absent. The null travels in the chunk's
+extension data because a property cannot be both omitted-when-null and present-when-null. (c) The
+error envelope always carries all four keys; `param` and `code` are written as nulls when unset.
+(d) `model` is required (the schema's own list is `model, messages`; the message is OpenAI's "you
+must provide a model parameter"), and an id other than the served one is a 404 with code
+`model_not_found`, checked before readiness so a loading server answers it too. The reply's `model`
+is always the served id; the request's id is matched case-insensitively. The bridge used to default
+a missing id to its own and echo any other, which the chunk 3 review had already called dishonest:
+a client asking for `gpt-4o` was told it had been served by one. Clients configure a provider with
+the model id they will send, so `phi-silica` (or `fake`, `aion-instruct`) is what they send. (e)
+`temperature` outside 0 to 2, `top_p` outside 0 to 1 and `n` below 1 are 400s naming the parameter,
+on every backend, whether or not the backend applies the value. (f) `stream_options` without
+`stream: true` is a 400, in the schema's own words. Not changed: `system_fingerprint`,
+`service_tier`, the `usage` detail objects and `annotations` are optional in the schema and stay
+absent; `/v1/completions` is chunk 8. The smoke script already read `finish_reason` and `usage` with
+null-tolerant checks, so it passed unchanged on the fake backend. 488 tests.

@@ -89,7 +89,8 @@ public class ChatCompletionsStreamingTests
         var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => LongReply });
         await using var host = await BridgeTestHost.StartAsync(fake);
 
-        var chunks = await ReadChunksAsync(await PostStreamAsync(host, model: "my-model", includeUsage: true));
+        // The id is matched case-insensitively and the reply carries the served spelling (D77).
+        var chunks = await ReadChunksAsync(await PostStreamAsync(host, model: "FAKE", includeUsage: true));
 
         var id = chunks[0].GetProperty("id").GetString();
         var created = chunks[0].GetProperty("created").GetInt64();
@@ -100,7 +101,7 @@ public class ChatCompletionsStreamingTests
         {
             Assert.Equal(id, c.GetProperty("id").GetString());
             Assert.Equal(created, c.GetProperty("created").GetInt64());
-            Assert.Equal("my-model", c.GetProperty("model").GetString());
+            Assert.Equal("fake", c.GetProperty("model").GetString());
         });
     }
 
@@ -116,8 +117,10 @@ public class ChatCompletionsStreamingTests
         var last = withChoices[^1];
 
         Assert.Equal("stop", last.GetProperty("choices")[0].GetProperty("finish_reason").GetString());
+
+        // Present and null on every earlier chunk: the schema requires the key on each choice.
         Assert.All(withChoices.Take(withChoices.Count - 1), c =>
-            Assert.False(c.GetProperty("choices")[0].TryGetProperty("finish_reason", out _)));
+            Assert.Equal(JsonValueKind.Null, c.GetProperty("choices")[0].GetProperty("finish_reason").ValueKind));
     }
 
     [Fact]
@@ -144,12 +147,14 @@ public class ChatCompletionsStreamingTests
 
         var chunks = await ReadChunksAsync(await PostStreamAsync(host, includeUsage: true));
 
-        var usageChunks = chunks.Where(c => c.TryGetProperty("usage", out _)).ToList();
+        var usageChunks = chunks.Where(c => c.TryGetProperty("usage", out var u) && u.ValueKind == JsonValueKind.Object).ToList();
         var usageChunk = Assert.Single(usageChunks);
 
-        // Exactly one, it is the last chunk before [DONE], and it carries no choices.
-        Assert.True(chunks[^1].TryGetProperty("usage", out _));
+        // Exactly one, it is the last chunk before [DONE], and it carries no choices. Every other
+        // chunk carries "usage": null, as OpenAI's do once usage was asked for.
+        Assert.Equal(JsonValueKind.Object, chunks[^1].GetProperty("usage").ValueKind);
         Assert.Equal(0, usageChunk.GetProperty("choices").GetArrayLength());
+        Assert.All(chunks.Take(chunks.Count - 1), c => Assert.Equal(JsonValueKind.Null, c.GetProperty("usage").ValueKind));
 
         var json = await host.Client.PostAsJsonAsync(Path, Body(model: "fake", stream: false));
         var jsonUsage = JsonDocument.Parse(await json.Content.ReadAsStringAsync()).RootElement.GetProperty("usage");
@@ -374,7 +379,7 @@ public class ChatCompletionsStreamingTests
 
         // The two deltas that did get generated were streamed first, and nothing claimed a normal finish.
         Assert.Contains("one ", body, StringComparison.Ordinal);
-        Assert.DoesNotContain("finish_reason", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"finish_reason\":\"", body, StringComparison.Ordinal); // no stop, length or filter; the null on a role chunk is not a finish
         Assert.Equal(1, fake.ContextsCreated);
         Assert.Equal(1, fake.ContextsDisposed);
     }
@@ -508,7 +513,7 @@ public class ChatCompletionsStreamingTests
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Contains(": keep-alive", body, StringComparison.Ordinal);
-        Assert.DoesNotContain("finish_reason", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"finish_reason\":\"", body, StringComparison.Ordinal); // no stop, length or filter; the null on a role chunk is not a finish
         Assert.EndsWith("data: [DONE]\n\n", body, StringComparison.Ordinal);
 
         var error = ErrorEvent(body);

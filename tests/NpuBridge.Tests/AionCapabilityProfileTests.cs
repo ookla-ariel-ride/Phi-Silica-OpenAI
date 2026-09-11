@@ -44,7 +44,7 @@ public class AionCapabilityProfileTests
         var fake = new FakeBackend(new FakeBackendOptions { Capabilities = AionProfile, Responder = _ => ["I am Ada."] });
         await using var host = await BridgeTestHost.StartAsync(fake);
 
-        var response = await host.Client.PostAsJsonAsync(Path, new { model = "aion-instruct", stream, messages = ConversationWithSystem });
+        var response = await host.Client.PostAsJsonAsync(Path, new { model = "fake", stream, messages = ConversationWithSystem });
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         var call = Assert.Single(fake.Calls);
@@ -69,12 +69,12 @@ public class AionCapabilityProfileTests
             SystemPromptPlacement = SystemPromptPlacement.Native,
         });
 
-        var rejected = await host.Client.PostAsJsonAsync(Path, new { model = "aion-instruct", messages = ConversationWithSystem });
+        var rejected = await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = ConversationWithSystem });
         Assert.Equal(HttpStatusCode.BadRequest, rejected.StatusCode);
         Assert.Equal("system_prompt_placement_unsupported", (await ReadJson(rejected)).GetProperty("error").GetProperty("code").GetString());
         Assert.Empty(fake.Calls);
 
-        var served = await host.Client.PostAsJsonAsync(Path, new { model = "aion-instruct", messages = new[] { new { role = "user", content = "hi" } } });
+        var served = await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = new[] { new { role = "user", content = "hi" } } });
         Assert.Equal(HttpStatusCode.OK, served.StatusCode);
         var call = Assert.Single(fake.Calls);
         Assert.Null(call.SystemPrompt);
@@ -93,7 +93,7 @@ public class AionCapabilityProfileTests
         {
             var response = await host.Client.PostAsJsonAsync(Path, new
             {
-                model = "aion-instruct",
+                model = "fake",
                 temperature = 0.2,
                 top_p = 0.9,
                 top_k = 5,
@@ -147,7 +147,7 @@ public class AionCapabilityProfileTests
 
         var response = await host.Client.PostAsJsonAsync(Path, new
         {
-            model = "aion-instruct",
+            model = "fake",
             stream,
             messages = new[] { new { role = "user", content = "this prompt is longer than eight characters" } },
         });

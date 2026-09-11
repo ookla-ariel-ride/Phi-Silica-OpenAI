@@ -239,7 +239,13 @@ concurrent requests for one conversation each get their own context (the second 
 
 Live today:
 
-- Errors use the OpenAI body `{"error":{"message","type","param","code"}}`. An over-length
+- **Wire shapes follow OpenAI's schema (D77).** `model` is required and must be the served id (any
+  other is a 404 `model_not_found`; the reply always carries the served id); `choices[].logprobs`,
+  `message.refusal`, every streamed choice's `finish_reason` and every error's `param` and `code` are
+  written as explicit nulls when unset; with `include_usage` every chunk before the usage chunk carries
+  `"usage": null`; `temperature`, `top_p`, `n` and `stream_options` are range-checked as the schema
+  states. `OpenAiConformanceTests` pins each rule.
+- Errors use the OpenAI body `{"error":{"message","type","param","code"}}`, all four keys always present. An over-length
   transcript is HTTP 400 with code `context_length_exceeded` (from the preflight before any
   generation on Phi Silica, from the generation's status on a backend without one), and nothing is
   silently truncated. `--truncate-history` is the only switch that may drop turns instead: it removes

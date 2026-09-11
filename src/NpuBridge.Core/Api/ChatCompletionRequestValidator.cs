@@ -92,9 +92,42 @@ public static class ChatCompletionRequestValidator
             }
         }
 
+        // OpenAI's schema requires `model` beside `messages`, and its API answers a missing one with
+        // exactly this message. A drop-in provider that quietly served whatever model it had would let
+        // a client believe it had asked for something.
+        if (string.IsNullOrWhiteSpace(request.Model))
+        {
+            return ChatCompletionValidationResult.Invalid("you must provide a model parameter", param: "model");
+        }
+
+        if (request.N is < 1)
+        {
+            return ChatCompletionValidationResult.Invalid($"n must be at least 1; got {request.N}.", param: "n");
+        }
+
         if (request.N is > 1)
         {
             return ChatCompletionValidationResult.Invalid("n greater than 1 is not supported.", param: "n");
+        }
+
+        // The sampling ranges OpenAI enforces. Checked whether or not the backend applies the value,
+        // so a request is rejected the same way on every backend.
+        if (request.Temperature is { } temperature && (temperature < 0 || temperature > 2 || float.IsNaN(temperature)))
+        {
+            return ChatCompletionValidationResult.Invalid(
+                $"temperature must be between 0 and 2; got {temperature}.", param: "temperature");
+        }
+
+        if (request.TopP is { } topP && (topP < 0 || topP > 1 || float.IsNaN(topP)))
+        {
+            return ChatCompletionValidationResult.Invalid($"top_p must be between 0 and 1; got {topP}.", param: "top_p");
+        }
+
+        // "Only set this when you set stream: true" (the schema's own words for stream_options).
+        if (request.StreamOptions is not null && request.Stream != true)
+        {
+            return ChatCompletionValidationResult.Invalid(
+                "stream_options is only allowed when stream is true.", param: "stream_options");
         }
 
         // A cap of zero or less asks for no completion at all. OpenAI rejects it rather than returning an

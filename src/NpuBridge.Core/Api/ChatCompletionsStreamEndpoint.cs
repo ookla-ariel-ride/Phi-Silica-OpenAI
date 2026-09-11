@@ -67,7 +67,8 @@ internal sealed class ChatCompletionsStreamEndpoint
 
         // Identity of the reply, fixed once and repeated on every chunk: a client that stitches the
         // chunks back together must see the same id/created/model a non-streamed reply would carry.
-        var model = prepared.Request.Model ?? prepared.Backend.ModelId;
+        // The served id, never the requested one: preparation already refused any other (D77).
+        var model = prepared.Backend.ModelId;
         var created = time.GetUtcNow().ToUnixTimeSeconds();
         var includeUsage = prepared.Request.StreamOptions?.IncludeUsage == true;
 
@@ -156,7 +157,7 @@ internal sealed class ChatCompletionsStreamEndpoint
                 {
                     // The role chunk. OpenAI clients rely on it to open the assistant message.
                     roleSent = true;
-                    await sse.WriteChunkAsync(Chunk(requestId, created, model,
+                    await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
                         new ChatCompletionDelta("assistant", string.Empty), finishReason: null), aborted).ConfigureAwait(false);
 
                     // Deliberately not cancelled by `aborted`: the loop must end when the channel completes,
@@ -169,7 +170,7 @@ internal sealed class ChatCompletionsStreamEndpoint
                         var release = cutter.Accept(delta);
                         if (release.Length > 0)
                         {
-                            await sse.WriteChunkAsync(Chunk(requestId, created, model,
+                            await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
                                 new ChatCompletionDelta(null, release), finishReason: null), aborted).ConfigureAwait(false);
                         }
 
@@ -260,7 +261,7 @@ internal sealed class ChatCompletionsStreamEndpoint
                 // gone out yet. It still has to: a client builds the assistant message from it, and it
                 // has to precede the tail chunk below.
                 roleSent = true;
-                await sse.WriteChunkAsync(Chunk(requestId, created, model,
+                await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
                     new ChatCompletionDelta("assistant", string.Empty), finishReason: null), aborted).ConfigureAwait(false);
             }
 
@@ -299,12 +300,12 @@ internal sealed class ChatCompletionsStreamEndpoint
 
             if (tail.Length > 0)
             {
-                await sse.WriteChunkAsync(Chunk(requestId, created, model,
+                await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
                     new ChatCompletionDelta(null, tail), finishReason: null), aborted).ConfigureAwait(false);
             }
 
             // The last real chunk. Its delta is empty; it exists to carry finish_reason.
-            await sse.WriteChunkAsync(Chunk(requestId, created, model,
+            await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
                 new ChatCompletionDelta(null, null), finishReason), aborted).ConfigureAwait(false);
 
             // Usage, same chars/4 estimate on both sides as the non-streaming path (D44): the
@@ -506,13 +507,21 @@ internal sealed class ChatCompletionsStreamEndpoint
         return null;
     }
 
+    /// <summary>
+    /// One content-bearing chunk. With <paramref name="nullUsage"/> (the request asked for usage) it
+    /// carries <c>"usage": null</c>, as every chunk before the usage chunk must.
+    /// </summary>
     private static ChatCompletionChunk Chunk(
         string id,
         long created,
         string model,
+        bool nullUsage,
         ChatCompletionDelta delta,
-        string? finishReason) =>
-        new(id, created, model, [new ChatCompletionChunkChoice(0, delta, finishReason)]);
+        string? finishReason)
+    {
+        var chunk = new ChatCompletionChunk(id, created, model, [new ChatCompletionChunkChoice(0, delta, finishReason)]);
+        return nullUsage ? chunk.WithNullUsage() : chunk;
+    }
 
     /// <summary>
     /// Runs the generation and, whatever happens, closes the channel so the reader loop ends. A throw

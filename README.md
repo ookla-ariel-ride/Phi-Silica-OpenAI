@@ -143,12 +143,21 @@ question alone does not fit is still a 400.
 
 ## Request parameters
 
-`temperature`, `top_p` and `top_k` reach Phi Silica. `max_tokens`, `max_completion_tokens` and `stop`
-are enforced by the bridge, since neither Windows API offers them: output is cut at the limit and the
-generation cancelled, which really does stop the accelerator rather than only the client. An
-assistant message's `tool_calls` are carried and distinguish conversations in the cache, but tool
-calling itself is not emulated yet: `tools`, `tool_choice` and a few other parameters are accepted and
-ignored with one warning each per process. `n` above 1 is a 400.
+`model` is required and must be the id `/v1/models` lists (`phi-silica`, `fake` or `aion-instruct`,
+matched case-insensitively); any other id is a 404 with code `model_not_found`, as OpenAI answers,
+and the reply always names the model that served it. `temperature`, `top_p` and `top_k` reach Phi
+Silica, and `temperature` and `top_p` are range-checked as OpenAI's schema states. `max_tokens`,
+`max_completion_tokens` and `stop` are enforced by the bridge, since neither Windows API offers them:
+output is cut at the limit and the generation cancelled, which really does stop the accelerator rather
+than only the client. An assistant message's `tool_calls` are carried and distinguish conversations
+in the cache, but tool calling itself is not emulated yet: `tools`, `tool_choice` and a few other
+parameters are accepted and ignored with one warning each per process. `n` above 1 is a 400, and so
+is `stream_options` without `stream: true`.
+
+The response and chunk objects carry every field OpenAI's schema requires, including the nullable ones
+(`logprobs`, `refusal`, a `finish_reason` on every streamed choice, and `"usage": null` on the chunks
+before the usage chunk when you ask for usage), so a client generated from the schema reads them
+without presence checks.
 
 ## Configuration
 

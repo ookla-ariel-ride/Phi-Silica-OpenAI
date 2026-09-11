@@ -348,7 +348,8 @@ Found by a read of the merged tree after chunk 4, none load-bearing, none fixed 
   straight into `backend.CreateContext(nativeSystem)`. `FakeBackend` does not care; what the Phi Silica
   and Aion runtimes do with an empty system context is unmeasured. Collapse it to null at the call
   site, or measure it, before it matters.
-- **The response echoes back whatever `model` string the client sent.** `model` in the response body is
+- **The response echoes back whatever `model` string the client sent (resolved by D77: an unknown id
+  is a 404 `model_not_found`, a missing one a 400, and the reply always carries the served id).** `model` in the response body is
   `request.Model ?? backend.ModelId`, with no check that the requested model is the one being served, so
   a client asking for `gpt-4o` gets `"model": "gpt-4o"` back from the on-device model. Convenient for
   tools that assert on their own model id, and it is why the field is left alone for now, but it is not

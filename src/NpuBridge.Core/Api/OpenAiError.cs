@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Http;
 
 namespace NpuBridge.Api;
@@ -5,7 +6,15 @@ namespace NpuBridge.Api;
 /// <summary>OpenAI's error envelope: <c>{"error":{"message","type","param","code"}}</c>.</summary>
 public sealed record OpenAiErrorBody(OpenAiErrorDetail Error);
 
-public sealed record OpenAiErrorDetail(string Message, string Type, string? Param, string? Code);
+/// <summary>
+/// All four fields are required by OpenAI's schema; <c>param</c> and <c>code</c> are nullable, so they
+/// are written as explicit nulls rather than omitted like every other null the bridge serialises.
+/// </summary>
+public sealed record OpenAiErrorDetail(
+    string Message,
+    string Type,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Param,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Code);
 
 /// <summary>
 /// Error types are the ones OpenAI actually emits: <c>invalid_request_error</c> (including 404s for

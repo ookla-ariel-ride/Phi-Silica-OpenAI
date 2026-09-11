@@ -29,7 +29,7 @@ public class ChatCompletionRequestTests
     public void Array_of_parts_content_deserializes_in_order()
     {
         var json = """
-            {"messages":[{"role":"user","content":[
+            {"model":"fake","messages":[{"role":"user","content":[
                 {"type":"text","text":"first"},
                 {"type":"text","text":"second"}
             ]}]}
@@ -49,7 +49,7 @@ public class ChatCompletionRequestTests
     [Fact]
     public void Content_may_be_null_on_an_assistant_message()
     {
-        var json = """{"messages":[{"role":"assistant","content":null}]}""";
+        var json = """{"model":"fake","messages":[{"role":"assistant","content":null}]}""";
 
         var request = JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!;
         var message = Assert.Single(request.Messages!);
@@ -62,7 +62,7 @@ public class ChatCompletionRequestTests
     [Fact]
     public void Empty_string_content_on_a_user_message_is_valid()
     {
-        var json = """{"messages":[{"role":"user","content":""}]}""";
+        var json = """{"model":"fake","messages":[{"role":"user","content":""}]}""";
 
         var request = JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!;
         var result = ChatCompletionRequestValidator.Validate(request);
@@ -74,7 +74,7 @@ public class ChatCompletionRequestTests
     public void Tool_message_carries_name_and_tool_call_id()
     {
         var json = """
-            {"messages":[
+            {"model":"fake","messages":[
                 {"role":"user","content":"what's the weather"},
                 {"role":"tool","tool_call_id":"call_01","name":"get_weather","content":"{\"temp\":21}"}
             ]}
@@ -92,7 +92,7 @@ public class ChatCompletionRequestTests
     [Fact]
     public void Image_content_part_fails_validation_with_messages_param()
     {
-        var json = """{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://x"}}]}]}""";
+        var json = """{"model":"fake","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://x"}}]}]}""";
 
         var request = JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!;
         var result = ChatCompletionRequestValidator.Validate(request);
@@ -108,9 +108,9 @@ public class ChatCompletionRequestTests
     /// validation runs before the endpoint's try block, the request became a 500.
     /// </summary>
     [Theory]
-    [InlineData("""{"messages":[null]}""")]
-    [InlineData("""{"messages":[{"role":"user","content":"hi"},null]}""")]
-    [InlineData("""{"messages":[null,{"role":"user","content":"hi"}]}""")]
+    [InlineData("""{"model":"fake","messages":[null]}""")]
+    [InlineData("""{"model":"fake","messages":[{"role":"user","content":"hi"},null]}""")]
+    [InlineData("""{"model":"fake","messages":[null,{"role":"user","content":"hi"}]}""")]
     public void Null_message_element_fails_validation_instead_of_throwing(string json)
     {
         var request = JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!;
@@ -124,9 +124,9 @@ public class ChatCompletionRequestTests
     }
 
     [Theory]
-    [InlineData("""{"messages":[{"role":"user","content":[{"type":"text"}]}]}""")]
-    [InlineData("""{"messages":[{"role":"user","content":[{"type":"text","text":null}]}]}""")]
-    [InlineData("""{"messages":[{"role":"user","content":[{"type":"text","text":"ok"},{"type":"text"}]}]}""")]
+    [InlineData("""{"model":"fake","messages":[{"role":"user","content":[{"type":"text"}]}]}""")]
+    [InlineData("""{"model":"fake","messages":[{"role":"user","content":[{"type":"text","text":null}]}]}""")]
+    [InlineData("""{"model":"fake","messages":[{"role":"user","content":[{"type":"text","text":"ok"},{"type":"text"}]}]}""")]
     public void Text_content_part_without_text_fails_validation(string json)
     {
         var request = JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!;
@@ -140,7 +140,7 @@ public class ChatCompletionRequestTests
     [Fact]
     public void An_empty_text_content_part_stays_valid()
     {
-        var json = """{"messages":[{"role":"user","content":[{"type":"text","text":""}]}]}""";
+        var json = """{"model":"fake","messages":[{"role":"user","content":[{"type":"text","text":""}]}]}""";
 
         var request = JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!;
 
@@ -149,8 +149,8 @@ public class ChatCompletionRequestTests
 
     /// <summary>Ruled deliberate: a message with no content at all renders as empty text, not an error.</summary>
     [Theory]
-    [InlineData("""{"messages":[{"role":"user"}]}""")]
-    [InlineData("""{"messages":[{"role":"user","content":null}]}""")]
+    [InlineData("""{"model":"fake","messages":[{"role":"user"}]}""")]
+    [InlineData("""{"model":"fake","messages":[{"role":"user","content":null}]}""")]
     public void A_message_without_content_stays_valid(string json)
     {
         var request = JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!;
@@ -164,7 +164,7 @@ public class ChatCompletionRequestTests
     public void Unknown_or_missing_role_fails_validation(string? role)
     {
         var message = new ChatMessage(role, ChatMessageContent.FromText("hi"), null, null);
-        var request = new ChatCompletionRequest(null, [message], null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
+        var request = new ChatCompletionRequest("fake", [message], null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
 
         var result = ChatCompletionRequestValidator.Validate(request);
 
@@ -175,7 +175,7 @@ public class ChatCompletionRequestTests
     [Fact]
     public void Missing_messages_fails_validation()
     {
-        var request = new ChatCompletionRequest(null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
+        var request = new ChatCompletionRequest("fake", null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
 
         var result = ChatCompletionRequestValidator.Validate(request);
 
@@ -186,7 +186,7 @@ public class ChatCompletionRequestTests
     [Fact]
     public void Empty_messages_array_fails_validation()
     {
-        var request = new ChatCompletionRequest(null, [], null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
+        var request = new ChatCompletionRequest("fake", [], null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
 
         var result = ChatCompletionRequestValidator.Validate(request);
 
@@ -201,7 +201,7 @@ public class ChatCompletionRequestTests
     public void N_greater_than_one_fails_validation(int? n, bool expectedValid)
     {
         var message = new ChatMessage("user", ChatMessageContent.FromText("hi"), null, null);
-        var request = new ChatCompletionRequest(null, [message], null, n, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
+        var request = new ChatCompletionRequest("fake", [message], null, n, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
 
         var result = ChatCompletionRequestValidator.Validate(request);
 
@@ -223,7 +223,7 @@ public class ChatCompletionRequestTests
     public void Stream_is_valid_and_is_not_an_ignored_parameter(bool? stream)
     {
         var message = new ChatMessage("user", ChatMessageContent.FromText("hi"), null, null);
-        var request = new ChatCompletionRequest(null, [message], stream, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
+        var request = new ChatCompletionRequest("fake", [message], stream, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
 
         var result = ChatCompletionRequestValidator.Validate(request);
 
@@ -234,7 +234,7 @@ public class ChatCompletionRequestTests
     [Fact]
     public void Stream_options_deserializes_and_is_not_an_ignored_parameter()
     {
-        var json = """{"messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}""";
+        var json = """{"model":"fake","messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}""";
 
         var request = JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!;
 
@@ -248,6 +248,7 @@ public class ChatCompletionRequestTests
     {
         var json = """
             {
+                "model": "fake",
                 "messages": [{"role":"user","content":"hi"}],
                 "temperature": 0.5,
                 "top_p": 0.9,
@@ -290,9 +291,9 @@ public class ChatCompletionRequestTests
     public void Stop_as_bare_string_and_as_array_normalize_to_same_list()
     {
         var stringForm = JsonSerializer.Deserialize<ChatCompletionRequest>(
-            """{"messages":[{"role":"user","content":"hi"}],"stop":"END"}""", JsonDefaults.Options)!;
+            """{"model":"fake","messages":[{"role":"user","content":"hi"}],"stop":"END"}""", JsonDefaults.Options)!;
         var arrayForm = JsonSerializer.Deserialize<ChatCompletionRequest>(
-            """{"messages":[{"role":"user","content":"hi"}],"stop":["END"]}""", JsonDefaults.Options)!;
+            """{"model":"fake","messages":[{"role":"user","content":"hi"}],"stop":["END"]}""", JsonDefaults.Options)!;
 
         Assert.Equal(["END"], stringForm.Stop);
         Assert.Equal(["END"], arrayForm.Stop);
@@ -303,7 +304,7 @@ public class ChatCompletionRequestTests
     public void Stop_array_with_multiple_entries_normalizes_to_a_list()
     {
         var request = JsonSerializer.Deserialize<ChatCompletionRequest>(
-            """{"messages":[{"role":"user","content":"hi"}],"stop":["a","b"]}""", JsonDefaults.Options)!;
+            """{"model":"fake","messages":[{"role":"user","content":"hi"}],"stop":["a","b"]}""", JsonDefaults.Options)!;
 
         Assert.Equal(["a", "b"], request.Stop);
     }
@@ -361,7 +362,7 @@ public class ChatCompletionRequestTests
     public void Assistant_message_carries_its_tool_calls()
     {
         var json = """
-            {"messages":[{"role":"assistant","content":null,"tool_calls":[
+            {"model":"fake","messages":[{"role":"assistant","content":null,"tool_calls":[
               {"id":"call_01","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}
             ]}]}
             """;

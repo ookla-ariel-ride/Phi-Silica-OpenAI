@@ -117,6 +117,20 @@ internal static class ChatRequestPreparer
                 param: failure.Param));
         }
 
+        // 2a. The model must be the one this process serves. OpenAI answers any other id with a 404
+        // and this code; the bridge used to echo whatever id the client sent, which let a client
+        // asking for a cloud model believe it had been served by one (D77). Checked before readiness,
+        // like validation: it is a property of the request, and the served id is known while loading.
+        var servedModel = lifecycle.Backend.ModelId;
+        if (!string.Equals(request.Model, servedModel, StringComparison.OrdinalIgnoreCase))
+        {
+            ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars: 0, ttftMs: 0, tokens: 0,
+                status: "model_not_found", finish: "-", httpStatus: StatusCodes.Status404NotFound);
+            return ChatRequestPreparation.Failed(OpenAiError.NotFoundResult(
+                $"The model '{request.Model}' does not exist. This server exposes '{servedModel}'.",
+                code: "model_not_found"));
+        }
+
         // 3. Readiness, before any work.
         var snapshot = lifecycle.Snapshot;
         if (snapshot.Kind != BackendStateKind.Ready)

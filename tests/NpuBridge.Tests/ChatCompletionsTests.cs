@@ -42,16 +42,55 @@ public class ChatCompletionsTests
         host.AssertNoLeak();
     }
 
+    /// <summary>
+    /// OpenAI requires <c>model</c> and refuses any id it does not serve (D77). The bridge used to
+    /// fall back to its own id when the field was missing and to echo whatever id it was sent.
+    /// </summary>
     [Fact]
-    public async Task Model_falls_back_to_the_backend_id_when_the_request_omits_it()
+    public async Task A_request_without_a_model_is_a_400_naming_the_parameter()
     {
         var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["x"] });
         await using var host = await BridgeTestHost.StartAsync(fake);
 
         var response = await host.Client.PostAsJsonAsync(Path, new { messages = new[] { new { role = "user", content = "hi" } } });
 
-        var root = await ReadJson(response);
-        Assert.Equal("fake", root.GetProperty("model").GetString());
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var error = (await ReadJson(response)).GetProperty("error");
+        Assert.Equal("you must provide a model parameter", error.GetProperty("message").GetString());
+        Assert.Equal("model", error.GetProperty("param").GetString());
+        Assert.Empty(fake.Calls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task An_unknown_model_is_a_404_model_not_found_on_both_shapes(bool stream)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["x"] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync(Path, new { model = "gpt-4o", stream, messages = new[] { new { role = "user", content = "hi" } } });
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        var error = (await ReadJson(response)).GetProperty("error");
+        Assert.Equal("model_not_found", error.GetProperty("code").GetString());
+        Assert.Equal("invalid_request_error", error.GetProperty("type").GetString());
+        Assert.Contains("gpt-4o", error.GetProperty("message").GetString(), StringComparison.Ordinal);
+        Assert.Contains("fake", error.GetProperty("message").GetString(), StringComparison.Ordinal);
+        Assert.Empty(fake.Calls);
+        Assert.Equal(0, fake.ContextsCreated);
+    }
+
+    [Fact]
+    public async Task The_model_id_is_matched_case_insensitively_and_the_reply_carries_the_served_spelling()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["x"] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync(Path, new { model = "FAKE", messages = new[] { new { role = "user", content = "hi" } } });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("fake", (await ReadJson(response)).GetProperty("model").GetString());
     }
 
     [Fact]
@@ -490,7 +529,9 @@ public class ChatCompletionsTests
 
         var error = (await ReadJson(response)).GetProperty("error");
         Assert.Equal("n", error.GetProperty("param").GetString());
-        Assert.False(error.TryGetProperty("code", out _), "the n validation failure sets no code; a swap would put 'n' there");
+        // The n validation failure sets no code, and the schema requires the key anyway: present, null.
+        // A swap would put "n" there.
+        Assert.Equal(JsonValueKind.Null, error.GetProperty("code").ValueKind);
     }
 
     [Fact]
