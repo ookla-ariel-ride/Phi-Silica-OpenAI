@@ -3,7 +3,7 @@
 ## Works today (verified)
 | Area | Status | Evidence |
 |---|---|---|
-| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; 495 xunit tests green (chunk 5 and the D77 conformance pass merged 2026-09-11) |
+| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; 496 xunit tests green (chunk 5, the D77 conformance pass and D78 merged 2026-09-11) |
 | `/healthz`, `/v1/models`, `/v1` fallback | ✅ | TestServer tests + live curl on the exe |
 | Config precedence json < local < env < CLI | ✅ | real-file test + live probes |
 | CLI verbs `run`, `service`, `task`, `help`, `version` | ✅ | tests + live exit codes |
@@ -18,6 +18,7 @@
 | Prompt overflow → HTTP 400 `context_length_exceeded` | ✅ | Decided by the preflight before any generation (D73): the smoke test's 16.6K-character transcript is refused in 31 ms on the real NPU, with the preflight's numbers in the message (D75); `TruncationTests` on both shapes |
 | Context cache (`--context-cache-size`) | ✅ | `ConversationKeyTests`, `ContextCacheTests`, `ContextCacheEndpointTests` (hits/misses/eviction/concurrency/dispose-on-failure on both shapes); smoke on the NPU: continuation hit at 235 ms TTFT against a 392 ms replay, counters on `/healthz` (D71, D72, D74, D75) |
 | `--truncate-history` and `x-npu-bridge-truncated-turns` | ✅ | `TruncationTests` with and without a preflight; smoke on the NPU: the refused transcript answers with `truncated-turns: 4` on a second server (D73, D75) |
+| OpenAI wire conformance (D77) | ✅ | `OpenAiConformanceTests`: required-but-nullable fields written as nulls on both shapes, `usage: null` before the usage chunk, all four error keys, `model` required and served-only (404 `model_not_found`), schema ranges; Codex-reviewed; fake and Phi Silica smoke runs passed |
 | Logon task install/status/run/uninstall | ✅ | live, elevated (pre-supervisor build; `/End` path covered by kill-parent probe) |
 | Windows service verbs | ⚠️ | commands verified by tests and emulation; not exercised against the SCM |
 | gitleaks hook + CI | ✅ | planted secrets blocked |
@@ -73,3 +74,8 @@
   the same drain-on-exception and late-delta gaps in both adapters (D69), applied before the merge.
 - Chunk 5 (2026-09-11): built in-session on `chunk-5-context-cache` with 462 tests, then the Phi
   Silica smoke run (D75). Two adversarial reviews (a Claude subagent and Codex) found the same two defects, the exchange boundary at the first assistant turn and a throwing preflight leaking its context, and Codex a third, the JSON retry inheriting a cancelled token; all applied with ten tests (D76) and the smoke run repeated. Fast-forward merged to `main`.
+- OpenAI conformance pass (2026-09-11, D77): checked against the `openai-openapi` schema; a Codex
+  review found `message.content` also required-but-nullable and the two `model_not_found` envelopes
+  disagreeing on `param`, both fixed with tests. Fast-forward merged.
+- D78 (2026-09-11): issue #12 (suffix lookup for truncated conversations) closed without a change
+  after the test written first showed the follow-up turn already hits the truncated context.

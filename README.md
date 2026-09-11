@@ -4,11 +4,12 @@ An OpenAI-compatible HTTP endpoint for the on-device language model on a Copilot
 NPU). Point OpenCode, Hermes, `curl` or the Python `openai` client at `http://127.0.0.1:5273/v1` and
 use the NPU model as a provider: local, offline, free.
 
-The model is small: Microsoft documents a context window of about 3.5K tokens, and on a Snapdragon X
-Elite roughly 13,400 characters of prompt fit, decoding at about 35 tokens per second by the bridge's
-own estimate (four characters per token). Short conversations work well, and a continuing conversation
-is cheap because the bridge keeps the model's context between turns. Long agent loops with a dozen
-tools will not fit, and the bridge says so in OpenAI's error format rather than hiding it.
+The model is small. Microsoft describes Phi Silica with a 4K-token context, and on a Snapdragon X
+Elite the runtime accepts roughly 13,400 characters of prompt and decodes at about 35 tokens per
+second by the bridge's own estimate (four characters per token). Short conversations work well, and a
+continuing conversation is cheap because the bridge keeps the model's context between turns. Long
+agent loops with a dozen tools will not fit, and the bridge says so in OpenAI's error format rather
+than hiding it.
 
 ## Backends
 
@@ -69,8 +70,9 @@ dependency, with one elevation prompt.
 .\src\NpuBridge\bin\Debug\net10.0-windows10.0.26100.0\win-arm64\NpuBridge.exe --backend phi-silica
 ```
 
-The first load takes 15 to 25 seconds. Watch for `"status":"ready"` from
-`curl.exe http://127.0.0.1:5273/healthz`, then send the same request with `"model":"phi-silica"`.
+The first load takes up to about 25 seconds (8 seconds once the model is warm). Watch for
+`"status":"ready"` from `curl.exe http://127.0.0.1:5273/healthz`, then send the same request with
+`"model":"phi-silica"`.
 
 Any OpenAI client works against the same base URL:
 
@@ -93,6 +95,30 @@ and it streams over server-sent events like any other OpenAI provider.
 five minutes, including the context cache and the overflow handling. Re-run `identity.ps1 -Install`
 whenever the build output folder or the manifest changes.
 
+## How a request travels
+
+```mermaid
+flowchart TD
+    A["POST /v1/chat/completions"] --> B["Validate the body: model, messages, ranges"]
+    B -->|"unknown model"| E404["404 model_not_found"]
+    B -->|"backend still loading"| E503["503 model_loading"]
+    B --> D["Render the transcript (PromptTemplate)"]
+    D --> F{"A cached context holds a prefix of it?"}
+    F -->|"hit"| G["Check the context out; render only the new turns"]
+    F -->|"miss"| H["Fresh context; render the whole transcript"]
+    G --> I{"Preflight: does it fit?"}
+    H --> I
+    I -->|"no, and --truncate-history"| J["Drop the oldest exchange"] --> F
+    I -->|"no"| E400["400 context_length_exceeded"]
+    I -->|"yes"| K["Generate on the NPU; apply max_tokens and stop; answer as JSON or SSE"]
+    K -->|"Complete and uncut"| L["Store the context under the new transcript's key"]
+    K -->|"cut, failed or cancelled"| M["Dispose the context"]
+```
+
+The preflight is the runtime's own answer to "how much of this fits", asked before anything is
+generated. Aion's preview SDK has no preflight, so on that backend the answer comes from the
+generation's status instead, and with `--truncate-history` the bridge retries after it.
+
 ## Endpoints
 
 | Endpoint | Purpose |
@@ -103,8 +129,8 @@ whenever the build output folder or the manifest changes.
 | `POST /debug/generate` | one literal prompt into the backend with timing. Diagnostic, loopback only |
 
 Anything else under `/v1` returns an OpenAI-shaped 404, or a 405 with `Allow` when the path is known
-but the method is wrong. Errors use the `{"error":{"message","type","param","code"}}` body, and nothing
-is ever silently truncated.
+but the method is wrong. Errors use the `{"error":{"message","type","param","code"}}` body with all
+four keys always present, and nothing is ever silently truncated.
 
 ## Conversations and the context cache
 
@@ -139,7 +165,8 @@ message says how many characters fit. Start the bridge with `--truncate-history`
 the oldest exchange (a user turn and everything the model did in answer to it, tool calls and results
 included) until the conversation fits, never the message being answered, and adds
 `x-npu-bridge-truncated-turns: N` to the reply. Each drop is logged at Warning. A request whose last
-question alone does not fit is still a 400.
+question alone does not fit is still a 400. The turn after a truncation finds the truncated context
+again, after the same drops, and sends only the new turn.
 
 ## Request parameters
 
@@ -196,6 +223,13 @@ activation and supervises the child, forwarding its exit code and stopping it on
 it behaves like one process. Activation inherits no environment, so a secret set only in your shell
 never reaches the child and is dropped with a warning.
 
+```mermaid
+flowchart LR
+    U["NpuBridge.exe --backend phi-silica<br/>started by path, no identity"] -->|"activates through the sparse package"| C["Activated child<br/>NpuBridge_jtas4mnxdyzpe<br/>listens on 127.0.0.1:5273"]
+    U -.->|"supervises: waits on the pid, forwards the exit code, kills it on Ctrl+C"| C
+    C --> M["Phi Silica runtime<br/>Microsoft.Windows.AI.Text on the NPU"]
+```
+
 **Auto-start differs by backend.** A Windows service is launched by path and so cannot hold identity.
 Phi Silica uses a logon task (`NpuBridge.exe task install`, elevated); aion and fake use a service
 (`NpuBridge.exe service install`).
@@ -206,9 +240,10 @@ generating, which is why it arrives in milliseconds. A backend without that pref
 preview SDK) can only say so by failing the generation, and with `--truncate-history` the bridge
 retries after that failure too.
 
-**Token counts are estimates**, characters over four on both sides, not a tokenizer's output. Progress
-callbacks would undercount by about three times on this hardware. On a cache hit `prompt_tokens` still
-counts the whole conversation, not only the turns that were sent.
+**Token counts are estimates**, characters over four on both sides, not a tokenizer's output. The
+SDK exposes no tokenizer, and progress callbacks would undercount by about three times on this
+hardware. On a cache hit `prompt_tokens` still counts the whole conversation, not only the turns that
+were sent.
 
 **One request at a time is intent, not enforcement.** Nothing serializes concurrent generations against
 the single model handle, and concurrent requests on hardware are untested.
@@ -220,25 +255,36 @@ endpoint is a finding about the raw model, not about this API.
 ## Repository layout
 
 ```
-src/NpuBridge.Core/     logic: endpoints, DTOs, prompt template, conversation key, context cache, config, backend contract, fake backend
-src/NpuBridge/          ARM64 exe: host, CLI verbs, Phi Silica and Aion adapters, package activation, supervisor
-tests/NpuBridge.Tests/  xunit against the fake backend through TestServer
-packaging/, scripts/    sparse-package manifest; identity.ps1 and smoke.ps1
-docs/, memory-bank/     plan, decisions, deferred work, session handoff, project notes
+npu-bridge.slnx, Directory.Build.props, nuget.config   solution; shared build settings; the local NuGet source
+src/NpuBridge.Core/        logic, no WinRT references, tested without the NPU
+  Api/                     endpoints (JSON and SSE), OpenAI DTOs, validation, the cut, the conversation session and lease
+  Backends/                ILanguageModelBackend, BackendLifecycle, ContextCache, DeltaAccumulator; Fake/ the fake backend
+  Configuration/           options, binder, command line, environment variables
+  Hosting/                 DI wiring, sc.exe and schtasks command builders, process identity
+  Prompting/               PromptTemplate (message flattening, tails), ConversationKey (the cache key)
+src/NpuBridge/             the ARM64 exe: Program.cs, PackageActivation, Supervisor, service and task verbs
+  Backends/                PhiSilicaBackend, AionBackend, PackageDependency
+tests/NpuBridge.Tests/     xunit against the fake backend through TestServer
+packaging/                 AppxManifest.xml for the sparse package; BuildTools.proj
+scripts/                   identity.ps1 (package identity), smoke.ps1 (the hardware run)
+docs/                      PLAN.md, DECISIONS.md, FUTURE.md, SESSION-HANDOFF.md
+memory-bank/               project notes kept for the next session
+nuget-local/               where the Aion SDK nupkg goes (gitignored; the adapter compiles only when it is present)
+.githooks/, .github/       the gitleaks pre-commit hook; the build-and-test and secret-scan workflows
 ```
 
-`NpuBridge.Core` has no WinRT references, so the tests run without the NPU. Start with `docs/PLAN.md`
-for the design and the order remaining work lands in, `docs/DECISIONS.md` for why things are the way
-they are, and `docs/FUTURE.md` for what is deliberately not done. Remaining work is tool-call
-emulation and a request queue with `/v1/completions`; each is a GitHub issue.
+Start with `docs/PLAN.md` for the design and the order remaining work lands in, `docs/DECISIONS.md`
+for why things are the way they are, and `docs/FUTURE.md` for what is deliberately not done.
+Remaining work is tool-call emulation and a request queue with `/v1/completions`; each is a GitHub
+issue.
 
-## Contributing
+## References
 
-Work is tracked in GitHub issues, one per remaining chunk plus defects and cleanups. Each change is
-built on a branch, must keep `dotnet test` green (the suite needs no NPU) and, when it touches a
-backend or the request pipeline, must pass `scripts/smoke.ps1 -Backend phi-silica` on a Copilot+ PC.
-Record a design choice in `docs/DECISIONS.md` and anything you deliberately leave out in
-`docs/FUTURE.md`. Enable the gitleaks hook before your first commit.
+- [Get started with Phi Silica in the Windows App SDK](https://learn.microsoft.com/windows/ai/apis/phi-silica), including the section on how Aion Instruct replaces it in October and November 2026
+- [Microsoft.Windows.AI.Text API reference](https://learn.microsoft.com/windows/ai/apis/phi-silica-api-ref)
+- [Phi Silica, small but mighty on-device SLM](https://blogs.windows.com/windowsexperience/2024/12/06/phi-silica-small-but-mighty-on-device-slm/), the Windows blog post on how the model runs on the NPU
+- [Aion 1.0 Instruct preview SDK and sample](https://aka.ms/tryaion), the source of the `aion` backend's framework package and NuGet
+- [OpenAI's OpenAPI specification](https://github.com/openai/openai-openapi), the schema the wire shapes are checked against
 
 ## License
 

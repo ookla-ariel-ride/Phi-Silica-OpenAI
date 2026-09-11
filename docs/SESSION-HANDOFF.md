@@ -1,94 +1,94 @@
-# Session handoff, 2026-09-11, after the chunk 5 merge
+# Session handoff, 2026-09-11, end of the late session
 
-Supersedes the 2026-09-11 end-of-day handoff (in git history). Everything below was verified at write
-time.
+Supersedes the handoff written after the chunk 5 merge earlier today (in git history). Everything
+below was verified at write time.
 
-## TL;DR
+## Where things stand
 
-- Chunks 1 to 6 are merged on `main` (`main` at or after `ef29693`). Chunk 5 (context cache and
-  overflow handling, issue #1) merged today after two adversarial reviews and two Phi Silica smoke
-  runs; D71 to D76 record it. Chunk 6 stays code-verified only (D70; issue #2 open).
-- Chunk 5 does three things. A continuing conversation hits a cached context and sends only its
-  newest turns (measured: 274 ms TTFT on a hit against 417 ms for the replay). An over-length
-  transcript is refused by the preflight in 31 ms instead of by a 26 s failed generation (D55
-  closed). With `--truncate-history` the oldest exchanges are dropped and the reply carries
-  `x-npu-bridge-truncated-turns`. `/healthz` reports `contexts_cached`, `context_cache_capacity`,
-  `context_cache_hits` and `context_cache_misses`.
-- Next is issue #9 (consolidate the duplicated post-generation pipeline), then chunk 7 (tool-call
-  emulation, issue #3).
+- `main` is at or after `dff824b`, tree clean, in sync with origin. The repository is now
+  `ookla-ariel-ride/npu-bridge` (renamed today; the old `Phi-Silica-OpenAI` URL redirects). The local
+  folder keeps its old name on purpose: package identity is registered against the build path, and
+  renaming it means `identity.ps1 -Install` again.
+- Chunks 1 to 6 are merged. Chunk 5 (context cache and overflow, D71 to D76) and the OpenAI
+  conformance pass (D77) both landed today; D78 closed issue #12 without a change. Chunk 6 stays
+  code-verified only (D70; issue #2 open).
+- 496 tests pass. `smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648; the
+  last NPU run was on the conformance branch before its review fixes, and the fake run passed on the
+  final code.
+- Open issues: #2, #3, #4, #9, #10, #11, #13. Closed today: #1, #12.
 
-## State at write time
+## What this session did, in order
 
-| Check | Result |
-|---|---|
-| OS build | 29648 |
-| `dotnet build` | clean, 0 warnings, both with the Aion SDK and `-p:AionSdkAvailable=false` |
-| `dotnet test` | 496 passed, 0 failed |
-| `smoke.ps1 -Backend phi-silica -Port 5298` | all steps passed, 1 skipped, 5 informational, twice today (before and after the review fixes) |
-| Branches | only `main`, locally and on origin (the chunk 5 branch was deleted after the fast-forward) |
-| GitHub issues | #1 closed by the merge; #2 open (hardware half of chunk 6); #3, #4, #9, #10, #11 open |
+1. Chunk 5: `ConversationKey`, `ContextCache`, `ConversationSession` and `ContextLease`, the
+   preflight-driven overflow check, `--truncate-history`, the header, `/healthz` cache fields, two
+   smoke steps. Two adversarial reviews (a Claude subagent and Codex) found the exchange boundary
+   at the first assistant turn and a throwing preflight leaking its context; Codex also found the
+   JSON retry inheriting a cancelled token. All fixed (D76). Two NPU runs passed.
+2. The README rewritten for chunk 5 with the README skill, then a humanizer pass over CLAUDE.md,
+   the memory bank, `docs/FUTURE.md`, this file and the day's decisions. Two stale facts fell out of
+   that pass and were corrected.
+3. gitleaks and `.gitignore` audited. Both were sound; the `docs/PLAN.md` and `memory-bank/` path
+   allowlists were removed so notes are scanned like code. A full-history scan is clean. One lesson
+   for the next audit: gitleaks' default stopwords excuse a planted secret that is an alphabet run,
+   so test with random-looking values.
+4. The OpenAI conformance pass (D77), checked against the `openai-openapi` schema and reviewed by
+   Codex: required-but-nullable fields written as nulls, `model` required and served-only with a 404
+   for any other id, schema ranges enforced. One NPU run failed at the first generation with an RPC
+   fault inside the model runtime before any bridge code ran; the re-run passed.
+5. Six decisions taken by the owner, one at a time (see below); two new issues filed; #12 then
+   closed by evidence. The README validated again, given its real layout, two diagrams and a
+   references section.
 
-## What this session did
+## Decisions the owner made today
 
-1. Built chunk 5 in-session on `chunk-5-context-cache`: `ConversationKey` (a length-prefixed encoding
-   of `(system, turns)`, never the rendered prompt, D71), `ContextCache` (bounded LRU, exclusive
-   checkout, disposal on eviction/replacement/shutdown, D72), `ConversationSession` and
-   `ContextLease` (lookup, tail rendering, preflight-driven overflow, the truncation loop, the
-   status-driven retry for backends without a preflight, the header, the pressure warning, D73),
-   `ChatMessage.ToolCalls`, the `/healthz` fields (D74), two smoke steps.
-2. Ran the Phi Silica smoke test (D75), then two adversarial reviews (a Claude subagent and Codex).
-   Both found the exchange boundary at the first assistant turn (it orphaned tool results) and a
-   throwing preflight leaking its context; Codex also found the JSON retry inheriting a cancelled
-   token. All fixed with ten tests (D76); the smoke run repeated clean.
-3. Fast-forward merged, updated `CLAUDE.md`, `docs/PLAN.md`, `memory-bank/` and this file.
-4. Later the same day: the README rewritten for chunk 5, a humanizer pass over the docs, the gitleaks
-   allowlist narrowed (docs and the memory bank are scanned; the placeholder attestation format is
-   excused by regex), and an OpenAI conformance pass (D77: required-but-nullable fields written as
-   nulls, `model` required and served-only with a 404 for any other id, schema ranges enforced),
-   reviewed by Codex and merged.
-
-## Things learned today worth keeping
-
-- **`contexts_cached` alone cannot prove a cache hit once the cache is full.** A miss evicts one and
-  adds one, so the count is unchanged either way. That is why `/healthz` gained the hit and miss
-  counters and why the smoke step reads them (D74).
-- **The preflight's answer depends on the text.** 13,179 usable characters for the smoke transcript,
-  13,429 for the D55 prompt. It is a tokenizer's verdict rather than a constant; ask it every time.
-- **After a truncation the next request in that conversation misses and truncates again.** The
-  stored key is over the truncated transcript and the client sends the full one. Correct but slower;
-  the fix options are in `docs/FUTURE.md`'s chunk 5 section.
-- **Do not run `dotnet build` while `smoke.ps1` has a server up.** The exe is locked and the copy
-  step fails. Wait for the run, then build.
-- Under package activation the server's console output is not in the smoke log (the by-path parent
-  is what the redirect captures), so the server-side log line is not evidence for a smoke assertion;
-  `/healthz` and the response are.
+- The strict `model` policy of D77 stays: a missing id is a 400, an unknown id a 404, the reply
+  always names the served model.
+- The `--context-window-hint` default stays 4096; the pressure warning cannot fire on Phi Silica
+  at that default and `docs/FUTURE.md` says why.
+- The Phi-3 tokenizer is adopted for real token counts (issue #13), on the condition that the
+  measurement in that issue agrees with the preflight; `tokenizer.model` is vendored in the repo.
+- Work order: issue #13, then issue #9, then chunk 7 (issue #3).
+- The repository was renamed to `npu-bridge` with a description and topics.
+- The suffix lookup for truncated conversations (issue #12) was approved on a premise I gave the
+  owner that turned out to be wrong; the test written first showed the follow-up turn already hits.
+  Withdrawn, D78.
 
 ## Do this next
 
-Decisions the owner made on 2026-09-11, in order of work: (1) the suffix lookup so a truncated
-conversation is found again, withdrawn the same evening because the follow-up already hits (D78,
-issue #12 closed with the test as evidence); (2) the Phi-3 tokenizer for real token counts, measured
-against the preflight first and adopted only if the vocabularies agree, `tokenizer.model` vendored
-(a new issue); (3) issue #9; (4) chunk 7. Also settled: the strict `model` policy of D77 stays; the
-`--context-window-hint` default stays 4096; the repository was renamed to `npu-bridge`.
+1. Issue #13. Measure first: tokenize the two prompts D55 and D75 give (the fox filler that fits at
+   13,429 characters, the smoke transcript that fits at 13,179) with `LlamaTokenizer` over
+   Phi-3.5-mini's `tokenizer.model`. If both land on the same token count within a few tokens, adopt
+   it for `usage` and the `max_tokens` budget, per backend, with chars/4 as the fallback for Aion.
+   Put the measurement in `scripts/smoke.ps1`. If they disagree, keep chars/4 and record why.
+2. Issue #9. Both endpoints grew a retry loop in chunk 5 and a null-usage flag in D77, so the
+   duplicated post-generation pipeline is larger than it was. Consolidate before chunk 7 adds
+   buffered tool detection to both.
+3. Chunk 7 (issue #3). `ChatMessage.ToolCalls` is carried and keyed; rendering the model its own
+   protocol, computing the stored key from the parsed calls, and buffering with keep-alives are the
+   chunk's job. Structured JSON output (2.4.x stable) is the design option on the issue.
+4. When a Windows build with Aion Instruct behind the Phi Silica API arrives: `smoke.ps1 -Backend
+   phi-silica` under the registry key, re-check D31, decide the fate of the preview adapter. When any
+   Aion generation runs, re-check the status-driven overflow path (D73).
 
-0. The two new issues above, in that order, each on its own branch with a review.
-1. Issue #9: consolidate the duplicated post-generation pipeline across the two shapes before
-   chunk 7 adds the buffered tool-detection path on top of both. Chunk 5 added a retry loop to each
-   endpoint, which made the duplication larger.
-2. Chunk 7 (issue #3): tool-call emulation. `ChatMessage.ToolCalls` is already carried and keyed;
-   rendering the model its own protocol and computing the stored key from the parsed calls are the
-   chunk's job. Structured JSON output (`GenerateStructuredJsonResponseAsync`, 2.4.x stable) is the
-   design option on the issue.
-3. When a Windows build with Aion Instruct behind the Phi Silica API arrives: run
-   `smoke.ps1 -Backend phi-silica` under the registry key, re-check D31 (LAF), and decide the fate of
-   the preview adapter. When any Aion generation runs, re-check the status-driven overflow path (D73).
+## Things learned today worth keeping
+
+- `contexts_cached` alone cannot prove a cache hit once the cache is full; the hit and miss
+  counters on `/healthz` can (D74).
+- The preflight's answer depends on the text (13,179 against 13,429 usable characters for two
+  prompts); it is a tokenizer's verdict, so ask it every time.
+- The turn after a truncation hits the truncated context after refused preflight rounds; it does
+  not replay (D78). The fake's window counts a tail's headings against what the context absorbed,
+  which is why that test uses 200-character turns.
+- The SDK exposes no tokenizer or token count; the 2.4.4 and 2.4.8-experimental Text metadata list
+  only `GetUsablePromptLength`, `GetUsablePromptLength2` and the experimental `CompressPromptAsync`.
+- Do not run `dotnet build` while `smoke.ps1` has a server up: the exe is locked and the copy fails.
+- Under package activation the server's console output is not in the smoke log; `/healthz` and the
+  response are the evidence.
+- The model runtime can fail its RPC channel on the first generation after start; one such run
+  today left nothing in the Application log and the re-run was clean.
 
 ## Machine facts (do not re-discover)
 
-- The GitHub repository was renamed to `ookla-ariel-ride/npu-bridge` on 2026-09-11 (the old name
-  redirects). The local folder is still `Phi-Silica-OpenAI`, on purpose: package identity is registered
-  against the build path, and renaming the folder means `identity.ps1 -Install` again.
 - Galaxy Book4 Edge, Snapdragon X Elite, Windows 11 ARM64 Insider build 29648 (29661 was taken on
   2026-09-10 and rolled back). Git Bash reports `AMD64` under emulation; PowerShell is native Arm64.
 - .NET SDK 10.0.400 arm64. Sparse package registered against the Debug build output, PFN
@@ -96,9 +96,10 @@ against the preflight first and adopted only if the vocabularies agree, `tokeniz
 - Installed, user scope: `Microsoft.AionInstructPreview.Framework.1.0` 1.0.0.0, the SDK nupkg in
   `nuget-local/`, `MicrosoftCorporationII.WinML.Qualcomm.QNN.EP.1.8` 1.8.30.0 and `...EP.2`
   2.2450.47.0. Windows App Runtime 1.8 (8000.946.1701.0) and 2.x present.
-- No `python`; `perl` is available in Git Bash and is the reliable way to script multi-line edits
-  (shell-quoted heredocs into perl mangled escapes twice today; a `.pl` file written with the Write
-  tool did not). `scripts/smoke.ps1` is CRLF; the `.cs` and `.md` files are LF.
+- No `python`. `perl` is in Git Bash and is the reliable way to script multi-line edits, but write
+  the `.pl` file with the Write tool: shell-quoted heredocs and `\u` sequences got mangled three
+  times today. `scripts/smoke.ps1` is CRLF; the `.cs` and `.md` files are LF. `strings` is not in
+  Git Bash; scan binaries from PowerShell.
 - Safety hook: a command combining a delete with a `C:\Program Files` path is blocked; split it.
 - `smoke.ps1` writes with `Write-Host`; pass `6>&1` and split per line before filtering.
 
@@ -108,16 +109,17 @@ against the preflight first and adopted only if the vocabularies agree, `tokeniz
 - The Aion blocker on this machine: D70 has everything; only another build or a Feedback Hub report.
 - The cache key is `ConversationKey`, never the rendered prompt (D71); the truncation header is set
   once a generation is attempted and never on the refusal (D76); sampling parameters are not in the
-  key.
-- Work happens on a branch and fast-forward merges after a subagent review and a Codex review; after
-  the merge, update this file, `CLAUDE.md`, `docs/PLAN.md` and `memory-bank/` in the same session.
+  key; no suffix lookup (D78).
+- `model` is required and served-only (D77).
+- Work happens on a branch and fast-forward merges after a review; after the merge, update this
+  file, `CLAUDE.md`, `docs/PLAN.md` and `memory-bank/` in the same session.
 
 ## Resume checklist
 
 ```powershell
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\Phi-Silica-OpenAI
-git status; git log --oneline -3                          # expect main at or after ef29693, tree clean
+git status; git log --oneline -3                          # expect main at or after dff824b, tree clean
 dotnet build; dotnet test                                 # expect 496 passed
 .\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 1 skipped, 5 informational
-gh issue list                                             # #2, #3, #4, #9, #10, #11 open
+gh issue list                                             # #2, #3, #4, #9, #10, #11, #13 open
 ```

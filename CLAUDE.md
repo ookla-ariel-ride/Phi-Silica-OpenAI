@@ -26,13 +26,18 @@ because build 29648 never appends the `WIN://SYSAPPID` token attribute for a mai
 dependency, so the Qualcomm QNN provider that Windows ML 1.8 needs cannot be image-mapped (D70; issue
 #2 stays open for the hardware half). Do not spend time on that blocker again: Developer Mode, SFC,
 DISM, ACLs, drivers and package identity are all ruled out; only another Windows build or a Feedback
-Hub report remains. Next is issue #9 (consolidate the duplicated post-generation pipeline), then
-chunk 7 (tool-call emulation, issue #3).
+Hub report remains. Also merged 2026-09-11: the OpenAI conformance pass (D77: required-but-nullable
+fields written as nulls, `model` required and served-only, schema ranges enforced) and D78 (no
+suffix lookup for truncated conversations; the follow-up turn already hits). Next is issue #13 (the
+Phi-3 tokenizer, measured against the preflight first), then issue #9 (consolidate the duplicated
+post-generation pipeline), then chunk 7 (tool-call emulation, issue #3). The repository is
+`ookla-ariel-ride/npu-bridge`; the local folder keeps its old name because package identity is
+registered against the build path.
 All four defects from the 2026-09-10 code review (#5 to #8) are fixed and merged (D62 to D65). The
 Insider flight to build 29661 broke Phi Silica and was rolled back to 29648; if it is offered again,
 expect the same (workload packages fail to register, model `NotReady`). An empty
 `Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'` listing is not proof of breakage on 29648;
-`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D77 so
+`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D78 so
 far); `docs/FUTURE.md` holds deferred work. Update both whenever a chunk changes a choice or defers
 something.
 

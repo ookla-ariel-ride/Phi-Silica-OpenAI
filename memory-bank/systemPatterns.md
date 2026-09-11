@@ -50,6 +50,14 @@ concurrent requests for one conversation never share a context: the second misse
   before any context exists, so they create none. Every other exit disposes the one context it
   created, in a `finally`. Tests assert the exact create-versus-dispose count on each path, so the
   guarantee can't be satisfied by accident (D43).
+- **Fields OpenAI's schema requires but allows null are written as explicit nulls.** The serializer
+  omits nulls everywhere else, so those properties carry `[JsonIgnore(Condition = Never)]`
+  (`logprobs`, `refusal`, `content`, a chunk choice's `finish_reason`, an error's `param` and
+  `code`), and the per-chunk `"usage": null` travels in the chunk's extension data because a
+  property cannot be both omitted-when-null and present-when-null (D77). `OpenAiConformanceTests`
+  pins each rule.
+- **The model check runs after validation and before readiness.** An unknown id is a 404 even while
+  the backend is loading; a valid id while loading is the 503 (D77).
 - **A capability check that gates on backend support must first check the request needs the
   capability.** Forcing `--system-prompt-placement native` on a backend without native system-prompt
   support should reject only requests that actually carry a system message. The check therefore runs

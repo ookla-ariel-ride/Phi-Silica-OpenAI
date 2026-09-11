@@ -12,8 +12,13 @@ machine; the NPU is here.
   version-constants source) + CsWinRT 2.3.1 (direct) + `Microsoft.Windows.SDK.BuildTools` 10.0.26100.4948
   (makeappx/signtool; also used by `identity.ps1`). CsWinRT reads Windows metadata from the
   `Microsoft.Windows.SDK.NET.Ref` 10.0.26100.57 NuGet, so no Windows SDK install is needed.
-- Tests: xunit 2.9.3, `Microsoft.AspNetCore.TestHost` 10.0.11. 495 tests, about 1 s.
-- gitleaks 8.30.1 (pre-commit hook + CI workflow) with project rules for LAF tokens.
+- Tests: xunit 2.9.3, `Microsoft.AspNetCore.TestHost` 10.0.11. 496 tests, about 1 s.
+- gitleaks 8.30.1 (pre-commit hook + CI workflow) with project rules for LAF tokens. Docs and the
+  memory bank are scanned like code (the path allowlists were removed 2026-09-11; the placeholder
+  attestation format is excused by regex). When testing a rule, use random-looking secrets: the
+  default stopword list excuses alphabet runs such as `AbCdEf…`.
+- The GitHub repository is `ookla-ariel-ride/npu-bridge` (renamed 2026-09-11 from
+  `Phi-Silica-OpenAI`, which redirects). The local folder keeps the old name.
 
 ## Runtime prerequisites on the machine
 - Windows App Runtime 2.4.0 (stable) and **2.4.1 experimental** (`Microsoft.WindowsAppRuntime.2-experimentalB`
@@ -34,6 +39,14 @@ machine; the NPU is here.
   `LanguageModelResponseResult { Text, Status, ExtendedError }`.
 - `AIFeatureReadyState`: Ready, NotReady, NotSupportedOnCurrentSystem, DisabledByUser,
   CapabilityMissing, NotCompatibleWithSystemHardware, OSUpdateNeeded.
+- **No tokenizer and no token count in the API** (checked 2026-09-11 in the 2.4.4 and
+  2.4.8-experimental `Microsoft.Windows.AI.Text` metadata): the only tokenizer-informed members are
+  `GetUsablePromptLength`, a `GetUsablePromptLength2` overload not yet examined, and the experimental
+  `CompressPromptAsync`. Microsoft describes Phi Silica as "based on a Cyber-EO compliant derivative
+  of Phi-3.5-mini", whose tokenizer is the Phi-3 one (Llama-style SentencePiece, 32,064 entries,
+  `tokenizer.model` on Hugging Face, MIT). `Microsoft.ML.Tokenizers`'s `LlamaTokenizer` loads it.
+  Whether the derivative kept that vocabulary is unpublished; issue #13 measures it against the
+  preflight before adopting it for `usage`.
 - LAF: `LimitedAccessFeatures.TryUnlockFeature("com.microsoft.windows.ai.languagemodel", token, attestation)`;
   stable → `Unavailable` without token; experimental works regardless.
 - Measured: model create 15.7 s to 23.6 s cold across two runs on 2026-09-05 (10 s was one earlier

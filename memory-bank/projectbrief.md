@@ -66,6 +66,12 @@ LoRA adapters, Microsoft Store publication. Tracked in `docs/FUTURE.md`.
 7. Tool-calling emulation.
 8. Concurrency/queueing, `/v1/completions`, client docs.
 
+## Repository
+`https://github.com/ookla-ariel-ride/npu-bridge` (renamed from `Phi-Silica-OpenAI` on 2026-09-11; the
+old URL redirects). Public, MIT.
+
 ## Owner
 Jim Siebengartner. Working agreement: plan first, chunked delivery, adversarial review after each
 chunk (in-session reviewer plus Codex), decisions and deferrals written down, commit per chunk.
+Decisions that are the owner's to make are put to them one at a time with a recommendation, and
+recorded in `docs/SESSION-HANDOFF.md` and the relevant issue.

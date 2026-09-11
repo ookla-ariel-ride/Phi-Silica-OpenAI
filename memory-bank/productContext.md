@@ -31,6 +31,10 @@ so those tools can run fully local, offline, and free.
 
 ## Known user-facing behaviours (decided)
 - Default listener `http://127.0.0.1:5273`; default backend `phi-silica`.
+- `model` is required and must be the served id, matched case-insensitively; a missing one is a 400
+  and any other id a 404 `model_not_found`, as OpenAI answers. The reply always names the served
+  model (D77). The wire shapes carry every field OpenAI's schema requires, the nullable ones as
+  explicit nulls, so a client generated from the schema reads them without presence checks.
 - Model ids: `phi-silica`, `aion-instruct` and `fake`. `/v1/models` lists `aion-instruct` whenever
   `--backend aion` starts, but on this machine `/healthz` reports the backend as failed (the OS cannot
   load the QNN provider, D70), so every generation answers 503 `model_unavailable`. When the SDK NuGet
@@ -51,4 +55,6 @@ so those tools can run fully local, offline, and free.
   it has one (Phi Silica), and `--truncate-history` drops the oldest exchanges instead, saying how many
   in `x-npu-bridge-truncated-turns`. `--queue-capacity` is accepted but does nothing until chunk 8.
 - Token counts in `usage` are estimates on both sides (`ceil(chars/4)`), documented as such, because
-  Phi Silica's progress callbacks undercount tokens roughly threefold.
+  Phi Silica's progress callbacks undercount tokens roughly threefold. The owner decided on
+  2026-09-11 to adopt the Phi-3 tokenizer for real counts if a measurement against the preflight
+  agrees (issue #13).
