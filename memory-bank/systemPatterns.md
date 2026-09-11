@@ -10,6 +10,7 @@ NpuBridge (exe, ARM64)          NpuBridge.Core (net10.0, no WinRT)          NpuB
   PackageActivation.cs             Configuration/ options, binder, CLI, sources
   ServiceCommands/TaskCommands     Hosting/    sc.exe + schtasks builders, identity
   ProcessIdentity.cs               Prompting/  PromptTemplate (flattening, tail), ConversationKey
+                                   Tokenizers/ ITokenCounter, Phi3TokenCounter, CharEstimate
                                    Backends/   ContextCache; Api/ ConversationSession + ContextLease
                                     (not yet)   Tools/ (chunk 7)
 ```
@@ -124,6 +125,12 @@ it should not pass vacuously on the NPU.
 - A `Responder` iterator that blocks synchronously must run behind an async hop
   (`FirstTokenDelay`), because an awaited `Task.Run` can continue on the caller's thread and would
   then block the handler before it enters its first-delta wait.
+- Logic that branches on a counter, a clock or any other injected behaviour gets two kinds of test: a
+  stand-in whose behaviour the test can state outright (the word counters in `TokenBudgetCutTests`,
+  one of which deliberately recounts a word when it grows), and a handful against the real thing
+  (`Phi3TokenCounter`) for the cases the stand-in cannot reach. The D80 reviews found the defect in
+  the second kind, so a branch whose correctness rests on a real dependency's behaviour needs at
+  least one test that uses it.
 
 ## Smoke script conventions (`scripts/smoke.ps1`, D79)
 - `Step` rows PASS, FAIL or SKIP and set the exit code; `InfoStep` rows report measurements and

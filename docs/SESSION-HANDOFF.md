@@ -5,7 +5,7 @@ below was verified at write time.
 
 ## Where things stand
 
-- `main` is at or after `a98c508`, tree clean, in sync with origin. The repository is
+- `main` is at or after `a83fc6a`, tree clean, in sync with origin. The repository is
   `ookla-ariel-ride/npu-bridge` (renamed today; the old `Phi-Silica-OpenAI` URL redirects). The local
   folder keeps its old name on purpose: package identity is registered against the build path, and
   renaming it means `identity.ps1 -Install` again.
@@ -73,6 +73,11 @@ below was verified at write time.
    exact cut waits for the end, `completion_tokens` is `TokensCovering`; a third fix from the CJK
    test (a budget ending inside a byte-fallback character stops before it). Three NPU runs, all
    passed. Fast-forward merged; #13 closed from the commit.
+9. Two documentation passes, one after each merge: the README through the README and humanizer
+   skills, the whole memory bank, `CLAUDE.md`, `docs/PLAN.md`'s header and this file. The second
+   pass also filed the runtime RPC fault in `docs/FUTURE.md` as work (recreate the model, or at
+   least fail `/healthz`, when a generation dies with an RPC-class HRESULT). No issue for it yet;
+   that is the owner's call.
 
 ## Decisions the owner made today
 
@@ -82,7 +87,8 @@ below was verified at write time.
   at that default and `docs/FUTURE.md` says why.
 - The Phi-3 tokenizer is adopted for real token counts (issue #13), on the condition that the
   measurement in that issue agrees with the preflight; `tokenizer.model` is vendored in the repo.
-- Work order: issue #13, then issue #9, then chunk 7 (issue #3).
+  The condition was met (D80) and the tokenizer is in.
+- Work order: issue #13, then issue #9, then chunk 7 (issue #3). #13 is done.
 - The repository was renamed to `npu-bridge` with a description and topics.
 - The suffix lookup for truncated conversations (issue #12) was approved on a premise I gave the
   owner that turned out to be wrong; the test written first showed the follow-up turn already hits.
@@ -90,24 +96,25 @@ below was verified at write time.
 
 ## Do this next
 
-0. Done today: issue #13 (D80). What remains of it is in `docs/FUTURE.md`: the pressure warning
-   still measures characters, and Aion keeps chars/4 until a generation runs there. When Aion
-   Instruct arrives behind the Phi Silica API, the smoke's tokenizer step is the check before
-   trusting the counter for that model.
-1. Issue #13 as it was planned, kept for the record. Measure first: tokenize the two prompts D55 and D75 give (the fox filler that fits at
-   13,429 characters, the smoke transcript that fits at 13,179) with `LlamaTokenizer` over
-   Phi-3.5-mini's `tokenizer.model`. If both land on the same token count within a few tokens, adopt
-   it for `usage` and the `max_tokens` budget, per backend, with chars/4 as the fallback for Aion.
-   Put the measurement in `scripts/smoke.ps1`. If they disagree, keep chars/4 and record why.
-2. Issue #9. Both endpoints grew a retry loop in chunk 5 and a null-usage flag in D77, so the
-   duplicated post-generation pipeline is larger than it was. Consolidate before chunk 7 adds
-   buffered tool detection to both.
-3. Chunk 7 (issue #3). `ChatMessage.ToolCalls` is carried and keyed; rendering the model its own
+1. Issue #9, the work order's next item. Both endpoints grew a retry loop in chunk 5, a null-usage
+   flag in D77 and counter-based usage plus `StopRequested` handling in D80, so the duplicated
+   post-generation pipeline is larger than when the issue was filed. Consolidate before chunk 7 adds
+   buffered tool detection to both. The issue names the paired code and a suggested shape, and its
+   "smaller items" checklist (the hand-built 502 envelope, duplicated test helpers, the fake's
+   four single-purpose knobs) is worth doing alongside.
+2. Chunk 7 (issue #3). `ChatMessage.ToolCalls` is carried and keyed; rendering the model its own
    protocol, computing the stored key from the parsed calls, and buffering with keep-alives are the
    chunk's job. Structured JSON output (2.4.x stable) is the design option on the issue.
+3. Issues #14 and #15 whenever there is an hour to spend: #14's items 7 to 12 plus its "move into
+   Core", "make injectable" and "delete or mark" sections, #15's items 4 to 9 and the manual
+   checklist. Each issue carries a comment saying exactly what landed and what each test does and
+   does not pin.
 4. When a Windows build with Aion Instruct behind the Phi Silica API arrives: `smoke.ps1 -Backend
-   phi-silica` under the registry key, re-check D31, decide the fate of the preview adapter. When any
-   Aion generation runs, re-check the status-driven overflow path (D73).
+   phi-silica` under the registry key, re-check D31, decide the fate of the preview adapter. Run the
+   tokenizer step before trusting the Phi-3 counter for that model. When any Aion generation runs,
+   re-check the status-driven overflow path (D73) and measure its tokenizer the way D80 did.
+5. Undecided, waiting on the owner: whether the runtime RPC fault deserves a `bug` issue and a
+   recreate-the-model fix, or stays a documented surprise (`docs/FUTURE.md`, README).
 
 ## Things learned today worth keeping
 
@@ -179,7 +186,7 @@ below was verified at write time.
 
 ```powershell
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\Phi-Silica-OpenAI
-git status; git log --oneline -3                          # expect main at or after a98c508, tree clean
+git status; git log --oneline -3                          # expect main at or after a83fc6a, tree clean
 dotnet build; dotnet test                                 # expect 632 passed
 .\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 1 skipped, 5 informational
 gh issue list                                             # #2, #3, #4, #9, #10, #11, #14, #15, #16 open

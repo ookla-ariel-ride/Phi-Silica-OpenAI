@@ -21,7 +21,8 @@ so those tools can run fully local, offline, and free.
   streaming keep-alive timings, and the backend's own diagnostics (bootstrap outcome, ready state,
   the text-contract counters `text_mismatches` and `late_deltas`); every request logs backend,
   prompt size, cache hit or miss, time to first token, tokens/s and outcome; `--verbose` shows the
-  exact prompt the model saw.
+  exact prompt the model saw; `POST /debug/generate` and `POST /debug/tokenize` answer "what does the
+  raw model do with this prompt" and "how many tokens is this text" without the OpenAI surface.
 - **Boring to operate.** One exe, one settings file, a logon task or service for auto-start, secrets in
   a gitignored local file, no admin needed to run.
 
@@ -46,7 +47,9 @@ so those tools can run fully local, offline, and free.
   correct OpenAI-shaped response with message content, `finish_reason` and a `usage` block; `stream:
   true` gets server-sent events (one `chat.completion.chunk` per delta, keep-alive comments while the
   first token is pending, an optional `usage` chunk, then `data: [DONE]`). `max_tokens`,
-  `max_completion_tokens` and `stop` are enforced by the bridge on both shapes (D53).
+  `max_completion_tokens` and `stop` are enforced by the bridge on both shapes (D53), the cap in the
+  backend's own tokens (D80). A streamed reply with no whitespace in it (CJK) arrives in one piece
+  near the cap, because the exact cut cannot be placed until the text ends.
 - A system message is delivered to the model by default (`--system-prompt-placement auto`, native
   context when the backend supports one), and the model does follow it under both placements (D45).
   `tools` and `tool_choice` are accepted but ignored until chunk 7; each warns once per process.

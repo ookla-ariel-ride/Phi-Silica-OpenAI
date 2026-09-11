@@ -4,13 +4,13 @@ An OpenAI-compatible HTTP endpoint for the on-device language model on a Copilot
 NPU). Point OpenCode, Hermes, `curl` or the Python `openai` client at `http://127.0.0.1:5273/v1` and
 use the NPU model as a provider: local, offline, free.
 
-The model is small. Microsoft describes Phi Silica with a 4K-token context; measured on a Snapdragon
-X Elite, an empty context takes 3,581 tokens of prompt (about 13,400 characters of English) and the
-model decodes at about 27 tokens per second. Those are real tokens: the bridge counts with the
-Phi-3.5 tokenizer, which the runtime's own limits were measured against. Short conversations work well, and a
-continuing conversation is cheap because the bridge keeps the model's context between turns. Long
-agent loops with a dozen tools will not fit, and the bridge answers with OpenAI's
-`context_length_exceeded` error instead of dropping turns on its own.
+The model is small. Microsoft describes Phi Silica with a 4K-token context, and on a Snapdragon X
+Elite an empty context accepts 3,581 tokens of prompt, roughly 13,400 characters of English, then
+decodes at about 27 tokens per second. Those counts are the model's own: the bridge tokenizes with
+Phi-3.5-mini's vocabulary, having measured that the runtime's prompt-length limit agrees with it.
+Short conversations work well, and a continuing one is cheap because the bridge keeps the model's
+context between turns. Long agent loops with a dozen tools will not fit, and the bridge answers with
+OpenAI's `context_length_exceeded` error instead of dropping turns on its own.
 
 ## Backends
 
@@ -95,10 +95,10 @@ and it streams over server-sent events like any other OpenAI provider.
 
 `scripts/smoke.ps1 -Backend phi-silica` checks the whole surface against the hardware in three to
 five minutes: health with identity, both response shapes, the cut, the context cache, the overflow
-refusal and `--truncate-history` on a second server, and at the end that the relaunched child
-process exited and the port is free. It starts and tears down three helper servers along the way,
-each with its own pass or fail row. Re-run `identity.ps1 -Install` whenever the build output folder
-or the manifest changes.
+refusal and `--truncate-history` on a second server, the tokenizer against the model's own prompt
+limit, and at the end that the relaunched child process exited and the port is free. It starts and
+tears down three helper servers along the way, each with its own pass or fail row. Re-run
+`identity.ps1 -Install` whenever the build output folder or the manifest changes.
 
 ## How a request travels
 
@@ -180,14 +180,14 @@ again, after the same drops, and sends only the new turn.
 matched case-insensitively); any other id is a 404 with code `model_not_found`, as OpenAI answers,
 and the reply always names the model that served it. `temperature`, `top_p` and `top_k` reach Phi
 Silica, and `temperature` and `top_p` are range-checked as OpenAI's schema states. `max_tokens`,
-`max_completion_tokens` and `stop` are enforced by the bridge, since neither Windows API offers them:
-output is cut at the limit, counted in the model's own tokens on Phi Silica, and the generation
-cancelled, and cancelling stops the accelerator.
-Measured on the streaming path, a prompt cut after four tokens finished in about a fifth of the time
-the same prompt took with a generous cap. An assistant message's `tool_calls` are carried and
-distinguish conversations in the cache, but tool calling itself is not emulated yet: `tools`,
-`tool_choice` and a few other parameters are accepted and ignored with one warning each per process.
-`n` above 1 is a 400, and so is `stream_options` without `stream: true`.
+`max_completion_tokens` and `stop` are enforced by the bridge, since neither Windows API offers them.
+The reply is cut at the limit, counted in the model's own tokens on Phi Silica, and the generation is
+cancelled there. Cancelling stops the accelerator: measured on the streaming path, a reply cut after
+four tokens finished in about a fifth of the time the same prompt took with a generous cap. An
+assistant message's `tool_calls` are carried and distinguish conversations in the cache, but tool
+calling itself is not emulated yet: `tools`, `tool_choice` and a few other parameters are accepted
+and ignored with one warning each per process. `n` above 1 is a 400, and so is `stream_options`
+without `stream: true`.
 
 The response and chunk objects carry every field OpenAI's schema requires, including the nullable ones
 (`logprobs`, `refusal`, a `finish_reason` on every streamed choice, and `"usage": null` on the chunks
@@ -249,12 +249,13 @@ generating, which is why it arrives in milliseconds either way. A backend withou
 (the Aion preview SDK) can only say so by failing the generation, and with `--truncate-history` the
 bridge retries after that failure too.
 
-**Token counts are real on Phi Silica and estimates elsewhere.** The SDK exposes no tokenizer, so
-the bridge ships Phi-3.5-mini's, after measuring that the runtime's prompt-length preflight lands on
-the same token count for every kind of text it was given (English, digits, code, JSON, CJK, emoji).
-`usage` and the `max_tokens` budget use it. The Aion preview adapter and the fake backend count
-characters divided by four. On a cache hit `prompt_tokens` still counts the whole conversation,
-including the turns that were not sent.
+**Token counts are real on Phi Silica and estimates elsewhere.** The SDK exposes no tokenizer, so the
+bridge ships Phi-3.5-mini's. What justifies that is a measurement: fourteen texts of very different
+character were fed to the model until it refused, and the point where it refused came out at the same
+token count each time, whether the text was English, digits, code, JSON, Chinese or emoji. `usage`
+and the `max_tokens` budget are counted with it, and `POST /debug/tokenize` will count any text you
+give it. The Aion preview adapter and the fake backend divide characters by four instead. On a cache
+hit `prompt_tokens` still counts the whole conversation, including the turns that were not sent.
 
 **Concurrent requests are not serialized.** Nothing queues generations against the single model
 handle, and concurrent requests on hardware are untested. A request queue is planned.
@@ -278,6 +279,7 @@ src/NpuBridge.Core/        logic, no WinRT references, tested without the NPU
   Configuration/           options, binder, command line, environment variables
   Hosting/                 DI wiring, sc.exe and schtasks command builders, process identity
   Prompting/               PromptTemplate (message flattening, tails), ConversationKey (the cache key)
+  Tokenizers/              ITokenCounter; the Phi-3 counter and its vendored tokenizer.model; chars/4
 src/NpuBridge/             the ARM64 exe: Program.cs, PackageActivation, Supervisor, service and task verbs
   Backends/                PhiSilicaBackend, AionBackend, PackageDependency
 tests/NpuBridge.Tests/     xunit against the fake backend through TestServer
