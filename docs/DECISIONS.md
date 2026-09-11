@@ -974,38 +974,51 @@ the D52 measurement reads. The D52 measurement's "exceeded" branch, whose own te
 not happen", was the audit's third candidate and is deliberately not one: the keep-alive timer starts
 only once a generation is being waited on, after the cache lookup and the preflight, so a refusal
 the preflight took over a second to reach still lands as an ordinary status, and that branch now
-reports it as preflight latency. The readiness step requires `package_identity` true and
-`diagnostics.bootstrap` equal to `ok` on phi-silica, and `package_identity` false on the fake and
-aion, which run by path; it also reads the served model id off `/healthz` for every chat request,
+reports it as pre-generation latency (body parse, cache lookup, the preflight where one exists). The
+readiness step requires `package_identity` true and `diagnostics.bootstrap` equal to `ok` on
+phi-silica, whoever started it, and `package_identity` false on the fake and aion when the script
+started them by path (a server found running under `-NoStart` is tested as found); it also reads
+the served model id off `/healthz`, before those checks, for every chat request,
 which the script used to spell as the backend selector (wrong for aion, whose id is
 `aion-instruct`). The preflight step requires a non-null `usable_prompt_chars` on every backend but
 aion. Teardown runs whenever the script started the server, whether the parent was stopped or had
 exited on its own: on phi-silica an activated child carrying `--supervisor-pid <parent>` on its
 command line must exist before the stop (the D37 contract, read through `Win32_Process`; another
 user's process shows no command line and cannot match), and afterwards the parent, every such
-child and the port's listener must be gone within 45 s, which sits above the host's 30 s shutdown
-timeout because the child stops gracefully and a backend still initialising waits out
-`BackendLifecycle`'s 15 s grace first. On the fake and aion there is no child, so the row checks
-the parent and the port. Auxiliary servers are waited out the same way before their port is reused.
+child and the port's listener must be gone within 60 s. That sits above the worst case the child
+can take: a backend still initialising holds `BackendLifecycle.StopAsync` for the host's 30 s
+shutdown budget and `DisposeAsync` for a further 15 s grace. A process query that fails is
+recorded as a teardown failure, not read as nothing left. On the fake and aion there is no child,
+so the row checks the parent and the port. Each auxiliary server (the `--truncate-history` run and
+the two placement runs) gets a teardown row of its own on the same terms; on phi-silica those are
+the only places the child-exit half of D37 is exercised more than once per run. A parent that had
+died on its own before teardown is reported as that, since its child is gone through `WatchParent`
+by then and says nothing about D37.
 `/healthz` gained `first_keep_alive_ms` and `keep_alive_interval_ms` so the D52 margin is read off
 the running server rather than from a copy of the constant in the script; a test pins that the
 endpoint reports the registered options and not the defaults. In the same branch, issue #14's first
 six tests: an exception mid-generation on a cache hit on both shapes, the refusal of a tail that does
 not fit a cached context with the context going back untouched, `max_completion_tokens` in a body
 that carries no `max_tokens` at all, wrongly typed `content` and `stop` and a literal `null` body as
-400s, a non-positive keep-alive interval disabling the comments, a non-positive first delay falling
-back to the interval, and a failure after the client has gone. Two of those needed care. The
-disabled-interval test proves its point without a clock by setting the first delay to zero as
-well: were the disabling branch missing, `Task.Delay(TimeSpan.Zero)` would write a comment before
-the gated generation could produce anything, so a body without one is not luck; a negative interval
-would throw there instead. The client-gone test names a branch (`FailAsync`'s client-gone arm) that
-is a race by construction: nine runs in ten in isolation took the other arm, the write attempted and
-its failure swallowed, because TestServer completes the response pipe before it signals
-`RequestAborted`. The test pins the contract instead, nothing reaches the client, the request runs
-off the end of the pipeline with no exception escaping, the context is disposed, and accepts either
-arm; `BridgeTestHost` gained a request ledger (a middleware counting completed requests and
-recording escaped exceptions, since TestServer has no Kestrel to log one at Error) and the
-`CapturingLoggerProvider` an `OnRecord` hook so a test can act inside the window a log line marks.
-What the first-delay test cannot pin is that the fallback is the interval rather than some other
-positive delay; that needs the keep-alive waits driven by the injected `TimeProvider`, filed in
-`docs/FUTURE.md`. 511 tests.
+400s, a non-positive keep-alive interval disabling the comments, a non-positive first delay being
+accepted with a keep-alive still committing the headers, and a failure after the client has gone.
+Three of those needed care. The disabled-interval test proves its point without a clock by setting
+the first delay to zero as well: were the disabling branch missing, `Task.Delay(TimeSpan.Zero)`
+would write a comment before the gated generation could produce anything; a negative interval
+would throw there instead. The negative row is deterministic; the zero row has a window of a few
+instructions between the backend call the test waits on and the handler entering its wait, in
+which a delta could satisfy the wait first, so it is near-certain rather than proof. The first-delay
+test pins only that a non-positive value is accepted: a fallback to zero, or to any other
+non-negative span, would pass it too. Both gaps close once the keep-alive waits are driven by the
+injected `TimeProvider`, filed in `docs/FUTURE.md`. The client-gone test names a branch
+(`FailAsync`'s client-gone arm) that is a race by construction: nine runs in ten in isolation took
+the other arm, the write attempted and its failure swallowed, because TestServer completes the
+response pipe before it signals `RequestAborted`. The test pins the contract instead and accepts
+either arm: the request runs off the end of the pipeline with no exception escaping, the context is
+disposed, nothing is logged at Error, and the client saw the delta and nothing after it (that last
+one is the weakest, since the client cancelled its own read). Its synchronous hold between tokens
+runs off the request's thread, behind the fake's first-token delay, so it cannot block the handler
+before the handler enters its wait. `BridgeTestHost` gained a request ledger (a middleware counting
+completed requests and recording escaped exceptions, since TestServer has no Kestrel to log one at
+Error) and the `CapturingLoggerProvider` an `OnRecord` hook so a test can act inside the window a
+log line marks. 512 tests.

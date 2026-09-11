@@ -15,8 +15,10 @@
   stops the accelerator, and how an over-length prompt is refused -- how long it takes, and whether
   the verdict lands as an HTTP status or as an in-stream error frame (D52, D55). Those report numbers
   and do not fail the run over a surprising number, which is a finding rather than a broken bridge.
-  A measurement that contradicts something the bridge guarantees (a status line arriving after the
-  first keep-alive was due, a placement run that cannot answer) is a failure, though.
+  A measurement that contradicts something the bridge guarantees (a placement run that cannot answer
+  200, /healthz not carrying the keep-alive timings the D52 step reads) is a failure, though. A status
+  line arriving after the first keep-alive was due is not one of those: the keep-alive timer starts
+  only once a generation is being waited on, so that number measures the pre-generation phase.
 
   For -Backend phi-silica the exe is started by path; it relaunches itself through package activation so
   the process has identity and supervises that instance (scripts/identity.ps1 -Install must have been run
@@ -86,9 +88,10 @@ function Step([string] $name, [scriptblock] $body) {
     }
 }
 
-# For the two real-model measurements: prints numbers for docs/DECISIONS.md, but a model that
-# misbehaves or a step that cannot get a clean read is a finding, not a bridge failure, so this never
-# adds to the FAIL count or the exit code.
+# For the real-model measurements: prints numbers for docs/DECISIONS.md. A model that misbehaves or a
+# step that cannot get a clean read is a finding, not a bridge failure, so a surprising number never
+# adds to the FAIL count or the exit code; only a body that calls Fail, for a contradiction of
+# something the bridge guarantees, does (D79).
 function InfoStep([string] $name, [scriptblock] $body) {
     Write-Host "==> $name" -ForegroundColor Cyan
     try {
@@ -248,7 +251,7 @@ function Start-AuxServer([string] $label, [int] $port, [string[]] $extraArgs) {
         }
         throw "$label server not ready after ${ReadyTimeoutSeconds}s; last: $($last | ConvertTo-Json -Compress)"
     } catch {
-        Stop-AuxServer $p $port
+        Stop-AuxServer $p $port $label
         throw
     }
 }
@@ -257,14 +260,16 @@ function Start-AuxServer([string] $label, [int] $port, [string[]] $extraArgs) {
 # carries --supervisor-pid <that pid> on its command line (the activated child, D37; Win32_Process shows
 # the command line of every process this user owns, and none for another user's, which then cannot
 # match), and the listener on its port. Returns what is still there at the deadline: no survivors and
-# Listening false when all is well. The child stops gracefully once it notices the parent has gone,
-# and a backend still initialising waits out BackendLifecycle's 15 s grace period first, so the
-# deadline has to sit above the host's 30 s shutdown timeout.
-function Wait-ServerGone([int] $serverPid, [int] $port, [int] $seconds = 45) {
+# Listening false when all is well. The child stops gracefully once it notices the parent has gone.
+# Its worst case is a backend still initialising: BackendLifecycle.StopAsync waits on that for the
+# host's 30 s shutdown budget, then DisposeAsync waits a further 15 s grace, so the deadline sits
+# above the two added together. A process query that fails throws rather than reading as "nothing
+# left": with $ErrorActionPreference Stop the caller records the failure instead of a clean teardown.
+function Wait-ServerGone([int] $serverPid, [int] $port, [int] $seconds = 60) {
     $pattern = "--supervisor-pid\s+$serverPid(\s|$)"
     $deadline = (Get-Date).AddSeconds($seconds)
     while ($true) {
-        $left = @(Get-CimInstance Win32_Process -Filter "Name = 'NpuBridge.exe'" -ErrorAction SilentlyContinue |
+        $left = @(Get-CimInstance Win32_Process -Filter "Name = 'NpuBridge.exe'" |
             Where-Object { $_.ProcessId -eq $serverPid -or ($_.CommandLine -and $_.CommandLine -match $pattern) })
         $listening = Test-PortListening $port
         if ((-not $listening -and $left.Count -eq 0) -or (Get-Date) -ge $deadline) {
@@ -274,16 +279,30 @@ function Wait-ServerGone([int] $serverPid, [int] $port, [int] $seconds = 45) {
     }
 }
 
-function Stop-AuxServer($p, [int] $port) {
+# Stops an auxiliary server and records its teardown as a row of its own: on phi-silica each aux
+# server relaunches an activated child, so these are the only places D37's child-exit half is
+# exercised more than once per run, and a survivor here is a shutdown defect, not a warning. Called
+# from a Step's finally, so the row lands before the Step's own.
+function Stop-AuxServer($p, [int] $port, [string] $label = 'aux') {
     if (-not $p) { return }
     if (-not $p.HasExited) {
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
     }
     # Waited out rather than slept over: the next Start-AuxServer on this port refuses to start while
     # the previous run's child is still shutting down on it.
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $gone = Wait-ServerGone $p.Id $port
+    $elapsed = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
+    $step = "teardown: the $label server (port $port) exits and the port frees"
     if ($gone.Listening -or $gone.Survivors.Count -gt 0) {
-        Write-Host "    warning: after the aux server on port $port was stopped, listening=$($gone.Listening) and pid(s) $(($gone.Survivors | ForEach-Object ProcessId) -join ',') remain" -ForegroundColor Yellow
+        $detail = "after the $label server (pid $($p.Id)) was stopped, listening=$($gone.Listening) and NpuBridge pid(s) $(($gone.Survivors | ForEach-Object ProcessId) -join ',') remain after $elapsed s"
+        $results.Add([pscustomobject]@{ Step = $step; Result = 'FAIL'; Detail = $detail })
+        Write-Host "    FAIL $detail" -ForegroundColor Red
+    }
+    else {
+        $detail = "pid $($p.Id) gone and port $port free after $elapsed s"
+        $results.Add([pscustomobject]@{ Step = $step; Result = 'PASS'; Detail = $detail })
+        Write-Host "    PASS $detail" -ForegroundColor Green
     }
 }
 
@@ -319,19 +338,21 @@ try {
         }
         if (-not $last -or $last.status -ne 'ready') { throw "not ready after ${ReadyTimeoutSeconds}s; last: $($last | ConvertTo-Json -Compress)" }
 
+        # Every chat request below names this id: the served model is the only one accepted (D77), and
+        # it is not the backend selector (aion serves aion-instruct). Read before the checks below so
+        # a readiness failure does not also fail every later step for want of a model id.
+        $script:servedModel = $last.model
+        if ([string]::IsNullOrWhiteSpace($servedModel)) { throw '/healthz carries no model id' }
+
         # What ready has to mean per backend, so a start without identity, or one whose runtime
-        # bootstrap was skipped, cannot pass as healthy (issue #15). Only phi-silica relaunches through
-        # package activation; the fake and aion run by path and must say so.
+        # bootstrap was skipped, cannot pass as healthy (issue #15). Phi Silica cannot be ready without
+        # identity, whoever started it. The fake and aion run by path when this script starts them and
+        # must say so; a server someone else started (-NoStart) is tested as found.
         if ($Backend -eq 'phi-silica') {
             if ($last.package_identity -ne $true) { throw "phi-silica is ready without package identity (package_identity=$($last.package_identity)); the relaunch through package activation did not happen" }
             if ($last.diagnostics.bootstrap -ne 'ok') { throw "phi-silica diagnostics.bootstrap='$($last.diagnostics.bootstrap)', expected 'ok'" }
         }
-        elseif ($last.package_identity -ne $false) { throw "$Backend reports package_identity=$($last.package_identity); only phi-silica runs with identity" }
-
-        # Every chat request below names this id: the served model is the only one accepted (D77), and
-        # it is not the backend selector (aion serves aion-instruct).
-        $script:servedModel = $last.model
-        if ([string]::IsNullOrWhiteSpace($servedModel)) { throw '/healthz carries no model id' }
+        elseif (-not $NoStart -and $last.package_identity -ne $false) { throw "$Backend reports package_identity=$($last.package_identity); started by path, it should have none" }
         "backend=$($last.backend) model=$($last.model) identity=$($last.package_identity) loading=$($last.loading_seconds)s diagnostics=$($last.diagnostics | ConvertTo-Json -Compress)"
     }
 
@@ -710,7 +731,7 @@ try {
             $lines.Add("--truncate-history server: HTTP 200 after $($sw.ElapsedMilliseconds) ms, x-npu-bridge-truncated-turns=$dropped, finish=$($c.choices[0].finish_reason), prompt_tokens=$($c.usage.prompt_tokens), reply='$($text.Trim().Substring(0, [Math]::Min(60, $text.Trim().Length)))'")
         }
         finally {
-            Stop-AuxServer $aux $auxPort
+            Stop-AuxServer $aux $auxPort 'truncate-history'
         }
 
         $lines -join "`n"
@@ -808,7 +829,7 @@ not a recollection.
                 $lines.Add("$placement -> error: $($_.Exception.Message)")
                 $failures.Add($placement)
             } finally {
-                Stop-AuxServer $auxProc $auxPort
+                Stop-AuxServer $auxProc $auxPort "placement=$placement"
             }
         }
 
@@ -943,10 +964,11 @@ not a recollection.
             }
             else {
                 # Not a contradiction, though it reads like one: the keep-alive timer starts only once a
-                # generation is being waited on, after the cache lookup and the preflight, so a refusal
-                # the preflight took this long over still lands as a status. The streaming tests prove the
-                # timer commits the headers; this number says how slow the preflight verdict was.
-                "exceeded: the status arrived after $verdictMs ms, past the ${firstKeepAliveMs} ms first keep-alive; the verdict came from the preflight, which runs before the keep-alive timer exists, so this measures preflight latency rather than the header deferral"
+                # generation is being waited on, after the body parse, the cache lookup and the preflight
+                # (where the backend has one), so a refusal that phase took this long over still lands
+                # as a status. The streaming tests prove the timer commits the headers; this number says
+                # how slow the pre-generation verdict was.
+                "exceeded: the status arrived after $verdictMs ms, past the ${firstKeepAliveMs} ms first keep-alive; the verdict came from the pre-generation phase (body parse, cache lookup, the preflight where one exists), which runs before the keep-alive timer exists, so this measures that phase's latency rather than the header deferral"
             }
             $lines.Add("margin: $margin")
         }
@@ -993,27 +1015,41 @@ not a recollection.
         # so the check is the parent and the port. Runs whether the parent was stopped here or had
         # already exited on its own (issue #15). -NoStart started nothing and checks nothing.
         $teardown = if ($Backend -eq 'phi-silica') { 'teardown: the parent and its activated child exit and the port frees' } else { 'teardown: the server exits and the port frees' }
-        $childPattern = "--supervisor-pid\s+$($proc.Id)(\s|$)"
-        $childrenBefore = @(Get-CimInstance Win32_Process -Filter "Name = 'NpuBridge.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -and $_.CommandLine -match $childPattern } | ForEach-Object ProcessId)
-
-        if ($proc.HasExited) {
-            Write-Host "Server (pid $($proc.Id)) had already exited with code $($proc.ExitCode)"
-        }
-        else {
-            Write-Host "Stopping server (pid $($proc.Id))"
-            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-        }
-
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $gone = Wait-ServerGone $proc.Id $Port
-        $sw.Stop()
-        $elapsed = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
-
         $problems = [System.Collections.Generic.List[string]]::new()
-        if ($Backend -eq 'phi-silica' -and $childrenBefore.Count -eq 0) { $problems.Add("no activated child carrying --supervisor-pid $($proc.Id) existed before the stop") }
-        if ($gone.Listening) { $problems.Add("port $Port still listening after $elapsed s") }
-        if ($gone.Survivors.Count -gt 0) { $problems.Add("NpuBridge pid(s) $(($gone.Survivors | ForEach-Object ProcessId) -join ',') still alive after $elapsed s") }
+        $childrenBefore = @()
+        $elapsed = 0
+        try {
+            $childPattern = "--supervisor-pid\s+$($proc.Id)(\s|$)"
+            $parentExited = $proc.HasExited
+            $childrenBefore = @(Get-CimInstance Win32_Process -Filter "Name = 'NpuBridge.exe'" |
+                Where-Object { $_.CommandLine -and $_.CommandLine -match $childPattern } | ForEach-Object ProcessId)
+
+            if ($parentExited) {
+                Write-Host "Server (pid $($proc.Id)) had already exited with code $($proc.ExitCode)"
+            }
+            else {
+                Write-Host "Stopping server (pid $($proc.Id))"
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            }
+
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $gone = Wait-ServerGone $proc.Id $Port
+            $sw.Stop()
+            $elapsed = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
+
+            if ($Backend -eq 'phi-silica' -and $childrenBefore.Count -eq 0) {
+                # A parent that died on its own (the model runtime's RPC fault, say) takes its child with it
+                # through WatchParent before this code runs, so an empty list then says nothing about D37.
+                if ($parentExited) { $problems.Add("the parent had already exited with code $($proc.ExitCode) before teardown, so its activated child could not be observed") }
+                else { $problems.Add("no activated child carrying --supervisor-pid $($proc.Id) existed before the stop") }
+            }
+            if ($gone.Listening) { $problems.Add("port $Port still listening after $elapsed s") }
+            if ($gone.Survivors.Count -gt 0) { $problems.Add("NpuBridge pid(s) $(($gone.Survivors | ForEach-Object ProcessId) -join ',') still alive after $elapsed s") }
+        }
+        catch {
+            # A process or port query that failed is not evidence that nothing is left.
+            $problems.Add("could not verify the teardown: $($_.Exception.Message)")
+        }
 
         if ($problems.Count -gt 0) {
             $detail = $problems -join '; '

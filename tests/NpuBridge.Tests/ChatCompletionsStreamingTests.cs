@@ -928,7 +928,11 @@ public class ChatCompletionsStreamingTests
     /// a zero first delay the disabling branch is the only thing standing between the loop and
     /// <c>Task.Delay(TimeSpan.Zero)</c>, which completes at once, so were the branch missing the very
     /// first wait would write a comment before the gate could open; a negative interval would throw
-    /// there instead. Either way a body with no comment is not luck.
+    /// there instead. The negative row is deterministic. The zero row has one window: the gate is
+    /// released once the backend has been called, which happens a few instructions before the handler
+    /// enters its wait, so a delta that reached the channel in that gap would let a missing branch
+    /// pass by a first wait that had already been satisfied. Closing it needs the keep-alive delays
+    /// driven by the injected <see cref="TimeProvider"/>, filed rather than done here.
     /// </summary>
     [Theory]
     [InlineData(0)]
@@ -963,21 +967,24 @@ public class ChatCompletionsStreamingTests
     }
 
     /// <summary>
-    /// A non-positive first delay falls back to the interval rather than reaching <c>Task.Delay</c>
-    /// with it: a negative span other than the infinite sentinel throws there, and the request would
-    /// fail before its first frame. With the fallback the first keep-alive commits the headers as
-    /// usual. What this cannot pin is that the fallback is the interval and not some other positive
-    /// delay; that needs the keep-alive delays driven by the injected <see cref="TimeProvider"/>, which
-    /// is filed rather than done here.
+    /// A non-positive first delay is accepted and a keep-alive still commits the headers. The negative
+    /// row is the one with teeth: a negative span other than the infinite sentinel throws in
+    /// <c>Task.Delay</c>, and without the fallback the request would fail before its first frame. What
+    /// this cannot pin is the delay actually used: the code falls back to the interval, but a fallback
+    /// to zero, or to any other non-negative span, would pass these assertions too. Pinning the value
+    /// needs the keep-alive delays driven by the injected <see cref="TimeProvider"/>, which is filed
+    /// rather than done here.
     /// </summary>
-    [Fact]
-    public async Task A_non_positive_first_keep_alive_delay_falls_back_to_the_interval()
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-5)]
+    public async Task A_non_positive_first_keep_alive_delay_is_accepted_and_a_keep_alive_still_commits_the_headers(int firstDelayMs)
     {
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["Hello"], FirstTokenGate = gate });
         await using var host = await BridgeTestHost.StartAsync(fake,
             keepAliveInterval: TimeSpan.FromMilliseconds(20),
-            firstKeepAliveDelay: TimeSpan.FromMilliseconds(-5));
+            firstKeepAliveDelay: TimeSpan.FromMilliseconds(firstDelayMs));
 
         using var guard = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         using var request = new HttpRequestMessage(HttpMethod.Post, Path)
@@ -1033,6 +1040,12 @@ public class ChatCompletionsStreamingTests
             Responder = _ => Tokens(),
             FailAfterTokens = 1,
             FailureStatus = GenerationStatus.Error,
+            // The iterator's wait is synchronous, so it must run off the request's thread: the handler
+            // starts the generation and then enters its first-delta wait, and a generation that blocked
+            // before the handler got there would hold the first delta the test is waiting to read. The
+            // fake's first-token delay is the one await before any delta that never completes
+            // synchronously, so everything after it, the wait included, runs on the pool.
+            FirstTokenDelay = TimeSpan.FromMilliseconds(1),
         });
         var capture = new CapturingLoggerProvider();
         await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture);

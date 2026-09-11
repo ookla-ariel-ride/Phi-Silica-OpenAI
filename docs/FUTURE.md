@@ -39,9 +39,10 @@ issues filed that day. `coverlet.collector` is now in the test project; run
 The first six unit tests and the smoke script's first three items landed on 2026-09-11 (D79); the
 rest of both issues stays open, as does the CI job.
 - **Keep-alive waits driven by the injected `TimeProvider`.** `WaitForFirstDeltaAsync` calls
-  `Task.Delay` on the wall clock, so a test can prove a non-positive first delay falls back to
-  *some* positive delay but not that it falls back to the interval, and the disabled-interval test
-  leans on `Task.Delay(TimeSpan.Zero)` completing at once. `Task.Delay(TimeSpan, TimeProvider, ...)`
+  `Task.Delay` on the wall clock, so a test can prove a non-positive first delay is accepted but not
+  what it falls back to (zero or any non-negative span would pass), and the disabled-interval test's
+  zero row leans on `Task.Delay(TimeSpan.Zero)` completing before the first delta reaches the
+  channel, which is near-certain rather than guaranteed. `Task.Delay(TimeSpan, TimeProvider, ...)`
   with a fake time provider would let both tests pin the exact delay requested (from the D79 reviews).
 
 ## Chunk 5 deferrals (context cache and overflow handling)

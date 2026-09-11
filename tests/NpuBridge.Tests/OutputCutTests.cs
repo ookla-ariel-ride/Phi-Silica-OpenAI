@@ -878,5 +878,11 @@ public class OutputCutTests
         Assert.Equal("Hello, w", completion.Content);
         Assert.Equal("length", completion.FinishReason);
         Assert.Equal(2, completion.CompletionTokens);
+
+        // A cut generation is cancelled, so its context is disposed, never cached (D72).
+        Assert.Equal(1, host.Fake.ContextsCreated);
+        Assert.Equal(1, host.Fake.ContextsDisposed);
+        Assert.Equal(0, host.Cache.Count);
+        host.AssertNoLeak();
     }
 }
