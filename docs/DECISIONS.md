@@ -725,3 +725,27 @@ and the LanguageModel workload packages as staged but not registered for any use
 Phi Silica works only through the workload session host. Consequence for chunk 6: the adapter is
 code-verified and review-clean; the hardware half of the definition of done cannot be met on this
 machine until the OS honours main-package dependencies again. (chunk 6)
+
+Mechanism, traced the same night. A main package's folder grants ordinary users only read
+unconditionally; execute is granted by a conditional ACE that requires the process token's
+`WIN://SYSAPPID` attribute to contain the package family (SDDL on the provider folder:
+`(XA;OICI;0x1200a9;;;BU;(WIN://SYSAPPID Contains "MicrosoftCorporationII.WinML.Qualcomm.QNN.EP.1.8_8wekyb3d8bbwe"))`
+beside `(A;OICI;FR;;;BU)`), while a framework folder grants read-and-execute unconditionally, which is
+exactly the observed split: reads and data mappings succeed everywhere, image mappings succeed only for
+frameworks and for copies made outside the folder. So `AddPackageDependency` on a main package must get
+that attribute onto the caller's token, and on this build it does not: the deployment service is
+contacted (it logs "validation and setting the Trust Label" on the provider package with flags 0x122,
+already set) and nothing else happens. The related deployment failure is not a 29661 artefact either:
+the `windows.accessControl.undocked` extension failed to register with `E_ACCESSDENIED` at 15:02 and
+15:11 on 2026-09-10 before the flight rebooted and again at 19:58, one minute after the rollback boot
+into 29648, each time while re-registering `WindowsWorkload.QueryBlockList.1` and
+`WindowsWorkload.TextRecognition.Qnn.1` (the service then "repairs ACLs" and gives up). That extension
+is an undocked deployment extension handler shipped by the inbox `MicrosoftWindows.UndockedDevKit`
+package (10.0.29648.1000, status Ok), documented as not for third parties. Public sources say nothing:
+the 29648 and 29661 release notes list no package or AI issues (29648's only known issue is an update
+error), and no GitHub issue in the Windows App SDK, Windows AI docs, AI Dev Gallery, Foundry Local or
+the Aion sample describes execute being denied on a resolved main-package dependency; the nearest are
+the sample's #1 (family absent on retail 26200) and Foundry Local #393 (duplicate provider families on
+26220). Repair options that remain are the owner's: an elevated `sfc /scannow` and
+`DISM /Online /Cleanup-Image /RestoreHealth` to repair inbox components, a Feedback Hub report under
+Developer Platform, or a different build. (chunk 6)
