@@ -353,7 +353,7 @@ public class OutputCutTests
         var count = Volatile.Read(ref produced.Value);
         Assert.True(count < 200, $"the generation produced {count} of 400 tokens; it was not cancelled");
 
-        await WaitUntilAsync(() => fake.ActiveContexts == 0);
+        await TestWait.UntilAsync(() => fake.ActiveContexts == 0);
         Assert.Equal(1, fake.ContextsCreated);
         Assert.Equal(1, fake.ContextsDisposed);
     }
@@ -468,7 +468,7 @@ public class OutputCutTests
             Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
         }
 
-        await WaitUntilAsync(() => fake.ActiveContexts == 0);
+        await TestWait.UntilAsync(() => fake.ActiveContexts == 0);
         Assert.Equal(fake.ContextsCreated, fake.ContextsDisposed);
     }
 
@@ -509,7 +509,7 @@ public class OutputCutTests
             Assert.Contains("\"error\"", body, StringComparison.Ordinal);
         }
 
-        await WaitUntilAsync(() => fake.ActiveContexts == 0);
+        await TestWait.UntilAsync(() => fake.ActiveContexts == 0);
     }
 
     /// <summary>
@@ -546,7 +546,7 @@ public class OutputCutTests
         // that the cancel ran, the registration threw, and the throw was caught.
         Assert.Contains(logs.Records, r => r.Message.Contains("cancelling the generation at the cut threw", StringComparison.Ordinal));
 
-        await WaitUntilAsync(() => fake.ActiveContexts == 0);
+        await TestWait.UntilAsync(() => fake.ActiveContexts == 0);
     }
 
     // ------------------------------------------------------------- the cutter itself
@@ -810,15 +810,8 @@ public class OutputCutTests
         string? finishReason = null;
         var completionTokens = 0;
 
-        foreach (var line in body.Split('\n').Where(l => l.StartsWith("data: ", StringComparison.Ordinal)))
+        foreach (var chunk in Sse.Chunks(body))
         {
-            var payload = line["data: ".Length..];
-            if (string.Equals(payload, "[DONE]", StringComparison.Ordinal))
-            {
-                continue;
-            }
-
-            var chunk = JsonDocument.Parse(payload).RootElement;
             // Every chunk carries "usage": null once usage was asked for; only the usage chunk has the object.
             if (chunk.TryGetProperty("usage", out var usage) && usage.ValueKind == JsonValueKind.Object)
             {
@@ -843,16 +836,6 @@ public class OutputCutTests
         }
 
         return new Completion(content.ToString(), finishReason, completionTokens);
-    }
-
-    private static async Task WaitUntilAsync(Func<bool> condition, [CallerArgumentExpression(nameof(condition))] string? description = null)
-    {
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
-        while (!condition())
-        {
-            Assert.True(DateTime.UtcNow < deadline, $"timed out waiting for: {description}");
-            await Task.Delay(10);
-        }
     }
 
     /// <summary>

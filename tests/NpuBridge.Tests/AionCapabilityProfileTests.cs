@@ -74,7 +74,7 @@ public class AionCapabilityProfileTests
         Assert.Equal("system_prompt_placement_unsupported", (await ReadJson(rejected)).GetProperty("error").GetProperty("code").GetString());
         Assert.Empty(fake.Calls);
 
-        var served = await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = new[] { new { role = "user", content = "hi" } } });
+        var served = await host.Client.PostAsJsonAsync(Path, ChatBody.User("hi"));
         Assert.Equal(HttpStatusCode.OK, served.StatusCode);
         var call = Assert.Single(fake.Calls);
         Assert.Null(call.SystemPrompt);

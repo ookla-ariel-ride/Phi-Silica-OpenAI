@@ -241,10 +241,10 @@ public class TruncationTests
             options: new BridgeOptions { Backend = BackendKind.Fake, ContextWindowHint = 256 });
 
         // 256 tokens is 1024 chars; nine tenths is 922.
-        await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = new[] { Msg("user", new string('x', 900)) } });
+        await host.Client.PostAsJsonAsync(Path, ChatBody.User(new string('x', 900)));
         Assert.DoesNotContain(capture.Records, r => r.Message.Contains("context pressure", StringComparison.Ordinal));
 
-        await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = new[] { Msg("user", new string('x', 950)) } });
+        await host.Client.PostAsJsonAsync(Path, ChatBody.User(new string('x', 950)));
         var warning = Assert.Single(capture.Records, r => r.Message.Contains("context pressure", StringComparison.Ordinal));
         Assert.Equal(LogLevel.Warning, warning.Level);
         Assert.Contains("950 chars, 92%", warning.Message, StringComparison.Ordinal);

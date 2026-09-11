@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
@@ -253,4 +255,76 @@ internal sealed class ManualTimeProvider : TimeProvider
     public override DateTimeOffset GetUtcNow() => _now;
 
     public void Advance(TimeSpan by) => _now += by;
+}
+
+/// <summary>
+/// Waiting for a condition the request pipeline reaches on another thread — a context disposed after
+/// the client has gone, a log line written on the way out. Polling, never a fixed delay: the suite
+/// asserts on ordering rather than on wall-clock time (D54), and a sleep long enough to be safe on a
+/// loaded CI agent is dead time on every run. A condition that never holds fails the test at the
+/// deadline instead of hanging the suite, and the failure quotes the caller's own expression.
+/// </summary>
+internal static class TestWait
+{
+    public static async Task UntilAsync(Func<bool> condition, [CallerArgumentExpression(nameof(condition))] string? description = null)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (!condition())
+        {
+            Assert.True(DateTime.UtcNow < deadline, $"timed out waiting for: {description}");
+            await Task.Delay(10);
+        }
+    }
+}
+
+/// <summary>
+/// Reads a server-sent-event body the way a client would: one place that knows the framing, so a test
+/// about what the chunks say does not re-implement how they are delimited. Tests that are about the
+/// framing itself (the <c>data: </c> prefix, the blank-line separator, the position of the terminator)
+/// still read the raw text — parsing here would assume the very thing they check.
+/// </summary>
+internal static class Sse
+{
+    private const string DataPrefix = "data: ";
+
+    /// <summary>The payload of every <c>data:</c> frame, in wire order, keep-alive comments excluded.</summary>
+    public static List<string> Payloads(string body) =>
+        body.Split('\n')
+            .Where(l => l.StartsWith(DataPrefix, StringComparison.Ordinal))
+            .Select(l => l[DataPrefix.Length..])
+            .ToList();
+
+    /// <summary>
+    /// Every frame that carries JSON, parsed: the payloads minus the literal <c>[DONE]</c> terminator.
+    /// The elements are clones, so they outlive the documents they were parsed from and a caller may
+    /// hold them past the end of the statement.
+    /// </summary>
+    public static List<JsonElement> Chunks(string body)
+    {
+        var chunks = new List<JsonElement>();
+        foreach (var payload in Payloads(body))
+        {
+            if (string.Equals(payload, "[DONE]", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            using var document = JsonDocument.Parse(payload);
+            chunks.Add(document.RootElement.Clone());
+        }
+
+        return chunks;
+    }
+}
+
+/// <summary>
+/// The request body that says nothing beyond "one user message": the shape most tests want, because
+/// what they are about is the reply, the backend's inputs or the failure, not the request. A test that
+/// needs another field (<c>stream</c>, a budget, a whole conversation) builds its own body rather than
+/// growing this one, so the default stays the body a reader can skip over.
+/// </summary>
+internal static class ChatBody
+{
+    public static object User(string content = "say hi") =>
+        new { model = "fake", messages = new[] { new { role = "user", content } } };
 }

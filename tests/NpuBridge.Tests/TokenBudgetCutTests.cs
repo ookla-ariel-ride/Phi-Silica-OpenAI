@@ -468,9 +468,8 @@ public class TokenBudgetCutTests
         var content = new System.Text.StringBuilder();
         string? finish = null;
         var tokens = 0;
-        foreach (var line in text.Split('\n').Where(l => l.StartsWith("data: ", StringComparison.Ordinal) && !l.EndsWith("[DONE]", StringComparison.Ordinal)))
+        foreach (var chunk in Sse.Chunks(text))
         {
-            var chunk = JsonDocument.Parse(line["data: ".Length..]).RootElement;
             if (chunk.TryGetProperty("usage", out var usage) && usage.ValueKind == JsonValueKind.Object)
             {
                 tokens = usage.GetProperty("completion_tokens").GetInt32();

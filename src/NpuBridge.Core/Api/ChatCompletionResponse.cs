@@ -50,4 +50,12 @@ public sealed record ChatCompletionResponseMessage(
 public sealed record CompletionUsage(
     int PromptTokens,
     int CompletionTokens,
-    int TotalTokens);
+    int TotalTokens)
+{
+    /// <summary>
+    /// The usage block from its two independent numbers. <c>total_tokens</c> is not a third fact, it is
+    /// their sum, and both response shapes were spelling that sum out for themselves.
+    /// </summary>
+    public static CompletionUsage For(int promptTokens, int completionTokens) =>
+        new(promptTokens, completionTokens, promptTokens + completionTokens);
+}

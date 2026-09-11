@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using NpuBridge.Backends;
 using NpuBridge.Configuration;
 using NpuBridge.Prompting;
+using NpuBridge.Tokenizers;
 
 namespace NpuBridge.Api;
 
@@ -346,10 +347,12 @@ internal sealed class ConversationSession
     }
 
     /// <summary>
-    /// Context pressure, per request, against <c>--context-window-hint</c> (tokens, times the same four
-    /// characters per token the usage estimate uses). A hint, not a measurement — the preflight is
-    /// the measurement, where one exists — so this is a Warning at nine tenths of the window and
-    /// silence below it, logged once per request however many truncation rounds it takes.
+    /// Context pressure, per request, against <c>--context-window-hint</c> (tokens, converted to
+    /// characters at <see cref="CharEstimateTokenCounter.CharsPerToken"/>). Deliberately the estimate
+    /// rather than the backend's own counter (D80): a hint the operator typed is not worth tokenizing
+    /// the whole transcript a second time for, and this is not a measurement — the preflight is the
+    /// measurement, where one exists. Hence a Warning at nine tenths of the window and silence below
+    /// it, logged once per request however many truncation rounds it takes.
     /// </summary>
     private void LogPressure(int transcriptChars)
     {
@@ -358,7 +361,7 @@ internal sealed class ConversationSession
             return;
         }
 
-        var windowChars = (long)_options.ContextWindowHint * ChatRequestMetrics.CharsPerToken;
+        var windowChars = (long)_options.ContextWindowHint * CharEstimateTokenCounter.CharsPerToken;
         if (transcriptChars * 10L >= windowChars * 9)
         {
             _pressureLogged = true;

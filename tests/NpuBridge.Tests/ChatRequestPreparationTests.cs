@@ -59,7 +59,7 @@ public class ChatRequestPreparationTests
         var fake = new FakeBackend(new FakeBackendOptions { InitGate = gate });
         await using var host = await BridgeTestHost.StartAsync(fake, waitForReady: false);
 
-        var response = await host.Client.PostAsJsonAsync(Path, Simple());
+        var response = await host.Client.PostAsJsonAsync(Path, ChatBody.User());
 
         Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
         Assert.Equal(0, fake.ContextsCreated);
@@ -74,7 +74,7 @@ public class ChatRequestPreparationTests
         var fake = new FakeBackend(new FakeBackendOptions { InitFailure = new InvalidOperationException("nope") });
         await using var host = await BridgeTestHost.StartAsync(fake);
 
-        var response = await host.Client.PostAsJsonAsync(Path, Simple());
+        var response = await host.Client.PostAsJsonAsync(Path, ChatBody.User());
 
         Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
         Assert.Equal(0, fake.ContextsCreated);
@@ -130,9 +130,6 @@ public class ChatRequestPreparationTests
         Assert.Equal(1, fake.ContextsCreated);
         host.AssertNoLeak();
     }
-
-    private static object Simple() =>
-        new { model = "fake", messages = new[] { new { role = "user", content = "say hi" } } };
 
     private static object WithSystem => new
     {

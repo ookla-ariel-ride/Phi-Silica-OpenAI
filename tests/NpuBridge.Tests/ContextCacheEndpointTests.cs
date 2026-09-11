@@ -7,6 +7,7 @@ using NpuBridge.Backends;
 using NpuBridge.Backends.Fake;
 using NpuBridge.Configuration;
 using NpuBridge.Prompting;
+using NpuBridge.Tokenizers;
 
 namespace NpuBridge.Tests;
 
@@ -282,7 +283,7 @@ public class ContextCacheEndpointTests
 
         var a = host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = conversation });
         var b = host.Client.PostAsJsonAsync(Path, new { model = "fake", stream = true, messages = conversation });
-        await WaitUntilAsync(() => fake.Calls.Count == 3);
+        await TestWait.UntilAsync(() => fake.Calls.Count == 3);
 
         // One of them is on the cached context, the other on a fresh one.
         Assert.Equal(2, fake.ContextsCreated);
@@ -295,7 +296,7 @@ public class ContextCacheEndpointTests
         Assert.All(responses, r => Assert.Equal(HttpStatusCode.OK, r.StatusCode));
         await Task.WhenAll(responses.Select(r => r.Content.ReadAsStringAsync()));
 
-        await WaitUntilAsync(() => fake.ContextsDisposed == 1);
+        await TestWait.UntilAsync(() => fake.ContextsDisposed == 1);
         Assert.Equal(1, host.Cache.Count);
         host.AssertNoLeak();
     }
@@ -312,13 +313,16 @@ public class ContextCacheEndpointTests
         var hit = await ReadJson(await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = conversation }));
 
         Assert.Equal("miss then hit", $"{(fake.Calls[0].History.Count == 0 ? "miss" : "?")} then {(fake.Calls[2].History.Count == 1 ? "hit" : "?")}");
-        var expected = ChatRequestMetrics.EstimateTokens("sys".Length + PromptTemplate.Render(
+        // What usage counts is the native system text plus the whole rendered transcript, so the
+        // expectation counts that concatenation through the fake's own counter (chars/4, D80).
+        var counted = "sys" + PromptTemplate.Render(
         [
             new ChatMessage("system", ChatMessageContent.FromText("sys"), null, null),
             new ChatMessage("user", ChatMessageContent.FromText("hi"), null, null),
             new ChatMessage("assistant", ChatMessageContent.FromText("ok"), null, null),
             new ChatMessage("user", ChatMessageContent.FromText("more"), null, null),
-        ], nativeSystemPromptSupported: true).Prompt.Length);
+        ], nativeSystemPromptSupported: true).Prompt;
+        var expected = CharEstimateTokenCounter.Instance.Count(counted);
         Assert.Equal(expected, miss.GetProperty("usage").GetProperty("prompt_tokens").GetInt32());
         Assert.Equal(expected, hit.GetProperty("usage").GetProperty("prompt_tokens").GetInt32());
     }
@@ -378,16 +382,9 @@ public class ContextCacheEndpointTests
         }
 
         var text = new System.Text.StringBuilder();
-        foreach (var line in body.Split('\n').Where(l => l.StartsWith("data: ", StringComparison.Ordinal)))
+        foreach (var chunk in Sse.Chunks(body))
         {
-            var payload = line["data: ".Length..];
-            if (payload == "[DONE]")
-            {
-                continue;
-            }
-
-            using var doc = JsonDocument.Parse(payload);
-            foreach (var choice in doc.RootElement.GetProperty("choices").EnumerateArray())
+            foreach (var choice in chunk.GetProperty("choices").EnumerateArray())
             {
                 if (choice.GetProperty("delta").TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.String)
                 {
@@ -397,16 +394,6 @@ public class ContextCacheEndpointTests
         }
 
         return text.ToString();
-    }
-
-    private static async Task WaitUntilAsync(Func<bool> condition)
-    {
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
-        while (!condition())
-        {
-            Assert.True(DateTime.UtcNow < deadline, "timed out");
-            await Task.Delay(10);
-        }
     }
 
     private static async Task<JsonElement> ReadJson(HttpResponseMessage response)

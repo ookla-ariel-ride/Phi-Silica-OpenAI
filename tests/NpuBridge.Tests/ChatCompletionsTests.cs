@@ -1,6 +1,5 @@
 using System.Net;
 using System.Net.Http.Json;
-using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -266,7 +265,7 @@ public class ChatCompletionsTests
         });
         await using var host = await BridgeTestHost.StartAsync(fake, Options(SystemPromptPlacement.Native));
 
-        var response = await host.Client.PostAsJsonAsync(Path, Simple());
+        var response = await host.Client.PostAsJsonAsync(Path, ChatBody.User());
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         var root = await ReadJson(response);
@@ -288,7 +287,7 @@ public class ChatCompletionsTests
         var fake = new FakeBackend(new FakeBackendOptions { InitGate = gate });
         await using var host = await BridgeTestHost.StartAsync(fake, waitForReady: false);
 
-        var response = await host.Client.PostAsJsonAsync(Path, Simple());
+        var response = await host.Client.PostAsJsonAsync(Path, ChatBody.User());
 
         Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
         Assert.Equal("10", response.Headers.RetryAfter?.ToString());
@@ -307,7 +306,7 @@ public class ChatCompletionsTests
         var fake = new FakeBackend(new FakeBackendOptions { InitFailure = new InvalidOperationException("nope") });
         await using var host = await BridgeTestHost.StartAsync(fake);
 
-        var response = await host.Client.PostAsJsonAsync(Path, Simple());
+        var response = await host.Client.PostAsJsonAsync(Path, ChatBody.User());
 
         Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
         Assert.Null(response.Headers.RetryAfter);
@@ -322,7 +321,7 @@ public class ChatCompletionsTests
         var fake = new FakeBackend(new FakeBackendOptions { MaxPromptChars = 3, Responder = _ => ["ok"] });
         await using var host = await BridgeTestHost.StartAsync(fake);
 
-        var response = await host.Client.PostAsJsonAsync(Path, Simple("a much longer prompt than three characters"));
+        var response = await host.Client.PostAsJsonAsync(Path, ChatBody.User("a much longer prompt than three characters"));
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         var error = (await ReadJson(response)).GetProperty("error");
@@ -342,7 +341,7 @@ public class ChatCompletionsTests
         });
         await using var host = await BridgeTestHost.StartAsync(fake);
 
-        var response = await host.Client.PostAsJsonAsync(Path, Simple());
+        var response = await host.Client.PostAsJsonAsync(Path, ChatBody.User());
 
         Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
         Assert.Equal("server_error", (await ReadJson(response)).GetProperty("error").GetProperty("type").GetString());
@@ -360,7 +359,7 @@ public class ChatCompletionsTests
         });
         await using var host = await BridgeTestHost.StartAsync(fake);
 
-        var response = await host.Client.PostAsJsonAsync(Path, Simple());
+        var response = await host.Client.PostAsJsonAsync(Path, ChatBody.User());
 
         Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
         Assert.Equal("backend_error", (await ReadJson(response)).GetProperty("error").GetProperty("code").GetString());
@@ -380,7 +379,7 @@ public class ChatCompletionsTests
         });
         await using var host = await BridgeTestHost.StartAsync(fake);
 
-        var response = await host.Client.PostAsJsonAsync(Path, Simple());
+        var response = await host.Client.PostAsJsonAsync(Path, ChatBody.User());
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         var choice = (await ReadJson(response)).GetProperty("choices")[0];
@@ -674,7 +673,7 @@ public class ChatCompletionsTests
         var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["Hello", " world"] });
         await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture);
 
-        await host.Client.PostAsJsonAsync(Path, Simple("say hi"));
+        await host.Client.PostAsJsonAsync(Path, ChatBody.User("say hi"));
 
         var line = Assert.Single(capture.Records, r => r.Message.StartsWith("req=chatcmpl-", StringComparison.Ordinal));
         Assert.Contains("backend=fake", line.Message, StringComparison.Ordinal);
@@ -724,11 +723,11 @@ public class ChatCompletionsTests
     {
         // A generation that ended Complete parks its context in the cache (chunk 5); every other
         // outcome disposes it (D11). Either way nothing is left dangling, and shutdown empties the cache.
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, Simple(), expectedContexts: 1, expectedCached: 1);
-        await AssertBalanced(new FakeBackendOptions { MaxPromptChars = 2, Responder = _ => ["ok"] }, Simple("a long prompt"), expectedContexts: 1, expectedCached: 0);
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureStatus = GenerationStatus.Error }, Simple(), expectedContexts: 1, expectedCached: 0);
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureStatus = GenerationStatus.ContentFiltered }, Simple(), expectedContexts: 1, expectedCached: 0);
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureException = new InvalidOperationException("boom") }, Simple(), expectedContexts: 1, expectedCached: 0);
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, ChatBody.User(), expectedContexts: 1, expectedCached: 1);
+        await AssertBalanced(new FakeBackendOptions { MaxPromptChars = 2, Responder = _ => ["ok"] }, ChatBody.User("a long prompt"), expectedContexts: 1, expectedCached: 0);
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureStatus = GenerationStatus.Error }, ChatBody.User(), expectedContexts: 1, expectedCached: 0);
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureStatus = GenerationStatus.ContentFiltered }, ChatBody.User(), expectedContexts: 1, expectedCached: 0);
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureException = new InvalidOperationException("boom") }, ChatBody.User(), expectedContexts: 1, expectedCached: 0);
 
         // A streamed request reaches the backend like any other, so it creates one context and must
         // account for it too -- the response outliving the generation call is exactly what makes
@@ -766,41 +765,27 @@ public class ChatCompletionsTests
         await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture);
 
         using var cts = new CancellationTokenSource();
-        var post = host.Client.PostAsJsonAsync(Path, Simple(), cts.Token);
+        var post = host.Client.PostAsJsonAsync(Path, ChatBody.User(), cts.Token);
 
         // Disconnect on an observed signal rather than after a fixed delay: on a loaded machine a
         // stopwatch fires before the request has reached the handler, and then the test asserts nothing
         // about a disconnect — it asserts that a request nobody started leaked no context. Waiting for
         // the backend to have been called is the same thing the streaming disconnect tests do by
         // reading a byte off the response first.
-        await WaitUntilAsync(() => fake.Calls.Count > 0);
+        await TestWait.UntilAsync(() => fake.Calls.Count > 0);
         await cts.CancelAsync();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => post);
 
-        await WaitUntilAsync(() => fake.ActiveContexts == 0);
+        await TestWait.UntilAsync(() => fake.ActiveContexts == 0);
         Assert.Equal(fake.ContextsCreated, fake.ContextsDisposed);
         Assert.Equal(0, fake.ActiveContexts);
         Assert.Single(fake.Calls);
         Assert.DoesNotContain(capture.Records, r => r.Level >= LogLevel.Error);
     }
 
-    /// <summary>Polls until the condition holds, or fails the test rather than hanging the suite.</summary>
-    private static async Task WaitUntilAsync(Func<bool> condition, [CallerArgumentExpression(nameof(condition))] string? description = null)
-    {
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
-        while (!condition())
-        {
-            Assert.True(DateTime.UtcNow < deadline, $"timed out waiting for: {description}");
-            await Task.Delay(10);
-        }
-    }
-
     private static BridgeOptions Options(SystemPromptPlacement placement) =>
         new() { Backend = BackendKind.Fake, SystemPromptPlacement = placement };
-
-    private static object Simple(string content = "say hi") =>
-        new { model = "fake", messages = new[] { new { role = "user", content } } };
 
     private static Task<HttpResponseMessage> PostConversationWithSystem(BridgeTestHost host) =>
         host.Client.PostAsJsonAsync(Path, new

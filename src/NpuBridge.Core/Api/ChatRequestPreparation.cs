@@ -231,10 +231,13 @@ internal static class ChatRequestPreparer
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            // The same envelope a backend that throws during generation gets, from the same place, so a
+            // client cannot tell the two apart by their shape -- it hand-built its own copy of this body
+            // before, which is how two spellings of one failure come about.
+            var backendFailure = GenerationFailure.FromException(ex);
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs: 0, tokens: 0,
-                status: ex.GetType().Name, finish: "-", httpStatus: StatusCodes.Status502BadGateway);
-            return ChatRequestPreparation.Failed(OpenAiError.Result(StatusCodes.Status502BadGateway,
-                $"Backend threw: {ex.GetType().Name}: {ex.Message}", OpenAiError.Server, code: "backend_error"));
+                status: ex.GetType().Name, finish: "-", httpStatus: backendFailure.StatusCode);
+            return ChatRequestPreparation.Failed(backendFailure.ToResult());
         }
     }
 }
@@ -245,12 +248,6 @@ internal static class ChatRequestPreparer
 /// </summary>
 internal static class ChatRequestMetrics
 {
-    /// <summary>Characters per token in every estimate this process makes: usage, the cut (D53), the pressure check.</summary>
-    public const int CharsPerToken = 4;
-
-    /// <summary>Documented estimate: four characters per token, rounded up. Never a real tokenizer.</summary>
-    public static int EstimateTokens(int chars) => (chars + CharsPerToken - 1) / CharsPerToken;
-
     /// <summary>
     /// One line per request. <c>http=0</c> means no response was sent because the client had already
     /// disconnected. <c>prompt_chars</c> is what was sent to the backend on this request (the tail, on a

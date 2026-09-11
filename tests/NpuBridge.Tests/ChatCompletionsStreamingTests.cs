@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Json;
-using System.Runtime.CompilerServices;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using NpuBridge.Backends;
@@ -543,9 +542,7 @@ public class ChatCompletionsStreamingTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.DoesNotContain("\"error\"", body, StringComparison.Ordinal);
 
-        var withChoices = Payloads(body)
-            .Where(p => !string.Equals(p, "[DONE]", StringComparison.Ordinal))
-            .Select(p => JsonDocument.Parse(p).RootElement)
+        var withChoices = Sse.Chunks(body)
             .Where(c => c.GetProperty("choices").GetArrayLength() > 0)
             .ToList();
         Assert.Equal("content_filter", withChoices[^1].GetProperty("choices")[0].GetProperty("finish_reason").GetString());
@@ -579,9 +576,8 @@ public class ChatCompletionsStreamingTests
 
         // And the stream is otherwise exactly the ordinary one.
         Assert.EndsWith("data: [DONE]\n\n", body, StringComparison.Ordinal);
-        Assert.Equal("one two", string.Concat(Payloads(body)
-            .Where(p => !string.Equals(p, "[DONE]", StringComparison.Ordinal))
-            .Select(p => JsonDocument.Parse(p).RootElement.GetProperty("choices")[0].GetProperty("delta"))
+        Assert.Equal("one two", string.Concat(Sse.Chunks(body)
+            .Select(c => c.GetProperty("choices")[0].GetProperty("delta"))
             .Where(d => d.TryGetProperty("content", out _))
             .Select(d => d.GetProperty("content").GetString())));
     }
@@ -602,10 +598,7 @@ public class ChatCompletionsStreamingTests
         await using var host = await BridgeTestHost.StartAsync(fake, keepAliveInterval: TimeSpan.FromMilliseconds(20));
 
         var body = await (await PostStreamAsync(host)).Content.ReadAsStringAsync();
-        var chunks = Payloads(body)
-            .Where(p => !string.Equals(p, "[DONE]", StringComparison.Ordinal))
-            .Select(p => JsonDocument.Parse(p).RootElement)
-            .ToList();
+        var chunks = Sse.Chunks(body);
 
         Assert.Contains(": keep-alive", body, StringComparison.Ordinal);
         Assert.Equal(2, chunks.Count);
@@ -732,7 +725,7 @@ public class ChatCompletionsStreamingTests
 
             // http=0 is the handler saying there is nobody left to write to: it is done with the client
             // and is now in the drain. The generation has not finished, so the context must still exist.
-            await WaitUntilAsync(() => capture.Records.Any(r => r.Message.Contains("http=0", StringComparison.Ordinal)));
+            await TestWait.UntilAsync(() => capture.Records.Any(r => r.Message.Contains("http=0", StringComparison.Ordinal)));
             Assert.Equal(1, fake.ContextsCreated);
             Assert.Equal(0, fake.ContextsDisposed);
         }
@@ -742,7 +735,7 @@ public class ChatCompletionsStreamingTests
         }
 
         // Only now, once the generation can end, is the context released.
-        await WaitUntilAsync(() => fake.ActiveContexts == 0);
+        await TestWait.UntilAsync(() => fake.ActiveContexts == 0);
         Assert.Equal(1, fake.ContextsCreated);
         Assert.Equal(1, fake.ContextsDisposed);
         Assert.False(disposedDuringGeneration, "the context was disposed while the backend was still generating");
@@ -781,7 +774,7 @@ public class ChatCompletionsStreamingTests
 
         await cts.CancelAsync();
 
-        await WaitUntilAsync(() => fake.ActiveContexts == 0);
+        await TestWait.UntilAsync(() => fake.ActiveContexts == 0);
         Assert.Equal(1, fake.ContextsCreated);
         Assert.Equal(1, fake.ContextsDisposed);
 
@@ -790,24 +783,13 @@ public class ChatCompletionsStreamingTests
         Assert.DoesNotContain(capture.Records, r => r.Level >= LogLevel.Error);
     }
 
-    /// <summary>Polls until the condition holds, or fails the test rather than hanging the suite.</summary>
-    private static async Task WaitUntilAsync(Func<bool> condition, [CallerArgumentExpression(nameof(condition))] string? description = null)
-    {
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
-        while (!condition())
-        {
-            Assert.True(DateTime.UtcNow < deadline, $"timed out waiting for: {description}");
-            await Task.Delay(10);
-        }
-    }
-
     /// <summary>
     /// The one error event in the body, checked to be the last frame before the done marker: an error
     /// event that left the stream hanging, or that was followed by more chunks, fails here.
     /// </summary>
     private static string ErrorPayload(string body)
     {
-        var payloads = Payloads(body);
+        var payloads = Sse.Payloads(body);
         Assert.Equal("[DONE]", payloads[^1]);
         var frame = Assert.Single(payloads, p => p.Contains("\"error\"", StringComparison.Ordinal));
         Assert.Equal(payloads[^2], frame);
@@ -816,13 +798,6 @@ public class ChatCompletionsStreamingTests
 
     private static JsonElement ErrorEvent(string body) =>
         JsonDocument.Parse(ErrorPayload(body)).RootElement.GetProperty("error");
-
-    /// <summary>The payload of every <c>data:</c> frame, in wire order, keep-alive comments excluded.</summary>
-    private static List<string> Payloads(string body) =>
-        body.Split('\n')
-            .Where(l => l.StartsWith("data: ", StringComparison.Ordinal))
-            .Select(l => l["data: ".Length..])
-            .ToList();
 
     /// <summary>
     /// The context is disposed even when cancelling the generation throws. The cancel that opens the
@@ -879,7 +854,7 @@ public class ChatCompletionsStreamingTests
         Assert.Contains("\"error\"", body, StringComparison.Ordinal);
         Assert.Contains("[DONE]", body, StringComparison.Ordinal);
 
-        await WaitUntilAsync(() => fake.ActiveContexts == 0);
+        await TestWait.UntilAsync(() => fake.ActiveContexts == 0);
         Assert.Equal(1, fake.ContextsDisposed);
     }
 
@@ -952,7 +927,7 @@ public class ChatCompletionsStreamingTests
         var send = host.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
 
         // The backend is generating, held at its gate, and nothing has committed the headers.
-        await WaitUntilAsync(() => fake.Calls.Count == 1);
+        await TestWait.UntilAsync(() => fake.Calls.Count == 1);
         Assert.False(send.IsCompleted, "the headers were committed before the first delta although keep-alives are disabled");
 
         gate.SetResult();
@@ -1089,7 +1064,7 @@ public class ChatCompletionsStreamingTests
         }
 
         // The request has run to the end of the pipeline: disposal alone would not say that.
-        await WaitUntilAsync(() => host.Requests.Completed == 1);
+        await TestWait.UntilAsync(() => host.Requests.Completed == 1);
         Assert.Empty(host.Requests.Escaped);
         Assert.Equal(1, fake.ContextsCreated);
         Assert.Equal(1, fake.ContextsDisposed);

@@ -98,8 +98,11 @@ internal sealed class ChatCompletionsEndpoint
         try
         {
             var stopwatch = Stopwatch.StartNew();
-            long firstTokenTicks = 0;
-            var callbacks = 0;
+
+            // Counts the deltas and times the first one, exactly as it does on the streaming path; the
+            // channel writer that path passes it is the only difference, and it is optional. Assigned
+            // once per attempt inside the loop, so a retry times itself rather than the attempt before it.
+            DeltaSink sink;
 
             // Set beside the CancelAsync below, when this handler cancels the generation because the
             // watcher tripped a limit, and read when the status comes back: a Cancelled this handler
@@ -141,91 +144,41 @@ internal sealed class ChatCompletionsEndpoint
                 // latter needs a source of the handler's own, the former arrives through the link.
                 using var generationCts = CancellationTokenSource.CreateLinkedTokenSource(http.RequestAborted);
                 cancelledByCut = false;
-                callbacks = 0;
-                firstTokenTicks = 0;
 
                 // Watches the text as it arrives purely to decide when to stop the generation early; the
-                // authoritative cut is applied below to the text the backend finally reports, with the
-                // same OutputCutter, so the answer does not depend on which deltas the watcher happened
+                // authoritative cut is applied below to the text the backend finally reports, with a
+                // second OutputCutter, so the answer does not depend on which deltas the watcher happened
                 // to see. Null when the request set no limits, which is the ordinary case and costs
-                // nothing. Fresh per attempt, like the signal beside it.
-                var watcher = limits.IsEmpty ? null : new OutputCutter(limits);
-
-                // How the callback tells this task that the cut fired. The callback never cancels
-                // anything itself: it runs on the backend's thread, and cancelling from there is wrong
-                // twice over. A straight Cancel() can complete the generation's await inline and re-enter
-                // the adapter while it is still inside this callback (Phi Silica then spins draining a
-                // callback that cannot finish until we return); and CancelAfter(0) moves the cancel onto
-                // a timer thread, where a throwing registration -- CsWinRT's IAsyncInfo.Cancel() on the
-                // live operation is one -- is rethrown with nothing above it to catch it, and the process
-                // terminates. So the callback sets this and the request task, awaiting below, cancels on
-                // its own thread inside a try. RunContinuationsAsynchronously keeps that continuation
-                // off the callback thread too.
-                var cutSignal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                // nothing. Fresh per attempt, like the sink beside it.
+                var watcher = limits.IsEmpty ? null : new CutWatcher(limits);
+                sink = new DeltaSink(stopwatch, observer: watcher is null ? null : watcher.Accept);
 
                 var generation = backend.GenerateAsync(
                     lease.Context,
                     lease.Prompt,
                     prepared.Sampling,
-                    delta =>
-                    {
-                        if (Interlocked.Increment(ref callbacks) == 1)
-                        {
-                            Interlocked.Exchange(ref firstTokenTicks, stopwatch.ElapsedTicks);
-                        }
-
-                        if (watcher is null)
-                        {
-                            return;
-                        }
-
-                        // StopRequested, not IsCut: with a token budget the watcher may know the budget
-                        // is passed before it can place the cut exactly (D80); either way the model stops
-                        // and the authoritative cut below runs over the text the backend returns.
-                        bool cut;
-                        lock (watcher)
-                        {
-                            if (watcher.StopRequested)
-                            {
-                                return;
-                            }
-
-                            watcher.Accept(delta);
-                            cut = watcher.StopRequested;
-                        }
-
-                        if (cut)
-                        {
-                            cutSignal.TrySetResult();
-                        }
-                    },
+                    sink.OnDelta,
                     generationCts.Token);
 
                 // Whichever comes first. When the cut has fired, cancel here -- on this thread, guarded
                 // -- and then wait for the generation to end as it would have anyway. The overshoot is a
                 // delta or two and costs nothing: the cut itself is applied to the final text below.
-                // Cancelling faults when a registration on the token throws, and that is a Debug line
-                // here rather than a failure, because the generation still ends, the text is still cut,
-                // and the finally still disposes the context -- exactly as the streaming path treats its
-                // own cancel.
                 //
                 // "Has the cut fired" rather than "did the cut win the race": a generation that ends in
                 // the same instant the watcher trips is still cancelled, so the flag beside the cancel
                 // means the same thing here as on the stream, which cancels whenever a delta trips the
                 // cutter no matter what the generation has done since. Cancelling a finished generation
                 // is a no-op.
-                await Task.WhenAny(generation, cutSignal.Task).ConfigureAwait(false);
-                if (cutSignal.Task.IsCompleted)
+                //
+                // Skipped when the request set no limits: there is no watcher, so nothing can ever
+                // complete the other half of the race, and awaiting the generation alone says the same.
+                if (watcher is not null)
                 {
-                    cancelledByCut = true;
-                    try
+                    await Task.WhenAny(generation, watcher.Signal).ConfigureAwait(false);
+                    if (watcher.Signal.IsCompleted)
                     {
-                        await generationCts.CancelAsync().ConfigureAwait(false);
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogDebug(ex, "req={RequestId} cancelling the generation at the cut threw; waiting for it to end anyway.",
-                            requestId);
+                        cancelledByCut = true;
+                        await GenerationPipeline.CancelGuardedAsync(generationCts, logger, requestId, "at the cut").ConfigureAwait(false);
                     }
                 }
 
@@ -249,15 +202,11 @@ internal sealed class ChatCompletionsEndpoint
 
             stopwatch.Stop();
             var totalMs = stopwatch.Elapsed.TotalMilliseconds;
-            var ttftMs = callbacks == 0 ? totalMs : firstTokenTicks * 1000.0 / Stopwatch.Frequency;
+            var ttftMs = sink.TtftMs(totalMs);
             var cacheLabel = lease.CacheHit ? "hit" : "miss";
             var promptChars = lease.PromptChars;
 
-            if (options.Verbose)
-            {
-                logger.LogInformation("req={RequestId} raw model output ({Status}):\n---- output ----\n{Text}\n---- end ----",
-                    requestId, result.Status, result.Text);
-            }
+            GenerationPipeline.LogRawOutput(logger, options, requestId, result);
 
             // 8. Status → response or error. The mapping itself lives in GenerationFailure, shared with
             // the streaming path so the two shapes cannot describe the same condition differently.
@@ -274,22 +223,16 @@ internal sealed class ChatCompletionsEndpoint
             // because the cap or a stop string was reached comes back Cancelled, which is a 502 for any
             // other reason; the cut is what tells the two apart, and it is decided by the text rather
             // than by the status so that a cut which landed on the last delta reads the same either way.
+            // The whole text in one go, so the cut's verdict is legible immediately -- unlike the stream,
+            // which must wait for its Flush (D57).
             var cut = limits.Cut(result.Text);
 
-            // Filtering outranks the cut: it is the one status that means "do not hand this text on",
-            // and a cut is not a licence to. Spelled out by name rather than as "not Complete", because
-            // Cancelled now reaches here legitimately whenever a limit fired.
-            var filtered = result.Status is GenerationStatus.ContentFiltered or GenerationStatus.BlockedByPolicy;
+            // Error, filtered, or content: one classification, shared with the streaming path, so the two
+            // shapes cannot describe the same generation differently. See GenerationOutcome for why the
+            // cut is consulted as the flag recorded at the cancel rather than as the cutter's state.
+            var outcome = GenerationOutcome.Classify(result, cancelledByCut);
 
-            // Only a Cancelled may be attributed to the cut, and only one this handler asked for. Gating
-            // the whole mapping on "a cut fired" suppressed every failure status, which was a regression
-            // against main: an Error that used to be a 502 became HTTP 200 with truncated text and
-            // finish_reason "length". And deciding "did the cut fire" from the whole-text cut was wrong
-            // too: it can report a cap the watcher never cancelled for, so a backend that reported
-            // Cancelled on its own was a success here and a failure on the stream.
-            var selfCancelled = cancelledByCut && result.Status is GenerationStatus.Cancelled;
-
-            if (!filtered && !selfCancelled && GenerationFailure.FromStatus(result) is { } failure)
+            if (outcome.Failure is { } failure)
             {
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
                     status: result.Status.ToString(), finish: "-", httpStatus: failure.StatusCode,
@@ -297,14 +240,12 @@ internal sealed class ChatCompletionsEndpoint
                 return failure.ToResult();
             }
 
-            var content = filtered ? string.Empty : cut.Text;
-            var finishReason = filtered ? "content_filter" : cut.FinishReason ?? "stop";
+            var content = outcome.Filtered ? string.Empty : cut.Text;
+            var finishReason = outcome.FinishReason(cut.FinishReason);
 
-            // 8b. Back into the cache -- only a context whose generation ended Complete, and only when
-            // the client got the whole reply. After a cut the context holds text the client never saw,
-            // so the transcript it would be stored under is not the one the client will send back; it
-            // is disposed by the finally like any other context that cannot be trusted (D11).
-            if (result.Status == GenerationStatus.Complete && cut.FinishReason is null)
+            // 8b. Back into the cache -- the rule is GenerationOutcome's, and the finally disposes every
+            // context it refuses (D11, D43).
+            if (outcome.KeepsContext(cut.FinishReason))
             {
                 lease.Keep(result.Text);
             }
@@ -324,7 +265,7 @@ internal sealed class ChatCompletionsEndpoint
                 Created: time.GetUtcNow().ToUnixTimeSeconds(),
                 Model: backend.ModelId,
                 Choices: [new ChatCompletionChoice(0, new ChatCompletionResponseMessage("assistant", content), finishReason)],
-                Usage: new CompletionUsage(promptTokens, completionTokens, promptTokens + completionTokens));
+                Usage: CompletionUsage.For(promptTokens, completionTokens));
 
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, completionTokens,
                 result.Status.ToString(), finishReason, StatusCodes.Status200OK, totalMs,

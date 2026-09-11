@@ -81,10 +81,11 @@ internal sealed class ChatCompletionsStreamEndpoint
         // stop string can straddle two deltas, and a delta already written cannot be recalled.
         var cutter = new OutputCutter(prepared.Limits);
 
-        // Not the same question as "has anything been written": a keep-alive comment starts the stream
-        // without opening the assistant message, and a reply with no deltas at all still needs its role
-        // chunk before the finish chunk.
-        var roleSent = false;
+        // Whether a delta ever arrived, which is not the same question as "has anything been written":
+        // a keep-alive comment starts the stream without opening the assistant message, and a reply with
+        // no deltas at all still needs its role chunk before the finish chunk. Declared out here because
+        // the loop below may run more than once and the answer that matters is the last attempt's.
+        var streamed = false;
 
         // Set when this handler cancels the generation because a limit fired while streaming, and read
         // when the status comes back. A fact recorded at the cancel, not inferred from the cutter
@@ -140,7 +141,7 @@ internal sealed class ChatCompletionsStreamEndpoint
                     AllowSynchronousContinuations = false,
                 });
 
-                sink = new DeltaSink(channel.Writer, stopwatch);
+                sink = new DeltaSink(stopwatch, channel.Writer);
 
                 // Started, not awaited: the reader loop below runs concurrently with it. The channel is
                 // completed in that method's finally, which is what ends the loop on every outcome,
@@ -150,13 +151,12 @@ internal sealed class ChatCompletionsStreamEndpoint
                 // Nothing has been written yet, on purpose. Waiting here — rather than opening with the
                 // role chunk — is what keeps the status line available for a failure that arrives before
                 // the first token. The first keep-alive comment is what ends that window, about a second in.
-                var streamed = await WaitForFirstDeltaAsync(sse, channel.Reader, streaming, aborted)
+                streamed = await WaitForFirstDeltaAsync(sse, channel.Reader, streaming, aborted)
                     .ConfigureAwait(false);
 
                 if (streamed)
                 {
                     // The role chunk. OpenAI clients rely on it to open the assistant message.
-                    roleSent = true;
                     await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
                         new ChatCompletionDelta("assistant", string.Empty), finishReason: null), aborted).ConfigureAwait(false);
 
@@ -181,7 +181,7 @@ internal sealed class ChatCompletionsStreamEndpoint
                             // (D80), and then the deltas already in flight keep coming through it so the
                             // flush below decides over everything the model produced.
                             cancelledByCut = true;
-                            await CancelGuardedAsync(generationCts, logger, requestId, "at the cut").ConfigureAwait(false);
+                            await GenerationPipeline.CancelGuardedAsync(generationCts, logger, requestId, "at the cut").ConfigureAwait(false);
                         }
 
                         if (cutter.IsCut)
@@ -222,13 +222,9 @@ internal sealed class ChatCompletionsStreamEndpoint
             var truncatedTurns = session.DroppedTurns;
 
             var totalMs = stopwatch.Elapsed.TotalMilliseconds;
-            var ttftMs = sink.Count == 0 ? totalMs : sink.FirstTokenTicks * 1000.0 / Stopwatch.Frequency;
+            var ttftMs = sink.TtftMs(totalMs);
 
-            if (options.Verbose)
-            {
-                logger.LogInformation("req={RequestId} raw model output ({Status}):\n---- output ----\n{Text}\n---- end ----",
-                    requestId, result.Status, result.Text);
-            }
+            GenerationPipeline.LogRawOutput(logger, options, requestId, result);
 
             if (aborted.IsCancellationRequested)
             {
@@ -240,21 +236,12 @@ internal sealed class ChatCompletionsStreamEndpoint
                 return null;
             }
 
-            // A generation this handler cancelled because a limit fired reports Cancelled, which is a
-            // 502 for every other reason. The cut is what tells those apart, so it is consulted first —
-            // as it is on the JSON path, in the same order, for the same reason.
-            //
-            // Only Cancelled, though. "A cut fired" is not a licence to discard every other status: a
-            // backend that reports Error after the cut has still failed, and on this hardware that is
-            // not hypothetical -- D55 established that a real prompt overflow surfaces as exactly that
-            // generic Error. Suppressing it hands the client HTTP 200, a truncated reply and
-            // finish_reason "stop", with nothing to say the generation faulted.
-            //
-            // "The cut caused it" is the flag set beside the CancelAsync above, not the cutter's state:
-            // a cut established later by Flush() cannot have caused anything, because nothing cancelled
-            // for it, and a Cancelled the handler never asked for is a failure on both shapes.
-            var selfCancelled = cancelledByCut && result.Status is GenerationStatus.Cancelled;
-            if (!selfCancelled && GenerationFailure.FromStatus(result) is { } failure)
+            // Error, filtered, or content: one classification, shared with the non-streaming path, in
+            // the same order and for the same reasons. See GenerationOutcome for why a Cancelled the
+            // handler asked for is not a failure while every other status still is, and why "the cut
+            // caused it" is the flag set beside the CancelAsync above rather than the cutter's state.
+            var outcome = GenerationOutcome.Classify(result, cancelledByCut);
+            if (outcome.Failure is { } failure)
             {
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
                     status: result.Status.ToString(), finish: "-",
@@ -263,20 +250,14 @@ internal sealed class ChatCompletionsStreamEndpoint
                 return await FailAsync(sse, failure, logger, requestId, aborted).ConfigureAwait(false);
             }
 
-            if (!roleSent)
+            if (!streamed)
             {
                 // Not one delta arrived — an empty reply, or a filtered one — so the role chunk has not
                 // gone out yet. It still has to: a client builds the assistant message from it, and it
                 // has to precede the tail chunk below.
-                roleSent = true;
                 await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
                     new ChatCompletionDelta("assistant", string.Empty), finishReason: null), aborted).ConfigureAwait(false);
             }
-
-            // Content filtering is not a failure: the generation ran, and the client is told so with a
-            // finish reason rather than an error, exactly as on the JSON path — and, as there, it
-            // outranks the cut, so the two shapes label the same outcome the same way.
-            var filtered = result.Status is GenerationStatus.ContentFiltered or GenerationStatus.BlockedByPolicy;
 
             // The held tail. The generation ended without a stop string forming, so the characters that
             // were withheld in case they were its first half are ordinary output after all and must go
@@ -287,21 +268,21 @@ internal sealed class ChatCompletionsStreamEndpoint
             // Not flushed at all when the runtime withheld the answer. The deltas already on the wire
             // cannot be recalled, but these have not been written yet and the bridge now knows they were
             // withheld: writing them here would be the one place a filtered reply gained text.
-            var tail = filtered ? string.Empty : cutter.Flush();
+            var tail = outcome.Filtered ? string.Empty : cutter.Flush();
 
             // Read after the flush, never before. Flush() can be the call that commits the cap: it is
             // deliberately deferred until the text runs Holdback past the budget, so a reply that ends
             // inside that window is only cut here. Reading FinishReason first labelled such a request
             // "stop" on this shape while the JSON path -- which reads it after its own flush -- called
-            // the very same generation "length", and a client that resumes on "length" stopped instead.
-            var finishReason = filtered ? "content_filter" : cutter.FinishReason ?? "stop";
+            // the very same generation "length", and a client that resumes on "length" stopped instead
+            // (D57). Hence the post-flush verdict is an argument to the shared classifier rather than
+            // something it reads for itself.
+            var finishReason = outcome.FinishReason(cutter.FinishReason);
 
-            // Back into the cache -- only a context whose generation ended Complete, and only when the
-            // client got the whole reply: after a cut the context holds text the client never saw, so
-            // the transcript it would be stored under is not the one the client will send back. The
-            // generation task has already ended (awaited above), so the context is idle; the finally's
-            // drain finds nothing to wait for and its Dispose finds the lease already settled (D51).
-            if (result.Status == GenerationStatus.Complete && !cutter.IsCut)
+            // Back into the cache, by the shared rule. The generation task has already ended (awaited
+            // above), so the context is idle; the finally's drain finds nothing to wait for and its
+            // Dispose finds the lease already settled (D51).
+            if (outcome.KeepsContext(cutter.FinishReason))
             {
                 lease.Keep(result.Text);
             }
@@ -334,7 +315,7 @@ internal sealed class ChatCompletionsStreamEndpoint
                     Created: created,
                     Model: model,
                     Choices: [],
-                    Usage: new CompletionUsage(promptTokens, completionTokens, promptTokens + completionTokens)),
+                    Usage: CompletionUsage.For(promptTokens, completionTokens)),
                     aborted).ConfigureAwait(false);
             }
 
@@ -383,7 +364,7 @@ internal sealed class ChatCompletionsStreamEndpoint
             // between a failure and the disposal below: letting a throw escape would skip both the drain
             // and Dispose(), leaking exactly the handle D43 guarantees is released -- worse than the D51
             // defect, which disposed too early rather than never.
-            await CancelGuardedAsync(generationCts, logger, requestId, "on the way out").ConfigureAwait(false);
+            await GenerationPipeline.CancelGuardedAsync(generationCts, logger, requestId, "on the way out").ConfigureAwait(false);
 
             if (generation is not null)
             {
@@ -405,27 +386,6 @@ internal sealed class ChatCompletionsStreamEndpoint
     }
 
     private static string CacheLabel(ContextLease? lease) => lease is null ? "-" : lease.CacheHit ? "hit" : "miss";
-
-    /// <summary>
-    /// Cancels the generation without letting the cancel itself fail the request. <c>CancelAsync</c>
-    /// faults when a registration on the token throws, and CsWinRT registers one that calls
-    /// <c>IAsyncInfo.Cancel()</c> on the live WinRT operation — a COM call that can fail rather than
-    /// no-op. Both places this handler cancels, the cut and the exit, go on to await the generation and
-    /// dispose the context regardless, so a throw here is a Debug line and nothing more. Cancelling a
-    /// source twice is a no-op, so calling this at the cut and again on the way out is fine.
-    /// </summary>
-    private static async Task CancelGuardedAsync(CancellationTokenSource generationCts, ILogger logger, string requestId, string where)
-    {
-        try
-        {
-            await generationCts.CancelAsync().ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            logger.LogDebug(ex, "req={RequestId} cancelling the generation {Where} threw; draining and disposing anyway.",
-                requestId, where);
-        }
-    }
 
     /// <summary>
     /// Waits until either the first delta is queued (true) or the generation ended without producing one
@@ -457,15 +417,21 @@ internal sealed class ChatCompletionsStreamEndpoint
 
         while (true)
         {
-            using var timer = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            var finished = await Task.WhenAny(wait, Task.Delay(next, timer.Token)).ConfigureAwait(false);
-            if (ReferenceEquals(finished, wait))
+            try
             {
-                await timer.CancelAsync().ConfigureAwait(false);
-                return await wait.ConfigureAwait(false);
+                // WaitAsync returns a task of its own and leaves `wait` -- the channel's, awaited again
+                // on the next lap -- to complete when it completes. Its timer is released either way;
+                // what it does leave behind is one continuation on `wait` per lap, and the laps are
+                // bounded by the generation's own length over the fifteen-second interval.
+                return await wait.WaitAsync(next, cancellationToken).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                // No delta yet. Say something on the wire and wait again.
             }
 
-            // The delay lost the race to nothing but its own token: the client is gone.
+            // Belt and braces: a cancel that lands in the same instant as the timeout is reported as the
+            // timeout, and writing to a connection whose client has gone is not worth the exception.
             cancellationToken.ThrowIfCancellationRequested();
 
             await sse.WriteAsync(KeepAliveFrame, cancellationToken).ConfigureAwait(false);
@@ -596,45 +562,6 @@ internal sealed class ChatCompletionsStreamEndpoint
 
             await _response.WriteAsync(frame, cancellationToken).ConfigureAwait(false);
             await _response.Body.FlushAsync(cancellationToken).ConfigureAwait(false);
-        }
-    }
-
-    /// <summary>
-    /// The only thing the backend's callback thread can reach. It holds a channel writer and a
-    /// stopwatch and nothing else — no <see cref="HttpResponse"/>, no <see cref="HttpContext"/>, not
-    /// even a closure over one — so "never write to the response from the callback" is a property of
-    /// what is in scope rather than a rule someone has to remember. Every field is touched through
-    /// interlocked operations because <see cref="OnDelta"/> and the request's own task run at once.
-    /// </summary>
-    private sealed class DeltaSink
-    {
-        private readonly ChannelWriter<string> _writer;
-        private readonly Stopwatch _stopwatch;
-        private long _firstTokenTicks;
-        private int _count;
-
-        public DeltaSink(ChannelWriter<string> writer, Stopwatch stopwatch)
-        {
-            _writer = writer;
-            _stopwatch = stopwatch;
-        }
-
-        /// <summary>Callbacks seen. Not a token count: runtimes batch several tokens per callback.</summary>
-        public int Count => Volatile.Read(ref _count);
-
-        /// <summary>Stopwatch ticks at the first callback; meaningless when <see cref="Count"/> is 0.</summary>
-        public long FirstTokenTicks => Interlocked.Read(ref _firstTokenTicks);
-
-        public void OnDelta(string delta)
-        {
-            if (Interlocked.Increment(ref _count) == 1)
-            {
-                Interlocked.Exchange(ref _firstTokenTicks, _stopwatch.ElapsedTicks);
-            }
-
-            // Unbounded channel: TryWrite only fails once the writer is completed, which happens after
-            // GenerateAsync has returned and so after the last callback.
-            _writer.TryWrite(delta);
         }
     }
 }

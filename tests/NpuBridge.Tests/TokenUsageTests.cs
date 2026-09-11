@@ -198,10 +198,7 @@ public class TokenUsageTests
         JsonElement usage;
         if (stream)
         {
-            var chunks = text.Split('\n')
-                .Where(l => l.StartsWith("data: ", StringComparison.Ordinal) && !l.EndsWith("[DONE]", StringComparison.Ordinal))
-                .Select(l => JsonDocument.Parse(l["data: ".Length..]).RootElement)
-                .ToList();
+            var chunks = Sse.Chunks(text);
             usage = Assert.Single(chunks, c => c.TryGetProperty("usage", out var u) && u.ValueKind == JsonValueKind.Object).GetProperty("usage");
         }
         else

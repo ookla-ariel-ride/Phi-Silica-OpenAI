@@ -26,7 +26,7 @@ public class OpenAiConformanceTests
         var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["hi"] });
         await using var host = await BridgeTestHost.StartAsync(fake);
 
-        var body = await (await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = new[] { User("x") } })).Content.ReadAsStringAsync();
+        var body = await (await host.Client.PostAsJsonAsync(Path, ChatBody.User("x"))).Content.ReadAsStringAsync();
         var choice = JsonDocument.Parse(body).RootElement.GetProperty("choices")[0];
 
         Assert.Equal(JsonValueKind.Null, choice.GetProperty("logprobs").ValueKind);
@@ -45,7 +45,7 @@ public class OpenAiConformanceTests
         await using var host = await BridgeTestHost.StartAsync(fake);
 
         var body = await (await host.Client.PostAsJsonAsync(Path, new { model = "fake", stream = true, messages = new[] { User("x") } })).Content.ReadAsStringAsync();
-        var chunks = Chunks(body).Where(c => c.GetProperty("choices").GetArrayLength() > 0).ToList();
+        var chunks = Sse.Chunks(body).Where(c => c.GetProperty("choices").GetArrayLength() > 0).ToList();
 
         Assert.NotEmpty(chunks);
         Assert.All(chunks, c =>
@@ -59,7 +59,7 @@ public class OpenAiConformanceTests
         Assert.Equal("stop", chunks[^1].GetProperty("choices")[0].GetProperty("finish_reason").GetString());
 
         // Without stream_options.include_usage no chunk carries a usage key at all.
-        Assert.All(Chunks(body), c => Assert.False(c.TryGetProperty("usage", out _)));
+        Assert.All(Sse.Chunks(body), c => Assert.False(c.TryGetProperty("usage", out _)));
     }
 
     [Theory]
@@ -133,7 +133,7 @@ public class OpenAiConformanceTests
         var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureException = new InvalidOperationException("boom") });
         await using var host = await BridgeTestHost.StartAsync(fake);
 
-        var fault = await Error(await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = new[] { User("x") } }));
+        var fault = await Error(await host.Client.PostAsJsonAsync(Path, ChatBody.User("x")));
         Assert.Equal("server_error", fault.GetProperty("type").GetString());
         Assert.Equal("backend_error", fault.GetProperty("code").GetString());
         Assert.Equal(JsonValueKind.Null, fault.GetProperty("param").ValueKind);
@@ -147,7 +147,7 @@ public class OpenAiConformanceTests
         fake.Options.FailAfterTokens = 1;
         fake.Options.Responder = _ => ["a", "b"];
         var stream = await (await host.Client.PostAsJsonAsync(Path, new { model = "fake", stream = true, messages = new[] { User("x") } })).Content.ReadAsStringAsync();
-        var frame = Chunks(stream).Single(c => c.TryGetProperty("error", out _)).GetProperty("error");
+        var frame = Sse.Chunks(stream).Single(c => c.TryGetProperty("error", out _)).GetProperty("error");
         Assert.True(frame.TryGetProperty("param", out _));
         Assert.True(frame.TryGetProperty("code", out _));
         Assert.True(frame.TryGetProperty("message", out _));
@@ -184,7 +184,7 @@ public class OpenAiConformanceTests
         var get = await host.Client.GetAsync("/v1/models/gpt-4o");
 
         // A valid id while loading is still the 503; checked before the gate opens.
-        var loading = await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = new[] { User("x") } });
+        var loading = await host.Client.PostAsJsonAsync(Path, ChatBody.User("x"));
         Assert.Equal(HttpStatusCode.ServiceUnavailable, loading.StatusCode);
         gate.SetResult();
 
@@ -230,7 +230,7 @@ public class OpenAiConformanceTests
             stream_options = new { include_usage = true },
             messages = new[] { User("x") },
         })).Content.ReadAsStringAsync();
-        var chunks = Chunks(body);
+        var chunks = Sse.Chunks(body);
 
         Assert.True(chunks.Count >= 3);
         Assert.All(chunks.Take(chunks.Count - 1), c => Assert.Equal(JsonValueKind.Null, c.GetProperty("usage").ValueKind));
@@ -251,7 +251,7 @@ public class OpenAiConformanceTests
             stream_options = new { include_usage = true },
             messages = new[] { User("x") },
         })).Content.ReadAsStringAsync();
-        var chunks = Chunks(body);
+        var chunks = Sse.Chunks(body);
 
         var frames = chunks.Where(c => c.TryGetProperty("choices", out _)).ToList();
         Assert.NotEmpty(frames);
@@ -266,10 +266,4 @@ public class OpenAiConformanceTests
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         return doc.RootElement.GetProperty("error").Clone();
     }
-
-    private static List<JsonElement> Chunks(string body) =>
-        body.Split('\n')
-            .Where(l => l.StartsWith("data: ", StringComparison.Ordinal) && !l.EndsWith("[DONE]", StringComparison.Ordinal))
-            .Select(l => JsonDocument.Parse(l["data: ".Length..]).RootElement.Clone())
-            .ToList();
 }
