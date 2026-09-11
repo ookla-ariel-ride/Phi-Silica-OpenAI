@@ -3,14 +3,14 @@
 ## Works today (verified)
 | Area | Status | Evidence |
 |---|---|---|
-| Solution, build, tests | ✅ | `dotnet build` clean, 381 xunit tests green (chunk 4 merged; re-verified 2026-09-10) |
+| Solution, build, tests | ✅ | `dotnet build` clean, 387 xunit tests green (review bugs #5/#6/#8 merged 2026-09-10) |
 | `/healthz`, `/v1/models`, `/v1` fallback | ✅ | TestServer tests + live curl on the exe |
 | Config precedence json < local < env < CLI | ✅ | real-file test + live probes |
 | CLI verbs `run`, `service`, `task`, `help`, `version` | ✅ | tests + live exit codes |
 | Fake backend with faults/threads/init rules | ✅ | tests |
 | Sparse package identity (`identity.ps1`) | ✅ | registered; PFN `NpuBridge_jtas4mnxdyzpe` |
 | Self-relaunch via package activation + supervision | ✅ | child had identity, saw shell env, died with the parent |
-| Phi Silica adapter (experimental SDK) | ✅ | smoke: generate, preflight, system prompt, disconnect drain |
+| Phi Silica adapter (experimental SDK) | ⚠️ | smoke passed the morning of 2026-09-10 (generate, preflight, system prompt, disconnect drain); **unusable since the 29661 Insider flight that evening** (workload packages fail to register, model `NotReady`); #7's text-contract change is on `review-fixes`, build-verified only |
 | `/v1/chat/completions` non-streaming | ✅ | `ChatCompletionsTests`; smoke on the real NPU: 677 ms–899 ms across runs, correct shape and usage |
 | `/v1/chat/completions` streaming (SSE) | ✅ | `ChatCompletionsStreamingTests` (framing, error event, keep-alive, disconnect drain); smoke streaming step on the NPU |
 | Client-side cut: `max_tokens`, `max_completion_tokens`, `stop` | ✅ | `OutputCutTests` on both shapes; smoke shows the cut cancels the NPU (D53) |
@@ -19,7 +19,7 @@
 | Logon task install/status/run/uninstall | ✅ | live, elevated (pre-supervisor build; `/End` path covered by kill-parent probe) |
 | Windows service verbs | ⚠️ | commands verified by tests and emulation; not exercised against the SCM |
 | gitleaks hook + CI | ✅ | planted secrets blocked |
-| Build + test CI (`.github/workflows/build.yml`, windows-latest) | ⚠️ | added 2026-09-10; passes locally, first Actions run not yet observed |
+| Build + test CI (`.github/workflows/build.yml`, windows-latest) | ✅ | added 2026-09-10; first Actions run green in 2 m 22 s |
 
 ## Not built yet
 - `/v1/completions` — chunk 8

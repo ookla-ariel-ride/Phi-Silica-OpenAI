@@ -17,7 +17,12 @@ Status: `docs/PLAN.md` is the signed-off design (read it first). Chunks 1 to 4 o
 merged: skeleton, the Phi Silica adapter, non-streaming `POST /v1/chat/completions` with the prompt
 template, and streaming over server-sent events with the client-side cut for `max_tokens`/`stop`.
 Chunk 5 (context cache + overflow) is next; its blockers are under "Traps for the next chunks" below.
-Code lands in the chunk order listed there. `docs/DECISIONS.md` records why things are the way they
+Code lands in the chunk order listed there. Three of the four defects from the 2026-09-10 code review
+(#5, #6, #8) are fixed and merged (D62 to D64); the fourth (#7, the Phi Silica adapter's text contract,
+D65) is implemented on `review-fixes` and waits on hardware verification, because the Windows Insider
+flight to build 29661 (2026-09-10 evening) left the Phi Silica workload packages unregisterable, so the
+model reports `NotReady` and `smoke.ps1` cannot reach a generation until the flight is fixed or rolled
+back. Do not retry `--install-model` or re-registering the packages; both were tried. `docs/DECISIONS.md` records why things are the way they
 are (D1 to D65 so far); `docs/FUTURE.md` holds deferred work. Update both whenever a chunk changes a
 choice or defers something.
 

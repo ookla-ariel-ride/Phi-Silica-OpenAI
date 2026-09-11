@@ -1,15 +1,18 @@
 # Active Context — npu-bridge
 
-_Last updated: 2026-09-10 (chunk 4 merged; chunk 5 next)_
+_Last updated: 2026-09-10 late (review bugs #5/#6/#8 merged; #7 waits on hardware; chunk 5 next)_
 
 ## Where we are
 Chunks 1 to 4 are merged on `main`. Chunk 4 (streaming) passed its whole-branch review on 2026-09-07
-(D56 to D59, commit `7817044`) and was fast-forward merged the same day. The state documents were not
-updated at that point; a whole-project review on 2026-09-10 caught it and brought `CLAUDE.md`,
-`docs/PLAN.md`, `docs/SESSION-HANDOFF.md` and this folder up to date.
+(D56 to D59, commit `7817044`) and was fast-forward merged the same day. On 2026-09-10 the four defects
+from the code review became issues; three (#5, #6, #8) are fixed test-first, reviewed by a Claude
+subagent and by Codex, and merged (D62 to D64, `main` at `41bbfaf`). The fourth (#7, the Phi Silica
+adapter's text contract, D65) is implemented on `review-fixes` and blocked on hardware verification.
 
-381 tests pass. `scripts/smoke.ps1 -Backend phi-silica` passes every step (1 skipped, 4 informational),
-re-run on 2026-09-10.
+387 tests pass. **`scripts/smoke.ps1 -Backend phi-silica` cannot run**: the Insider flight to build
+29661 (installed the evening of 2026-09-10) left the Phi Silica workload packages unregisterable and
+the model reports `NotReady`. Last full pass: the morning of 2026-09-10 on 29648. See
+`docs/SESSION-HANDOFF.md` "Machine facts" for the diagnosis and what not to retry.
 
 ## What chunk 4 built
 Streaming server-sent events on `POST /v1/chat/completions`, plus everything around it: the mid-stream
@@ -20,11 +23,20 @@ It opened with a refactor that split the handler into a shared preparation phase
 readiness, placement and rendering instead of drifting. One failure mapping (`GenerationFailure`)
 serves both shapes.
 
-## What the 2026-09-10 session added
-- `.github/workflows/build.yml`: build + test on `windows-latest`, Debug configuration. **Its first run
-  has not been observed**; it triggers on the next push.
-- Three low-severity code notes in `docs/FUTURE.md` (2026-09-10 section), none fixed.
+## What the 2026-09-10 sessions added
+- `.github/workflows/build.yml`: build + test on `windows-latest`, Debug configuration. First run
+  observed green (2 m 22 s).
+- Three low-severity code notes in `docs/FUTURE.md` (2026-09-10 section), none fixed; now issue #10.
 - A rule in `CLAUDE.md`'s working method: after a merge, update the state docs in the same session.
+- The review fixes: a release never ends on a high surrogate (D64); "the cut caused this cancellation"
+  is a fact each handler records beside its cancel, not an inference from the cutter (D62); the JSON
+  path's cancel runs on the request task, never on the backend callback thread, and every cancel this
+  code issues is guarded (D63). The fake's throwing-registration option now has cut-path coverage on
+  both shapes, with the guard's own Debug line as the proof that the cancel ran. The test host captures
+  Debug records when a logger provider is attached.
+- On the branch only: the Phi Silica adapter returns the delivered deltas as `Text` on every status,
+  delivers under the append lock, and counts `text_mismatches` and `late_deltas` (after a completed
+  generation only) in `/healthz`; `smoke.ps1` has a text-contract step asserting both stay zero (D65).
 
 ## Two things the hardware settled (2026-09-07, re-confirmed 2026-09-10)
 - **Cancelling really does stop the NPU.** An early cut on the streaming path finished in 772 ms
@@ -53,8 +65,9 @@ serves both shapes.
   chunk 6 can measure.
 
 ## How to resume
-1. Read `CLAUDE.md`, then `docs/DECISIONS.md` (D51 to D59 are chunk 4) and the chunk 3 and chunk 4
-   sections of `docs/FUTURE.md`.
-2. `dotnet build; dotnet test` (381) and `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298`.
-3. Push, and check that the `build` workflow goes green.
-4. Chunk 5, the context cache, starting from the two blockers above.
+1. Read `CLAUDE.md`, then `docs/DECISIONS.md` (D51 to D61 are chunk 4, D62 to D65 the review fixes)
+   and the chunk 3 and chunk 4 sections of `docs/FUTURE.md`.
+2. `dotnet build; dotnet test` (387). Check `Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'`
+   before touching the NPU; if both packages are listed, run
+   `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298`, then merge `review-fixes` and close #7.
+3. Chunk 5, the context cache, starting from the two blockers above (issue #1).

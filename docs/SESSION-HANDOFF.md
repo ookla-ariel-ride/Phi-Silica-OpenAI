@@ -1,16 +1,20 @@
-# Session handoff — 2026-09-10
+# Session handoff — 2026-09-10 (late session)
 
 Supersedes the 2026-09-07 handoff (in git history). Everything below was verified at write time.
 
 ## TL;DR
 
 - **Chunks 1 to 4 are merged on `main`.** Chunk 4 (streaming) passed its whole-branch review on
-  2026-09-07 (D56 to D59, commit `7817044`) and was fast-forward merged. The previous handoff, `CLAUDE.md`,
-  `docs/PLAN.md` and `memory-bank/` were not updated at the time and still said chunk 4 was unmerged;
-  this session fixed that.
-- 381 tests pass. `scripts/smoke.ps1 -Backend phi-silica` passes every step.
-- A build-and-test GitHub Actions workflow now exists (`.github/workflows/build.yml`). It has not had a
-  first run yet: it triggers on the next push.
+  2026-09-07 (D56 to D59, commit `7817044`) and was fast-forward merged.
+- **Bugs #5, #6 and #8 from the 2026-09-10 code review are fixed, reviewed and merged** (D62 to D64,
+  `main` at `41bbfaf`). 387 tests pass. Both reviewers (a Claude subagent and Codex) found the same two
+  real defects in the first cut of the fixes, both fixed before the merge.
+- **#7 (the Phi Silica adapter's text contract, D65) is implemented on `review-fixes`, two commits
+  ahead of `main`, and cannot be verified:** the Windows Insider flight to build 29661, installed the
+  evening of 2026-09-10, left the Phi Silica workload packages unregisterable. The model reports
+  `NotReady`; `smoke.ps1` fails at its first step. Details and what was tried are under "Machine facts".
+- The build-and-test GitHub Actions workflow has now been observed green (first run 2026-09-10 22:25Z,
+  2 m 22 s).
 - **Chunk 5 (context cache + overflow) is next.** Its two blockers are unchanged, below.
 
 ## State at write time
@@ -18,9 +22,10 @@ Supersedes the 2026-09-07 handoff (in git history). Everything below was verifie
 | Check | Result |
 |---|---|
 | `dotnet build` | clean, 0 warnings |
-| `dotnet test` | **381 passed**, 0 failed, 2 s |
-| `smoke.ps1 -Backend phi-silica -Port 5298` | **all steps passed**, 1 skipped (tool probe), 4 informational |
-| `main` | at `7817044` plus this session's uncommitted doc and CI changes |
+| `dotnet test` | **387 passed**, 0 failed, 1 s (stable over 8 consecutive runs) |
+| `smoke.ps1 -Backend phi-silica -Port 5298` | **fails at "healthz becomes ready"**: `NotReady` after the 29661 flight (last full pass: the morning of 2026-09-10 on build 29648) |
+| `main` | at `41bbfaf`, pushed |
+| `review-fixes` | `main` + 2 commits (#7), pushed; merge after the smoke test passes |
 | `chunk-4-streaming` | fully merged into `main`; safe to delete |
 
 Smoke numbers this run: model load 13.6 s; first token 430 to 700 ms; a one-word streamed reply 601 ms
@@ -53,6 +58,25 @@ verdict does not.
    "in-box in the coming months", possibly 2026-11-24. Its native tool calling would bypass chunk 7's
    emulation. See `memory-bank/techContext.md` and the Aion Plan issue.
 
+## What the late session did (after the doc commit `b6c4ade`)
+
+7. Worked the four bug issues test-first on `review-fixes`, one commit each: #6 (a release never ends on
+   a high surrogate, D64), #8 (`cancelledByCut` is a recorded fact on both shapes, D62), #5 (the JSON
+   path's cancel moved off the backend callback thread onto the request task; the stream's in-loop
+   cancel guarded; D63), #7 (the adapter returns the delivered deltas as `Text` on every status, counts
+   `text_mismatches`/`late_deltas` in `/healthz`; a text-contract step in `smoke.ps1`; D65). Every RED
+   was watched: the JSON case of #5 crashed the test host from the timer thread, exactly as reported.
+8. Ran the adversarial review twice (Claude subagent, Codex). Both found the JSON path's flag was set
+   in the callback rather than beside the cancel, and that the counters could publish out of order;
+   Codex added delivery order under the append lock, Claude added that a late callback after a
+   *cancelled* generation is expected and must not count. All fixed; the throwing-registration theory
+   now asserts the guard's own Debug line, so it proves the cancel ran (the test host now captures
+   Debug records when a provider is attached).
+9. Fast-forwarded `main` to everything except #7's two commits, pushed, which closed #5, #6 and #8.
+   Rebased `review-fixes` onto `main` so it holds only #7; commented the state on #7.
+10. Diagnosed why Phi Silica stopped working (see "Machine facts"); the finding is also in the
+    assistant's memory so no future session retries the same remedies.
+
 ## Hardware findings that matter for chunk 5 and 6 (from 2026-09-07, re-confirmed today)
 
 **Cancelling really does stop the NPU.** An early cut on the streaming path ended in 772 ms against
@@ -69,9 +93,11 @@ verdict does not.
 
 ## Do this next
 
-1. Commit and push this session's changes; watch the first run of the `build` workflow. It is the one
-   thing here that has not been observed working. If the x64 runner cannot cross-build the win-arm64
-   exe, split the job: build and test `NpuBridge.Core` + `tests` on any runner, build the exe separately.
+1. Get Phi Silica back. Check `Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'`; until it lists
+   both packages nothing on the NPU can be verified. Either roll the flight back (Settings > System >
+   Recovery > Go back, within 10 days of 2026-09-10) or take a later flight. Then run
+   `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298`, confirm the new text-contract step passes,
+   put the numbers in D65, fast-forward merge `review-fixes`, close #7 from the merge commit.
 2. Chunk 5, the context cache, starting from its two blockers in `docs/FUTURE.md` (chunk 3 section):
    - The prompt template's output is **not** a safe cache key: turn markers are unescaped, native
      placement omits the system text from the rendered prompt, and a lone user message passes through
@@ -83,8 +109,19 @@ verdict does not.
 
 ## Machine facts (do not re-discover)
 
-- This PC is the Copilot+ target: Galaxy Book4 Edge, Snapdragon X Elite, Windows 11 ARM64 build 29648.
-  Git Bash reports `AMD64` under emulation; trust PowerShell.
+- This PC is the Copilot+ target: Galaxy Book4 Edge, Snapdragon X Elite, Windows 11 ARM64, Insider
+  build **29661** since the evening of 2026-09-10 (was 29648). Git Bash reports `AMD64` under emulation;
+  trust PowerShell.
+- **The 29661 flight broke Phi Silica.** `LanguageModel.GetReadyState()` says `NotReady`; `--install-model`
+  fails with "The specified module could not be found". Root cause from the AppXDeploymentServer log:
+  the flight staged `WindowsWorkload.LanguageModel.Qnn.1` 1.2606.730.0, `WindowsWorkload.LanguageModel.Data.Qnn.1`
+  1.2605.851.0 and `WindowsWorkload.Data.PhiSilica.Qnn.1` 1.2606.733.0 at 16:17 (folders exist under
+  `C:\Program Files\WindowsApps`), but registering the two LanguageModel packages fails with
+  `0x80073CF6` / `0x80070005` "failed to register the windows.accessControl.undocked extension: Access
+  is denied" — from the flight's own AppReadiness pass (16:18 and 17:54), from a user-scope
+  `Add-AppxPackage -Register`, and from an elevated one. The data package registered. Other workloads
+  (TextRecognition, QueryBlockList) hit the same error and silently kept their old versions. Not caused
+  by npu-bridge; the identity registration is unaffected. Do not retry these remedies.
 - .NET SDK 10.0.400 arm64. Sparse package registered against the Debug build output, PFN
   `NpuBridge_jtas4mnxdyzpe`, certificate expires 2031-09-01. The exe binds to Windows App Runtime
   2.4.1-experimental; `Microsoft.WindowsAppSDK 2.4.1-experimental` is on nuget.org, so CI can restore it.
@@ -108,7 +145,8 @@ verdict does not.
 
 ```powershell
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\Phi-Silica-OpenAI
-git status; git log --oneline -3                    # expect main at or after 7817044, tree clean
-dotnet build; dotnet test                           # expect 381 passed
-.\scripts\smoke.ps1 -Backend phi-silica -Port 5298   # expect all passed, 1 skipped, 4 informational
+git status; git log --oneline -3                    # expect main at or after 41bbfaf, tree clean
+dotnet build; dotnet test                           # expect 387 passed
+Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'   # both packages listed = Phi Silica is back
+.\scripts\smoke.ps1 -Backend phi-silica -Port 5298   # then: expect all passed, 1 skipped, 4 informational
 ```
