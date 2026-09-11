@@ -685,3 +685,32 @@ yet" now that a real backend triggers it for parameters the runtime cannot apply
 Phi Silica adapter as verified in D62), the five-second drain timeout's theoretical window, and the
 requirement that chunk 7's buffering sink and chunk 8's scheduler keep the delta sink non-blocking.
 Phi Silica smoke re-run after these changes, build 29648: every step passed (1 skipped, 5 informational); text contract 0/0, texts match; streamed one-word reply 411 ms with the first chunk at 267 ms; throughput 35 estimated tok/s; early cut 469 ms against a 2,658 ms control; over-length verdict in-stream after 7.4 s, preflight 13,429 usable. (chunk 6 review)
+
+**D70. The Aion blocker is the OS refusing image-load access to a main package's content, not the
+provider, its ACL, Developer Mode or the driver.** Measured 2026-09-11 on build 29648 after the owner
+turned Developer Mode on (no change: the same `InvalidCache` failure). Probing from a plain Arm64
+PowerShell process: every provider DLL fails `LoadLibrary` in place with error 5, loads as a data
+file or image resource, has a valid Qualcomm or Microsoft signature, and loads as an executable image
+once copied out of `WindowsApps`; so the bytes are fine and the denial is location-bound. The same
+in-place test fails for every *main* package probed (Store-signed Microsoft ones included) and passes
+for every *framework* package, which is Windows's design: a main package's code may only be mapped by
+processes that hold the package in their graph. The provider packages opt in to that
+(`<uap15:DependencyTarget>true</uap15:DependencyTarget>`, and a
+`com.microsoft.windowsmlruntime.executionprovider` package extension naming
+`onnxruntime_providers_qnn.dll`), and the OS calls Windows ML 1.8 makes to use it
+(`TryCreatePackageDependency` for the family with Arm64, then `AddPackageDependency`) both return
+`S_OK` here with the right full name resolved; yet `LoadLibrary` of the provider DLL afterwards still
+fails with error 5, by path and by name. That is the whole failure: on this build the grant that a
+dynamic dependency on a main package is supposed to confer is not applied, so `TryRegister` fails
+inside the SDK and the NPU cache build has no provider. Current docs (learn.microsoft.com, read via
+Context7) say main-package dynamic dependencies exist only in the Windows 11 OS API and need that
+opt-in, which is what is present, and that Windows ML in Windows App SDK 2.1.3+ moved to
+"execution providers delivered as framework packages", which is why nothing else on this machine
+depends on this path: Aion is pinned to Windows App Runtime 1.8, whose catalog uses main-package
+providers. Ruled out: Developer Mode (on, no effect), the driver (irrelevant before a load), the
+package folder's ACL (Users have read-and-execute on every file), Smart App Control (off), AppLocker
+(no policy), Defender blocks (no events), a package staged on the broken 29661 flight (the folders
+date from 2026-08-16 and were registered after the rollback boot at 19:57). Not tried: removing and
+re-acquiring the two provider packages on this build, and a different Windows build. Consequence for
+chunk 6: the adapter is code-verified and review-clean; the hardware half of the definition of done
+cannot be met on this machine until the OS honours main-package dependencies again. (chunk 6)

@@ -37,13 +37,16 @@ land here instead of widening the chunk. Each entry says where it came from and 
   that every DLL in the `MicrosoftCorporationII.WinML.Qualcomm.QNN.EP.1.8` package fails `LoadLibrary`
   with `E_ACCESSDENIED`, even from a process that has the package in its dependency graph and even though
   the files read fine. The Aion framework's own DLLs load from the same `WindowsApps` root without
-  trouble; the difference is the provider package being a sideloaded main package whose folder ACL was
-  written on this Insider build (29648, after the 29661 rollback). Things that were not tried and might
-  clear it: enabling Developer Mode (the sample's `Bootstrap.ps1` turns it on and its validated run had
-  it on; here it is off), a later or earlier Windows build, a newer Qualcomm NPU driver (the sample's
-  issue #6 was fixed by one; this machine's is 30.0.219.1000 from 2025-11). Everything that depends on
-  a generation stays unmeasured: load time, TTFT, tok/s, system-prompt adherence under folded placement,
-  whether cancel stops the device, and the over-length verdict.
+  trouble. **Root cause pinned later the same day (D70):** the provider is a main package that opts
+  in as a dynamic-dependency target, the OS accepts the dependency (`TryCreatePackageDependency` and
+  `AddPackageDependency` both succeed from a plain process), and the build still refuses to map the
+  package's DLLs as images (error 5) from that process. Developer Mode was turned on and changed
+  nothing; the ACL, signatures, Smart App Control, AppLocker, Defender and the driver are ruled out.
+  Left to try: remove and re-acquire the two provider packages on this build (the retargeted
+  `AcquireQnnEp` tool is in the session scratchpad and would need rebuilding), or a different Windows
+  build. Everything that depends on a generation stays unmeasured: load time, TTFT, tok/s,
+  system-prompt adherence under folded placement, whether cancel stops the device, and the over-length
+  verdict.
 - **`BackendCapabilities.Cancellation` is not advertised on Aion** until the cut measurement earns it.
   The pipeline reads the flag nowhere yet (chunk 4 deferral above), so this changes no behaviour; the
   point is that the adapter claims nothing the smoke test has not shown.
