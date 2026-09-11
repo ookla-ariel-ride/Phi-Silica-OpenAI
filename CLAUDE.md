@@ -18,7 +18,7 @@ merged: skeleton, the Phi Silica adapter, non-streaming `POST /v1/chat/completio
 template, and streaming over server-sent events with the client-side cut for `max_tokens`/`stop`.
 Chunk 5 (context cache + overflow) is next; its blockers are under "Traps for the next chunks" below.
 Code lands in the chunk order listed there. `docs/DECISIONS.md` records why things are the way they
-are (D1 to D59 so far); `docs/FUTURE.md` holds deferred work. Update both whenever a chunk changes a
+are (D1 to D65 so far); `docs/FUTURE.md` holds deferred work. Update both whenever a chunk changes a
 choice or defers something.
 
 ## Machine reality

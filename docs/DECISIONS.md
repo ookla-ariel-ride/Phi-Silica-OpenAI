@@ -515,3 +515,64 @@ _across_deltas` asserted `DoesNotContain("EN")` over the whole wire body, but th
 on every frame and is Crockford base32 — an alphabet containing both E and N. Measured over 200,000
 generated ids, 1.54% contain `EN`. The ids are stripped before the assertion now; the claim is about the
 text the bridge wrote, not the identifier it drew.
+
+## 2026-09-10 — Review fixes (issues #5 to #8)
+
+The 2026-09-10 code review of the merged tree filed four defects as GitHub issues rather than widening
+chunk 4. Fixed on `review-fixes`, one commit per issue, each test-first: the failing test was watched
+to fail for the reported reason before the fix (the JSON case of #5 fails by crashing the test host,
+which is the reported symptom exactly). Chunk 5 builds on this code, so these landed before it.
+
+**D62. "The cut caused this cancellation" is a fact the handler records, never an inference from the
+cutter.** Both shapes reinterpret a `Cancelled` status as a successful cut (D56), but they decided "did
+the cut fire" from different inputs: the JSON path from the whole-text cut, which includes a cap
+committed by `Flush()`, the stream from `IsCut` before its flush. A backend reporting `Cancelled` on
+its own, with a reply ending inside the lookahead window, was HTTP 200 `finish_reason: "length"` on
+one shape and a 502 on the other — the drift `GenerationFailure` exists to prevent. Each handler now
+sets a flag beside the call that cancels, and `selfCancelled` is `flag && status is Cancelled` on both.
+Reachable today only with a backend that reports `Cancelled` unprompted, which `PhiSilicaBackend`
+never does; chunk 6's adapter has not been written yet, and this is the rule it inherits. (#8)
+
+**D63. The backend's callback thread never cancels anything.** The JSON cut called `CancelAfter(0)`
+from the delta callback. Zero delay was chosen so the cancel would not re-enter the adapter inline,
+but it moved the cancel onto a timer thread, and a registration that throws there — CsWinRT's
+`IAsyncInfo.Cancel()` on the live WinRT operation is one — is rethrown by `TimerQueueTimer.Fire` with
+nothing above it: the process terminates. Reproduced in the suite (the test host crashed with the
+registration's exception on the timer thread). The callback now completes a `TaskCompletionSource`
+(with `RunContinuationsAsynchronously`, so the continuation stays off the callback thread too), the
+request task races it against the generation, and cancels on its own thread inside a `try`, as the
+streaming path's finally already did. The stream's in-loop cancel at the cut had the same hole with a
+milder symptom — the fault took the unfiltered catch and the client got its capped content followed
+by an error event instead of `finish_reason: "length"` — and now goes through the same guard. This also
+closes the chunk 4 deferral about the callback touching a disposed `CancellationTokenSource`: it no
+longer touches one. (#5)
+
+**D64. A release never ends on a high surrogate.** D58 stepped a slice index back when it fell between
+the halves of a pair, but only when the index was strictly inside the text. With no stop strings the
+holdback is zero and the release is everything pending, so a delta ending on a high surrogate — a
+runtime that split the pair across two callbacks — went out whole, and `System.Text.Json` wrote the
+half as U+FFFD; the low half followed as a second U+FFFD. Any unrelated stop string hid it, because the
+holdback then happened to catch it, so the output depended on a setting with nothing to do with it.
+The release now holds the high half back regardless of holdback; the next delta or the flush releases
+it, so a genuinely lone surrogate is delayed by one delta and never lost. Reachable only if the
+runtime ever splits a decoded UTF-16 pair across callbacks, which is not established either way on
+Phi Silica; the cutter should not depend on it. (#6)
+
+**D65. The Phi Silica adapter returns the delivered deltas as the text, on every status; the runtime's
+own text is a cross-check.** Chunk 4 made "`GenerationResult.Text` is the concatenation of the deltas
+delivered" load-bearing (the JSON path cuts the returned text, the stream cuts the delta stream, and
+they agree only because those are the same characters), but `PhiSilicaBackend` returned the runtime's
+`result.Text` on `Complete` and fell back to the accumulated deltas only when that was empty, and it
+silently dropped a `Progress` callback that arrived after its completion barrier. `FakeBackend` honours
+the contract by construction, so the suite cannot see either. Of the two fixes the issue offered —
+honour the contract in the adapter, or relax it and cut the JSON path over the deltas too — the first
+is taken: one adapter-local rule beats a pipeline-wide change of what `Text` means, and chunk 6's
+adapter inherits the same rule. A mismatch between the runtime's text and the deltas, and a callback
+after the barrier, are each a Warning and a counter in `/healthz` (`text_mismatches`, `late_deltas`).
+`scripts/smoke.ps1` gained a text-contract step that sends one prompt on both shapes and asserts both
+counters read zero, reporting (not asserting) whether the wire texts matched. **Not yet run on
+hardware:** the Windows Insider flight to build 29661, installed the evening of 2026-09-10, left the
+three Phi Silica workload packages unregisterable (`0x80073CF6`, access denied registering the
+`windows.accessControl.undocked` extension, elevated or not), so the model reports `NotReady` and the
+smoke test cannot reach a generation. The adapter change is build-verified only until the flight is
+fixed or rolled back; that is why #7 stays open on the branch while #5, #6 and #8 merged. (#7)
