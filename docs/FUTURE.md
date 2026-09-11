@@ -270,7 +270,7 @@ Found by a read of the merged tree after chunk 4, none load-bearing, none fixed 
   endpoint shipped in chunks 1 and 2, so it deserves its own decision and its own review rather than
   being absorbed into a chunk that happened to notice it. Chunk 7 still cannot ship the tool-call
   response shape without settling it first.
-- **Error messages escape apostrophes as `0027`.** Same shared serializer options, same reasoning.
+- **Error messages escape apostrophes as `'`.** Same shared serializer options, same reasoning.
   Raised by the implementer rather than a reviewer, which is the right instinct. Fix it alongside the
   entry above.
 - **Overflow detection must not wait for a generation to fail (resolved in chunk 5, D73: the session
