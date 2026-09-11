@@ -42,7 +42,15 @@ serves both shapes.
 - Chunk 4's own deferrals are in the same file: the drain is unbounded and silent, keep-alive covers
   only the wait for the first token, and content filtering necessarily differs between the two shapes.
 - The merged `chunk-4-streaming` branch still exists locally and on origin; delete when convenient.
-- No owner decisions are open.
+- **GitHub issues are the work tracker** as of 2026-09-10: one per remaining chunk (5 to 8), four
+  defects from the code review, two cleanup items, and one for Aion 1.0 Plan. Read the issue before
+  starting; close it from the merge commit.
+- **Aion 1.0 Plan** (14B, 32K, native tool calling) is a different model from Aion Instruct and has no
+  SDK yet; watch for it around late November 2026. Aion Instruct's preview SDK is installable now and
+  is chunk 6's first step; the sample repo was updated 2026-09-10.
+- Owner decision open: whether to do chunk 6 (Aion Instruct adapter) before chunk 5 (context cache).
+  Chunk 5's truncation loop needs to know how a backend without preflight reports overflow, which only
+  chunk 6 can measure.
 
 ## How to resume
 1. Read `CLAUDE.md`, then `docs/DECISIONS.md` (D51 to D59 are chunk 4) and the chunk 3 and chunk 4

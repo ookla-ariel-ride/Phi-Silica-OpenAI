@@ -9,7 +9,9 @@ language model as an OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/mo
 `/v1/completions` arrives in chunk 8) so agent tools (OpenCode, Hermes) can use the NPU model as a provider.
 Two real backends behind one interface: **Phi Silica** (`Microsoft.Windows.AI.Text`, Windows App SDK)
 and **Aion Instruct Preview** (`AionInstructPreview.Text`, Microsoft's announced replacement), plus a
-**fake** backend for tests.
+**fake** backend for tests. Aion 1.0 **Plan** is a different model (14B, 32K context, native tool
+calling) with no SDK as of 2026-09-10; it is tracked as a GitHub issue, and a backend for it would
+bypass the tool-call emulation rather than use it.
 
 Status: `docs/PLAN.md` is the signed-off design (read it first). Chunks 1 to 4 of 8 are built and
 merged: skeleton, the Phi Silica adapter, non-streaming `POST /v1/chat/completions` with the prompt
@@ -225,3 +227,10 @@ Do not widen a chunk to absorb review findings.
 After the merge, in the same session: update the status paragraph at the top of this file, the chunk
 table in `docs/PLAN.md`, `docs/SESSION-HANDOFF.md` and `memory-bank/`. A merge without this leaves the
 next session working from the wrong state.
+
+Work is tracked in GitHub issues (`gh issue list`). Each remaining chunk has an issue labelled `chunk`
+carrying its scope, the decisions that constrain it, its known blockers and its definition of done;
+defects and cleanups from reviews are issues labelled `bug` or `tech-debt`. Read the issue before
+starting the work, put context a later session will need into the issue rather than only into chat,
+and close it from the merge commit (`closes #N`). `docs/FUTURE.md` stays the long-form record of why
+something was deferred; the issue is the work item.

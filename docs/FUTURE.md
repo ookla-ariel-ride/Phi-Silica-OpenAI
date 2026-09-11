@@ -21,6 +21,11 @@ land here instead of widening the chunk. Each entry says where it came from and 
 - **Content-filter option pass-through** (`ContentFilterOptions` on Phi Silica).
 - **LoRA adapters** (`LanguageModelOptions.LowRankAdapter`).
 - **Multiple model ids per process** (e.g. serve both backends at once, one model each).
+- **Aion 1.0 Plan backend.** Announced at Build 2026 (2026-06-02): 14B parameters, 32K context, native
+  tool calling and reasoning, "in-box on capable devices in the coming months" (a secondary source says
+  2026-11-24). No SDK or preview package exists as of 2026-09-10; the sample repo's release is Aion
+  Instruct only. When it lands it needs a `ToolCalling` capability that bypasses chunk 7's emulation and
+  a per-backend context-window hint. Tracked as a GitHub issue.
 
 ## Chunk 4 review deferrals
 

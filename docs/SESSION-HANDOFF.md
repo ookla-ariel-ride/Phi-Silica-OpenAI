@@ -42,6 +42,16 @@ verdict does not.
 4. Filed three low-severity notes in `docs/FUTURE.md` (2026-09-10 section): a non-client cancellation
    escapes the JSON path as a bare 500; the SSE "started" flag flips before the first write succeeds;
    `identity.ps1` removes the old registration before the new one is added.
+5. Ran a code review that found four defects (crash on the JSON cut path with a throwing cancellation
+   registration; lone high surrogate released at a delta end; the Phi Silica adapter not guaranteeing
+   `Text` equals the deltas; `Cancelled` attributed to the cut differently per shape). All are GitHub
+   issues now, as are the four remaining chunks and two cleanup items. **GitHub issues are the work
+   tracker from here**; read the issue before starting a chunk.
+6. Researched the Aion family. **Aion 1.0 Instruct** (Phi Silica's successor) has an installable
+   preview SDK now, ARM64 only, from the sample repo's release; neither asset is on this machine yet.
+   **Aion 1.0 Plan** is a different model (14B, 32K, native tool calling) with no SDK anywhere yet,
+   "in-box in the coming months", possibly 2026-11-24. Its native tool calling would bypass chunk 7's
+   emulation. See `memory-bank/techContext.md` and the Aion Plan issue.
 
 ## Hardware findings that matter for chunk 5 and 6 (from 2026-09-07, re-confirmed today)
 
@@ -78,7 +88,9 @@ verdict does not.
 - .NET SDK 10.0.400 arm64. Sparse package registered against the Debug build output, PFN
   `NpuBridge_jtas4mnxdyzpe`, certificate expires 2031-09-01. The exe binds to Windows App Runtime
   2.4.1-experimental; `Microsoft.WindowsAppSDK 2.4.1-experimental` is on nuget.org, so CI can restore it.
-- The Aion framework MSIX is still not installed; that is chunk 6.
+- The Aion Instruct framework MSIX and SDK NuGet are still not installed; both come from the sample
+  repo's v1.0.0.0 release and are chunk 6's first step. The sample repo was updated 2026-09-10, so
+  re-read its README first. Aion Plan has nothing to install.
 - gitleaks pre-commit hook active (`git config core.hooksPath .githooks`).
 - `smoke.ps1` writes with `Write-Host`; redirecting its stdout to a file captures nothing. Read the
   console, or pass `6>&1` if a transcript is needed.

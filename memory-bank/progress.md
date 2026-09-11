@@ -25,7 +25,8 @@
 - `/v1/completions` — chunk 8
 - Context cache, `--truncate-history` — chunk 5 (prompt-overflow → HTTP 400 `context_length_exceeded`
   already works, via each backend's preflight capability, not the cache)
-- Aion adapter — chunk 6
+- Aion Instruct adapter — chunk 6 (preview SDK available; not yet installed on the machine)
+- Aion Plan backend — unscheduled; the model has no SDK yet (GitHub issue tracks it)
 - Tool-call emulation — chunk 7
 - Scheduler / 429 queue, client docs — chunk 8
 

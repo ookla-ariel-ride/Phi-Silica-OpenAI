@@ -15,7 +15,10 @@ OpenAI's error format rather than hiding it.
 |---|---|---|
 | `phi-silica` | `Microsoft.Windows.AI.Text` (Windows App SDK) | works |
 | `fake` | in-process, deterministic | for tests and dry runs |
-| `aion` | `AionInstructPreview.Text` (Microsoft's replacement, from November 2026) | not implemented — the bridge starts, but the backend never reports ready |
+| `aion` | `AionInstructPreview.Text` (Aion 1.0 Instruct, Microsoft's Phi Silica replacement; preview SDK available now, in-box this fall) | not implemented — the bridge starts, but the backend never reports ready |
+
+Aion 1.0 Plan, the 14B reasoning model with a 32K window and native tool calling announced at Build
+2026, is a separate model with no SDK yet. It is tracked as an issue, not a backend.
 
 ## Requirements
 
@@ -82,8 +85,8 @@ print(reply.choices[0].message.content)
 There is no authentication. The client library insists on a key, so pass anything. Add `stream=True`
 and it streams over server-sent events like any other OpenAI provider.
 
-`scripts/smoke.ps1 -Backend phi-silica` checks the whole surface against the hardware in about a
-minute. Re-run `identity.ps1 -Install` whenever the build output folder or the manifest changes.
+`scripts/smoke.ps1 -Backend phi-silica` checks the whole surface against the hardware in two to three
+minutes. Re-run `identity.ps1 -Install` whenever the build output folder or the manifest changes.
 
 ## Endpoints
 
@@ -130,6 +133,8 @@ no behaviour.
 
 Secrets belong in `appsettings.local.json`, which is gitignored. A gitleaks pre-commit hook and a
 GitHub Actions workflow scan for them; enable the hook with `git config core.hooksPath .githooks`.
+A second workflow builds the solution and runs the test suite on every push; the tests use the fake
+backend, so they need no NPU.
 
 ## Things that will surprise you
 
@@ -145,7 +150,7 @@ Phi Silica uses a logon task (`NpuBridge.exe task install`, elevated); aion and 
 
 **An over-length prompt does not come back as one.** The bridge maps a backend's prompt-too-long
 verdict to a 400 with code `context_length_exceeded`, but Phi Silica never reports one: it fails
-generically after about 26 seconds, so you get a 502, or an error frame mid-stream once headers are
+generically after ten to thirty seconds, so you get a 502, or an error frame mid-stream once headers are
 already committed. See `docs/DECISIONS.md` D55.
 
 **Token counts are estimates**, characters over four on both sides, not a tokenizer's output. Progress

@@ -57,3 +57,19 @@ NpuBridge.exe --backend fake --listen http://127.0.0.1:5299 --verbose
 NpuBridge.exe task install|status|uninstall        # elevated for install/uninstall
 NpuBridge.exe service install|start|stop|uninstall # elevated; aion/fake only
 ```
+
+## Aion model family (researched 2026-09-10)
+- **Aion 1.0 Instruct**: the Phi Silica successor, announced at Build 2026 on 2026-06-02. Preview SDK
+  available now from the sample repo's release v1.0.0.0 (framework MSIX + `AionInstructPreview.Text.Framework.1.0.0.nupkg`,
+  ARM64 only, QNN NPU, no CPU fallback; first load compiles the model for 3 to 5 minutes). Also in Edge
+  Insider; open weights on Hugging Face were promised for July 2026. Microsoft replaces Phi Silica with
+  it in Windows "this fall". The sample repo was updated 2026-09-10; re-read its README before installing.
+- **Aion 1.0 Plan**: a different model, not a newer Instruct. 14B parameters, 32K context, native tool
+  calling and reasoning, for agentic workloads. "In-box on capable devices in the coming months"; one
+  secondary source cites 2026-11-24. **No SDK, no preview package, not on Hugging Face, not in the
+  Foundry Local catalog** as of 2026-09-10. API unpublished; probably the Windows AI Foundry APIs
+  rather than the Instruct framework. Needs a 40+ TOPS NPU (this machine qualifies); Windows AI APIs
+  now also target GPUs and CPUs.
+- Consequence for the plan: a backend with native tool calling should bypass chunk 7's emulation via a
+  `ToolCalling` capability, and `--context-window-hint` becomes per-backend. Tracked in the Aion Plan
+  GitHub issue.
