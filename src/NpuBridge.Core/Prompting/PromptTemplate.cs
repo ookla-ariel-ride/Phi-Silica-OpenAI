@@ -1,4 +1,6 @@
+using System.Buffers;
 using System.Text;
+using System.Text.Json;
 using NpuBridge.Api;
 
 namespace NpuBridge.Prompting;
@@ -192,7 +194,91 @@ public static class PromptTemplate
         return marker + "\n" + RenderTurnBody(message);
     }
 
-    private static string RenderTurnBody(ChatMessage message) => GetText(message.Content).TrimEnd();
+    /// <summary>
+    /// One turn's text. An assistant message that made tool calls renders its content, if any, and
+    /// then the calls as the same JSON envelope the injected instruction asks the model to produce —
+    /// so the model sees its own protocol in the transcript rather than an empty turn where its call
+    /// used to be, which is what it saw before chunk 7 and which taught it nothing.
+    ///
+    /// This is also the body <see cref="TurnText"/> returns, and therefore what
+    /// <see cref="ConversationKey"/> hashes. That is deliberate and it is the trap CLAUDE.md names:
+    /// anything a turn gains has to enter the key through here, or a cached context gets handed to a
+    /// conversation the model never saw. It is the reason the rendering below is byte-deterministic
+    /// and the reason it matches what this bridge's own replies serialise to — a client that sends our
+    /// <c>tool_calls</c> array back still hits the cache.
+    /// </summary>
+    private static string RenderTurnBody(ChatMessage message)
+    {
+        var text = GetText(message.Content).TrimEnd();
+        if (message.ToolCalls is not { Count: > 0 } calls)
+        {
+            return text;
+        }
+
+        var rendered = RenderToolCalls(calls);
+        return text.Length == 0 ? rendered : text + "\n" + rendered;
+    }
+
+    /// <summary>
+    /// The tool calls of one assistant turn, in the wire envelope <c>ToolSchemaRenderer</c> instructs
+    /// the model to use and <c>ToolCallParser</c> reads back. Compact and in the order the client sent
+    /// them: this text is hashed, so indentation or reordering would silently miss the cache.
+    ///
+    /// The call <c>id</c> is deliberately not rendered. The instruction's envelope has no id — the
+    /// model never produced one, the bridge assigns it — and the tool *result* turn carries it in its
+    /// marker, which is where the model needs it to match a result to a call. Including it here would
+    /// also put a per-request ulid into the cache key, so no conversation could ever hit.
+    /// </summary>
+    private static string RenderToolCalls(IReadOnlyList<ChatToolCall> calls)
+    {
+        var buffer = new ArrayBufferWriter<byte>();
+        using var writer = new Utf8JsonWriter(buffer);
+
+        writer.WriteStartObject();
+        writer.WriteStartArray("tool_calls");
+        foreach (var call in calls)
+        {
+            writer.WriteStartObject();
+            writer.WriteString("name", call.Function?.Name ?? string.Empty);
+            writer.WritePropertyName("arguments");
+            WriteArguments(writer, call.Function?.Arguments);
+            writer.WriteEndObject();
+        }
+
+        writer.WriteEndArray();
+        writer.WriteEndObject();
+        writer.Flush();
+
+        return Encoding.UTF8.GetString(buffer.WrittenSpan);
+    }
+
+    /// <summary>
+    /// <c>arguments</c> as the model is asked to write it: an object. The client sends it as JSON
+    /// text, so it is parsed and re-emitted, which also normalises whitespace out of the hashed text.
+    /// Absent or empty becomes <c>{}</c> rather than null, because the instruction's envelope always
+    /// has the key. Text that is not valid JSON is written as the JSON string it is: the model wrote
+    /// something the bridge could not read, and showing it back verbatim is more use to it than
+    /// dropping the turn's only content, while keeping the rendering parseable.
+    /// </summary>
+    private static void WriteArguments(Utf8JsonWriter writer, string? arguments)
+    {
+        if (string.IsNullOrWhiteSpace(arguments))
+        {
+            writer.WriteStartObject();
+            writer.WriteEndObject();
+            return;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(arguments);
+            document.RootElement.WriteTo(writer);
+        }
+        catch (JsonException)
+        {
+            writer.WriteStringValue(arguments);
+        }
+    }
 
     /// <summary>
     /// <c>[Tool result: name (id)]</c> when both are present. When one is missing, drop just that
