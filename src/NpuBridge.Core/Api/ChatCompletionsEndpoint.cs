@@ -179,16 +179,19 @@ internal sealed class ChatCompletionsEndpoint
                             return;
                         }
 
+                        // StopRequested, not IsCut: with a token budget the watcher may know the budget
+                        // is passed before it can place the cut exactly (D80); either way the model stops
+                        // and the authoritative cut below runs over the text the backend returns.
                         bool cut;
                         lock (watcher)
                         {
-                            if (watcher.IsCut)
+                            if (watcher.StopRequested)
                             {
                                 return;
                             }
 
                             watcher.Accept(delta);
-                            cut = watcher.IsCut;
+                            cut = watcher.StopRequested;
                         }
 
                         if (cut)
@@ -312,7 +315,9 @@ internal sealed class ChatCompletionsEndpoint
             // tail sent on a cache hit: a client budgeting its context wants the former, and the number
             // must not change with a cache hit.
             var promptTokens = lease.TranscriptTokens;
-            var completionTokens = backend.TokenCounter.Count(content);
+            // The tokens the model produced to reach the cut, in the tokenization of its own text: a
+            // stop-truncated prefix can count more on its own than the model spent on it (D80).
+            var completionTokens = backend.TokenCounter.TokensCovering(result.Text, content.Length);
 
             var body = new ChatCompletionResponse(
                 Id: requestId,

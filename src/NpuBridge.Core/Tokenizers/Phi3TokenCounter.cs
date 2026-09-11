@@ -37,20 +37,67 @@ public sealed class Phi3TokenCounter : ITokenCounter
         return text.Length == 0 ? 0 : _tokenizer.CountTokens(text);
     }
 
-    public int IndexAtTokenCount(string text, int tokens)
+    public int IndexAtTokenCount(string text, int tokens) => IndexAtTokenCount(text, tokens, out _);
+
+    public int IndexAtTokenCount(string text, int tokens, out int totalTokens)
     {
         ArgumentNullException.ThrowIfNull(text);
-        if (tokens <= 0 || text.Length == 0)
+        if (text.Length == 0)
+        {
+            totalTokens = 0;
+            return 0;
+        }
+
+        // One encoding gives both answers. Offsets refer to the normalized text, which the Llama
+        // normalizer lengthens by its dummy prefix (one leading word-boundary marker) and otherwise
+        // maps one char to one char, so the length difference is the shift back to the caller's string.
+        var encoded = _tokenizer.EncodeToTokens(text, out var normalized);
+        totalTokens = encoded.Count;
+        if (tokens <= 0)
         {
             return 0;
         }
 
-        // The index refers to the normalized text, which the Llama normalizer lengthens by its dummy
-        // prefix (one leading word-boundary marker) and otherwise maps one char to one char, so the
-        // length difference is the shift back to the caller's string.
-        var index = _tokenizer.GetIndexByTokenCount(text, tokens, out var normalized, out _);
+        if (tokens >= totalTokens)
+        {
+            return text.Length;
+        }
+
+        // Where the budget's last token ends, unless the next token starts before that: the byte-fallback
+        // tokens of one character all carry that character's offsets, so a budget that ends inside a
+        // character must stop before it, or the cut would hand over a character the budget did not pay
+        // for. A prefix cut here is covered by at most `tokens` tokens (TokensCovering).
         var shift = (normalized?.Length ?? text.Length) - text.Length;
-        index = Math.Clamp(index - shift, 0, text.Length);
-        return SurrogatePairs.StepBackIfSplitting(text, index);
+        var end = Math.Min(encoded[tokens - 1].Offset.End.Value, encoded[tokens].Offset.Start.Value);
+        return Math.Clamp(end - shift, 0, text.Length);
+    }
+
+    public int TokensCovering(string text, int prefixChars)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        if (text.Length == 0 || prefixChars <= 0)
+        {
+            return 0;
+        }
+
+        if (prefixChars >= text.Length)
+        {
+            return Count(text);
+        }
+
+        var encoded = _tokenizer.EncodeToTokens(text, out var normalized);
+        var shift = (normalized?.Length ?? text.Length) - text.Length;
+        var covering = 0;
+        foreach (var token in encoded)
+        {
+            if (token.Offset.Start.Value - shift >= prefixChars)
+            {
+                break;
+            }
+
+            covering++;
+        }
+
+        return covering;
     }
 }

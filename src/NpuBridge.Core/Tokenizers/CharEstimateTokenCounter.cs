@@ -25,25 +25,26 @@ public sealed class CharEstimateTokenCounter : ITokenCounter
         return (text.Length + CharsPerToken - 1) / CharsPerToken;
     }
 
-    public int IndexAtTokenCount(string text, int tokens)
+    public int IndexAtTokenCount(string text, int tokens) => IndexAtTokenCount(text, tokens, out _);
+
+    public int IndexAtTokenCount(string text, int tokens, out int totalTokens)
     {
         ArgumentNullException.ThrowIfNull(text);
+        totalTokens = Count(text);
         if (tokens <= 0)
         {
             return 0;
         }
 
         // tokens * 4 overflows int past ~536 million; an absurd budget is the whole text.
-        var index = (int)Math.Min((long)tokens * CharsPerToken, text.Length);
-        return SurrogatePairs.StepBackIfSplitting(text, index);
+        return (int)Math.Min((long)tokens * CharsPerToken, text.Length);
     }
-}
 
-/// <summary>Shared by every counter: a cut index never falls between the halves of a surrogate pair (D58).</summary>
-internal static class SurrogatePairs
-{
-    public static int StepBackIfSplitting(string text, int index) =>
-        index > 0 && index < text.Length && char.IsLowSurrogate(text[index]) && char.IsHighSurrogate(text[index - 1])
-            ? index - 1
-            : index;
+    /// <summary>On a four-character grid the tokens covering a prefix are its own estimate: <c>ceil(chars/4)</c>, as D44 always reported.</summary>
+    public int TokensCovering(string text, int prefixChars)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        var chars = Math.Clamp(prefixChars, 0, text.Length);
+        return (chars + CharsPerToken - 1) / CharsPerToken;
+    }
 }

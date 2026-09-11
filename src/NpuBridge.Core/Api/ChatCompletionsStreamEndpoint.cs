@@ -174,13 +174,21 @@ internal sealed class ChatCompletionsStreamEndpoint
                                 new ChatCompletionDelta(null, release), finishReason: null), aborted).ConfigureAwait(false);
                         }
 
-                        if (cutter.IsCut)
+                        if (cutter.StopRequested && !cancelledByCut)
                         {
-                            // Stop consuming and stop the model. Whatever is still queued is discarded; the
-                            // finally's cancel-drain-settle then runs unchanged, so the context is still
-                            // disposed exactly once and only after the generation task has ended.
+                            // Stop the model. On a settled cut nothing more will be emitted; on a token
+                            // budget the cutter may know the budget is passed before it can place the cut
+                            // (D80), and then the deltas already in flight keep coming through it so the
+                            // flush below decides over everything the model produced.
                             cancelledByCut = true;
                             await CancelGuardedAsync(generationCts, logger, requestId, "at the cut").ConfigureAwait(false);
+                        }
+
+                        if (cutter.IsCut)
+                        {
+                            // Stop consuming. Whatever is still queued is discarded; the finally's
+                            // cancel-drain-settle then runs unchanged, so the context is still disposed
+                            // exactly once and only after the generation task has ended.
                             break;
                         }
                     }
@@ -315,7 +323,9 @@ internal sealed class ChatCompletionsStreamEndpoint
             // exactly what reached the client. The prompt side is the whole transcript the model holds,
             // not the tail sent on a cache hit, as on the JSON path.
             var promptTokens = lease.TranscriptTokens;
-            var completionTokens = prepared.Backend.TokenCounter.Count(cutter.EmittedText);
+            // The tokens the model produced to reach what was sent, in the tokenization of everything the
+            // cutter saw (D80): a prefix counted on its own can tokenize differently.
+            var completionTokens = prepared.Backend.TokenCounter.TokensCovering(cutter.AllText, cutter.ContentLength);
 
             if (includeUsage)
             {

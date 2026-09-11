@@ -35,10 +35,29 @@ public class TokenCounterTests
         Assert.Equal(expected, CharEstimateTokenCounter.Instance.IndexAtTokenCount(text, tokens));
 
     [Fact]
-    public void Char_estimate_index_never_splits_a_surrogate_pair()
+    public void Char_estimate_index_is_the_raw_budget_even_inside_a_surrogate_pair()
     {
-        // Four chars per token lands between the halves of the emoji at index 4; step back to 3.
-        Assert.Equal(3, CharEstimateTokenCounter.Instance.IndexAtTokenCount("abc\U0001F600z", 1));
+        // Four chars per token lands between the halves of the emoji at index 4. The counter reports
+        // the raw boundary; the cutter steps back before slicing (D58) and compares positions raw, so
+        // stop-string precedence is what it was under cap * 4 characters.
+        Assert.Equal(4, CharEstimateTokenCounter.Instance.IndexAtTokenCount("abc\U0001F600z", 1));
+    }
+
+    [Theory]
+    [InlineData("abcdefghij", 0, 0)]
+    [InlineData("abcdefghij", 1, 1)]
+    [InlineData("abcdefghij", 4, 1)]
+    [InlineData("abcdefghij", 5, 2)]
+    [InlineData("abcdefghij", 10, 3)]
+    [InlineData("abcdefghij", 50, 3)]
+    public void Char_estimate_tokens_covering_a_prefix_are_its_own_estimate(string text, int chars, int expected) =>
+        Assert.Equal(expected, CharEstimateTokenCounter.Instance.TokensCovering(text, chars));
+
+    [Fact]
+    public void Char_estimate_index_reports_the_total_too()
+    {
+        Assert.Equal(8, CharEstimateTokenCounter.Instance.IndexAtTokenCount("abcdefghij", 2, out var total));
+        Assert.Equal(3, total);
     }
 
     [Fact]
@@ -106,15 +125,65 @@ public class TokenCounterTests
         Assert.Equal(expected, Phi3TokenCounter.Instance.IndexAtTokenCount(text, tokens));
 
     [Fact]
-    public void Phi3_index_never_splits_a_surrogate_pair()
+    public void Phi3_index_reports_the_total_too()
     {
-        // The emoji is several byte-fallback tokens; a cut inside them must fall before the pair.
-        var text = "Hi \U0001F600 there";
-        for (var tokens = 1; tokens < Phi3TokenCounter.Instance.Count(text); tokens++)
-        {
-            var index = Phi3TokenCounter.Instance.IndexAtTokenCount(text, tokens);
-            Assert.False(index > 0 && index < text.Length && char.IsLowSurrogate(text[index]), $"split at {index} for {tokens} tokens");
-        }
+        Assert.Equal(5, Phi3TokenCounter.Instance.IndexAtTokenCount("Hello world, how are you today?", 1, out var total));
+        Assert.Equal(8, total);
+    }
+
+    /// <summary>
+    /// The tokens the model produced to reach a point in its own text, not the count of the prefix on
+    /// its own: "international" is one token, while "internation" alone is "intern" + "ation".
+    /// </summary>
+    [Theory]
+    [InlineData("international", 13, 1)]
+    [InlineData("international", 11, 1)]
+    [InlineData("international", 1, 1)]
+    [InlineData("international", 0, 0)]
+    [InlineData("Hello world, how are you today?", 12, 3)] // Hello | world | ,
+    [InlineData("Hello world, how are you today?", 11, 2)] // ends exactly after "world"
+    [InlineData("Hello world, how are you today?", 6, 2)]  // one char into " world"
+    [InlineData("Hello world, how are you today?", 31, 8)]
+    [InlineData("Hello world, how are you today?", 99, 8)]
+    public void Phi3_tokens_covering_a_prefix_count_the_generated_tokens_it_ends_inside(string text, int chars, int expected) =>
+        Assert.Equal(expected, Phi3TokenCounter.Instance.TokensCovering(text, chars));
+
+    /// <summary>
+    /// A CJK character outside the vocabulary is three byte-fallback tokens sharing its offsets. A budget
+    /// that ends inside them stops before the character, and the prefix cut there is covered by no more
+    /// tokens than the budget.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    [InlineData(5)]
+    [InlineData(7)]
+    [InlineData(10)]
+    public void Phi3_index_inside_a_byte_fallback_character_stops_before_it(int tokens)
+    {
+        var text = string.Concat(Enumerable.Repeat("机器学习是人工智能的一个分支。", 3));
+        var index = Phi3TokenCounter.Instance.IndexAtTokenCount(text, tokens);
+        Assert.InRange(Phi3TokenCounter.Instance.TokensCovering(text, index), 0, tokens);
+    }
+
+    [Fact]
+    public void Phi3_counts_the_stop_truncated_prefix_differently_on_its_own()
+    {
+        // The reason TokensCovering exists.
+        Assert.Equal(1, Phi3TokenCounter.Instance.Count("international"));
+        Assert.Equal(2, Phi3TokenCounter.Instance.Count("internation"));
+    }
+
+    /// <summary>
+    /// The D80 review's counterexample to any fixed lookback: twenty hyphens tokenize as "----" first,
+    /// twenty-one as "-" first. Only a whitespace boundary settles a SentencePiece piece.
+    /// </summary>
+    [Fact]
+    public void Phi3_can_retokenize_a_run_from_its_start_when_one_character_is_appended()
+    {
+        Assert.Equal(4, Phi3TokenCounter.Instance.IndexAtTokenCount(new string('-', 20), 1));
+        Assert.Equal(1, Phi3TokenCounter.Instance.IndexAtTokenCount(new string('-', 21), 1));
     }
 
     [Fact]

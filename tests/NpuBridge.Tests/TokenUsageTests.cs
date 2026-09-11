@@ -25,7 +25,13 @@ public class TokenUsageTests
 
         public int Count(string text) => text.Length * 10;
 
-        public int IndexAtTokenCount(string text, int tokens) => Math.Min(text.Length, Math.Max(0, tokens / 10));
+        public int IndexAtTokenCount(string text, int tokens, out int totalTokens)
+        {
+            totalTokens = Count(text);
+            return Math.Min(text.Length, Math.Max(0, tokens / 10));
+        }
+
+        public int TokensCovering(string text, int prefixChars) => Math.Clamp(prefixChars, 0, text.Length) * 10;
     }
 
     [Theory]

@@ -141,14 +141,18 @@ internal readonly record struct CutResult(string Text, string? FinishReason);
 ///
 /// <b>A token budget adds one more thing to wait for.</b> The budget's position is the counter's
 /// index at <c>cap</c> tokens over everything generated so far, and with a BPE tokenizer that index
-/// can move when text arrives: a merge can reach into the word still being written, so the last
-/// tokens of the text are provisional (D80). SentencePiece pieces never span a whitespace boundary
-/// and are at most <see cref="MaxPieceChars"/> characters, so everything before the trailing partial
-/// word, or more than that many characters back, is settled. Near the budget (within
-/// <see cref="NearBudgetReserveTokens"/> tokens of it) the stream releases only settled text and
-/// commits the cap only once its index is settled, or the generation ends; far from the budget a
-/// provisional count cannot matter and text flows as it arrives. A counter that is
-/// <see cref="ITokenCounter.PrefixStable"/> (chars/4) needs none of this.
+/// can move when text arrives: a merge can reach into the word still being written, and a run of one
+/// character can retokenize from its start when one more arrives (twenty hyphens are "----" first,
+/// twenty-one are "-" first), so nothing inside the trailing whitespace-free run is settled (D80).
+/// SentencePiece pieces never span a whitespace boundary, so everything before the whitespace run
+/// that precedes the last word is. Near the budget (within <see cref="NearBudgetReserveTokens"/>
+/// tokens of it) the stream releases only settled text and commits the cap only once its index is
+/// settled, or the generation ends; far from the budget a provisional count cannot matter and text
+/// flows as it arrives. A reply with no whitespace at all (CJK) never settles, so its exact cut is
+/// decided at the end over everything that arrived; but the model is not left generating: once the
+/// text runs the reserve past the budget the cutter sets <see cref="StopRequested"/>, the handler
+/// cancels, and the deltas already in flight still reach the cutter for that final decision. A
+/// counter that is <see cref="ITokenCounter.PrefixStable"/> (chars/4) needs none of this.
 ///
 /// Not thread-safe. The streaming path drives it from the single channel reader, never from the
 /// backend's callback thread; the non-streaming path locks its watcher instance.
@@ -156,17 +160,18 @@ internal readonly record struct CutResult(string Text, string? FinishReason);
 internal sealed class OutputCutter
 {
     /// <summary>
-    /// How close to the budget, in tokens, the stream starts holding provisional text back. Eight tokens
-    /// is far more than a BPE re-merge shifts a count by in practice (one or two), so releasing freely
-    /// below it cannot overshoot; above it the trailing word waits for its whitespace, or for
-    /// <see cref="MaxPieceChars"/> more characters.
+    /// How close to the budget, in tokens, the stream starts holding provisional text back, and how far
+    /// past it the cutter asks for the model to be stopped before the exact cut is known. Eight tokens
+    /// is far more than a BPE re-merge shifts a count by in practice (one or two on this vocabulary),
+    /// so releasing freely below it cannot overshoot; above it the trailing word waits for its
+    /// whitespace, or for the end of the text.
     /// </summary>
     internal const int NearBudgetReserveTokens = 8;
 
-    /// <summary>The longest piece in the Phi-3 vocabulary: text further back than this cannot be re-merged.</summary>
-    internal const int MaxPieceChars = 16;
-
     private readonly OutputLimits _limits;
+
+    /// <summary>Set once the text runs the reserve past the budget with no settled cut yet: stop the model, decide the cut at the end.</summary>
+    private bool _stopRequested;
 
     /// <summary>Text generated but not yet emitted: the held tail, plus whatever the last delta added.</summary>
     private string _pending = string.Empty;
@@ -190,6 +195,17 @@ internal sealed class OutputCutter
 
     /// <summary>True once a limit fired: nothing further will ever be emitted, and the generation should be cancelled.</summary>
     public bool IsCut => FinishReason is not null;
+
+    /// <summary>
+    /// True once the generation should be cancelled: a limit fired, or the text has run the reserve past
+    /// a token budget whose exact position cannot be settled before the text ends. In the second case
+    /// deltas still arriving must keep coming through <see cref="Accept"/>, and <see cref="Flush"/>
+    /// makes the cut over everything that arrived.
+    /// </summary>
+    public bool StopRequested => IsCut || _stopRequested;
+
+    /// <summary>Everything generated so far, the text <see cref="EmittedText"/> is a prefix of; what <c>completion_tokens</c> is counted over.</summary>
+    public string AllText => _all.ToString();
 
     /// <summary>Characters emitted so far — the length of the completion the client will have received.</summary>
     public int ContentLength => _emitted;
@@ -245,13 +261,24 @@ internal sealed class OutputCutter
         var near = false;
         if (_limits.MaxTokens is { } cap)
         {
-            var all = _all.ToString();
             var counter = _limits.Counter;
-            capAt = Math.Max(0, counter.IndexAtTokenCount(all, cap) - _emitted);
+            if (_stopRequested && !final)
+            {
+                // The stop has been asked for and the cut waits for the end: nothing more is released,
+                // and there is nothing to count until the text is complete.
+                return string.Empty;
+            }
+
+            var all = _all.ToString();
+            capAt = Math.Max(0, counter.IndexAtTokenCount(all, cap, out var total) - _emitted);
             if (!counter.PrefixStable)
             {
-                near = cap <= NearBudgetReserveTokens || counter.IndexAtTokenCount(all, cap - NearBudgetReserveTokens) < all.Length;
-                settledEnd = Math.Max(0, Math.Max(TrailingWordStart(all), all.Length - MaxPieceChars) - _emitted);
+                near = total > cap - NearBudgetReserveTokens;
+                settledEnd = Math.Max(0, TrailingWordStart(all) - _emitted);
+                if (!final && total >= cap + NearBudgetReserveTokens)
+                {
+                    _stopRequested = true;
+                }
             }
         }
 
@@ -372,7 +399,8 @@ internal sealed class OutputCutter
     /// <summary>
     /// Where the provisional tail begins: the start of the whitespace run before the last word, since a
     /// SentencePiece piece carries its leading whitespace and never spans a whitespace boundary. Zero
-    /// when the text has no whitespace at all, so the whole of it is still one word in progress.
+    /// when the text has no whitespace at all, so the whole of it is still one word in progress. No
+    /// fixed lookback can replace this: a run of one character retokenizes from its start.
     /// </summary>
     private static int TrailingWordStart(string text)
     {

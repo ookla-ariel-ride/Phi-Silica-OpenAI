@@ -297,9 +297,12 @@ Live today:
   everything generated (exactly `cap * 4` characters under chars/4); `stop` strings are excluded from
   the output; the generation is cancelled at the cut. A stream holds back `longest stop - 1`
   characters so a stop string split across deltas is never leaked, and neither the holdback nor the
-  budget may split a surrogate pair (D58). With a BPE counter the stream also holds the trailing
-  partial word (at most 16 characters) once within 8 tokens of the budget, because a later merge can
-  move the budget's index; far from the budget text flows as it arrives. Only a `Cancelled` status
+  budget may split a surrogate pair (D58). With a BPE counter the stream also holds everything after
+  the last whitespace boundary once within 8 tokens of the budget, because a later merge can move
+  the budget's index (a run of one character retokenizes from its start); a whitespace-free reply is
+  cut exactly at the end, and the model is stopped once the text runs 8 tokens past the budget
+  (`OutputCutter.StopRequested`). `completion_tokens` is the tokens of the generated text that cover
+  what was delivered (`ITokenCounter.TokensCovering`), never the prefix counted on its own. Only a `Cancelled` status
   may be reinterpreted by a cut; any other failure status is still a failure (D56), and a filtered
   reply outranks the cut. Both shapes cut through the same `OutputCutter`, so the same text always
   yields the same reply and finish reason.

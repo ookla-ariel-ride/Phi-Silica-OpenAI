@@ -1100,3 +1100,27 @@ One more number from the same run, for D44's record: the measurement step's Engl
 characters and 68 Phi-3 tokens (5.4 characters per token), so chars/4 had been *over*counting
 English prose by 1.35 × while the progress callbacks undercount it by 2.3 ×; the decode rate that
 read as 35 tokens per second under chars/4 is 27.4 real tokens per second.
+
+**D80 review round (Codex, 2026-09-11).** Two counterexamples on the real tokenizer, both confirmed
+with the scratch probe and now pinned by tests. (a) A fixed lookback does not settle a BPE boundary:
+twenty hyphens tokenize as `----` first and twenty-one as `-` first, so the "16 characters back is
+settled" rule was wrong; the settled prefix is now everything before the whitespace run that precedes
+the last word, and nothing else. The consequence for a reply with no whitespace at all (CJK) is that
+its exact cut is decided only at the end, over everything that arrived; so that the model is not left
+generating, the cutter sets `StopRequested` once the text runs the reserve (8 tokens) past the
+budget, both handlers cancel on that flag instead of on `IsCut`, and the stream keeps feeding the
+deltas already in flight to the cutter for the final decision. (b) Removing a stop string can leave a
+prefix that tokenizes to more on its own than the model spent on it: `international` is one token,
+`internation` two. `completion_tokens` is therefore `ITokenCounter.TokensCovering(generatedText,
+deliveredLength)`, the tokens of the generated text that cover what was delivered, counting the one
+the cut ends inside; under chars/4 that is `ceil(chars/4)` as before. A third finding of my own fell
+out of the CJK test: the byte-fallback tokens of one character all carry that character's offsets, so
+a budget that ends inside a character now stops before it (`min(end of token n, start of token n+1)`),
+or the cut would hand over a character the budget did not pay for. Also from the review: the counters
+return the raw token boundary and the cutter alone steps back from a surrogate pair, so stop-string
+precedence under chars/4 compares the same unrounded budget it did before; the per-delta cost of a
+token budget is one whole-text encoding (measured 3 ms for 5,000 characters on this machine, so
+about 3 % of a five-second reply), with no encoding at all once the stop has been requested; and
+`prompt_tokens` under chars/4 now rounds the native system text and the prompt separately, which can
+read one token higher than the old `ceil((system + prompt) / 4)`, accepted as immaterial for an
+estimate. 630 tests.

@@ -67,28 +67,21 @@ public class TokenBudgetCutTests
 
         public int Count(string text) => Tokens(text).Count();
 
-        public int IndexAtTokenCount(string text, int tokens)
+        public int IndexAtTokenCount(string text, int tokens) => IndexAtTokenCount(text, tokens, out _);
+
+        public int IndexAtTokenCount(string text, int tokens, out int totalTokens)
         {
+            var all = Tokens(text).ToList();
+            totalTokens = all.Count;
             if (tokens <= 0)
             {
                 return 0;
             }
 
-            var index = 0;
-            var taken = 0;
-            foreach (var (start, length) in Tokens(text))
-            {
-                if (taken == tokens)
-                {
-                    return index;
-                }
-
-                index = start + length;
-                taken++;
-            }
-
-            return text.Length;
+            return tokens >= all.Count ? text.Length : all[tokens - 1].Start + all[tokens - 1].Length;
         }
+
+        public int TokensCovering(string text, int prefixChars) => Tokens(text).Count(t => t.Start < prefixChars);
 
         private IEnumerable<(int Start, int Length)> Tokens(string text)
         {
@@ -115,6 +108,27 @@ public class TokenBudgetCutTests
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// One token per character and never prefix-stable: the shape of CJK through byte fallback, where
+    /// a reply can run for hundreds of tokens without a whitespace boundary to settle on.
+    /// </summary>
+    private sealed class OnePerCharCounter : ITokenCounter
+    {
+        public string Name => "one-per-char";
+
+        public bool PrefixStable => false;
+
+        public int Count(string text) => text.Length;
+
+        public int IndexAtTokenCount(string text, int tokens, out int totalTokens)
+        {
+            totalTokens = text.Length;
+            return Math.Clamp(tokens, 0, text.Length);
+        }
+
+        public int TokensCovering(string text, int prefixChars) => Math.Clamp(prefixChars, 0, text.Length);
     }
 
     private static OutputLimits Limits(int? maxTokens, ITokenCounter counter, params string[] stop) =>
@@ -237,6 +251,76 @@ public class TokenBudgetCutTests
         Assert.Equal("length", cutter.FinishReason);
     }
 
+    /// <summary>
+    /// The review's counterexample to a fixed lookback: twenty hyphens are "----" first, twenty-one are
+    /// "-" first, so nothing inside a whitespace-free run is settled until the run ends. The stream may
+    /// therefore release nothing of it near the budget, and lands on the whole-text cut.
+    /// </summary>
+    [Fact]
+    public void A_run_that_retokenizes_from_its_start_cannot_make_the_stream_overshoot()
+    {
+        var limits = Limits(1, Phi3TokenCounter.Instance);
+        var whole = limits.Cut(new string('-', 21));
+        Assert.Equal("-", whole.Text);
+
+        var cutter = new OutputCutter(limits);
+        var streamed = Drive(cutter, new string('-', 20), "-");
+
+        Assert.Equal(whole.Text, streamed);
+        Assert.Equal("length", cutter.FinishReason);
+    }
+
+    /// <summary>
+    /// A whitespace-free reply can never settle, so the cut waits for the end; but the model must not
+    /// be left generating. Once the text runs the reserve past the budget the cutter asks for the stop
+    /// while still deciding the exact cut at the end, over everything that arrived.
+    /// </summary>
+    [Fact]
+    public void Past_the_budget_by_the_reserve_the_cutter_asks_for_the_stop_and_cuts_exactly_at_the_end()
+    {
+        var cutter = new OutputCutter(Limits(2, new OnePerCharCounter()));
+
+        Assert.Equal(string.Empty, cutter.Accept("aaaa"));      // 4 tokens: past the budget, within the reserve
+        Assert.False(cutter.StopRequested);
+        Assert.Equal(string.Empty, cutter.Accept("aaaa"));      // 8
+        Assert.False(cutter.StopRequested);
+        Assert.Equal(string.Empty, cutter.Accept("aaaa"));      // 12 >= 2 + 8
+        Assert.True(cutter.StopRequested);
+        Assert.False(cutter.IsCut, "the exact cut waits for the end of the text");
+        Assert.Equal(string.Empty, cutter.Accept("aaaa"));      // still arriving after the stop was asked for
+
+        Assert.Equal("aa", cutter.Flush());
+        Assert.True(cutter.IsCut);
+        Assert.Equal("length", cutter.FinishReason);
+        Assert.Equal("aa", cutter.EmittedText);
+    }
+
+    [Fact]
+    public void A_committed_cut_also_asks_for_the_stop()
+    {
+        var cutter = new OutputCutter(Limits(2, new WordCounter()));
+        Drive(cutter, "Hello world and more");
+
+        Assert.True(cutter.IsCut);
+        Assert.True(cutter.StopRequested);
+    }
+
+    /// <summary>
+    /// Removing a stop string can leave a prefix that tokenizes to more on its own than the model spent
+    /// on it: "international" is one token, "internation" two. completion_tokens is the tokens the
+    /// model generated to reach the cut, so it stays within the budget (D80 review).
+    /// </summary>
+    [Fact]
+    public void A_stop_string_inside_a_token_cuts_the_text_and_the_budget_still_holds()
+    {
+        var limits = Limits(1, Phi3TokenCounter.Instance, "al");
+        var cut = limits.Cut("international");
+
+        Assert.Equal("internation", cut.Text);
+        Assert.Equal("stop", cut.FinishReason);
+        Assert.Equal(1, limits.Counter.TokensCovering("international", cut.Text.Length));
+    }
+
     [Fact]
     public void A_prefix_stable_counter_never_holds_a_partial_word()
     {
@@ -303,7 +387,61 @@ public class TokenBudgetCutTests
         host.AssertNoLeak();
     }
 
-    private static async Task<(string Content, string? Finish, int CompletionTokens)> CompleteAsync(BridgeTestHost host, bool stream, int maxTokens)
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Completion_tokens_after_a_stop_inside_a_token_stay_within_the_budget(bool stream)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => ["international"],
+            TokenCounter = Phi3TokenCounter.Instance,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var (content, finish, completionTokens) = await CompleteAsync(host, stream, maxTokens: 1, stop: "al");
+
+        Assert.Equal("internation", content);
+        Assert.Equal("stop", finish);
+        Assert.Equal(1, completionTokens);
+        host.AssertNoLeak();
+    }
+
+    /// <summary>
+    /// CJK has no whitespace to settle on, so the stream holds text near the budget and the exact cut is
+    /// decided at the end; the model is still stopped once the reserve is passed, and both shapes land
+    /// on the same text with a count exactly on the cap.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_whitespace_free_reply_is_cut_exactly_and_the_model_is_stopped(bool stream)
+    {
+        var pieces = Enumerable.Repeat("机器学习", 40).ToArray();
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => pieces,
+            TokenCounter = Phi3TokenCounter.Instance,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var (content, finish, completionTokens) = await CompleteAsync(host, stream, maxTokens: 5);
+
+        var all = string.Concat(pieces);
+        Assert.Equal(all[..Phi3TokenCounter.Instance.IndexAtTokenCount(all, 5)], content);
+        Assert.NotEmpty(content);
+        Assert.Equal("length", finish);
+        // Byte-fallback characters are several tokens each, so the budget may end inside one and the cut
+        // then stops before it: at most the cap, and exactly what the counter says the text cost.
+        Assert.InRange(completionTokens, 1, 5);
+        Assert.Equal(Phi3TokenCounter.Instance.TokensCovering(all, content.Length), completionTokens);
+        Assert.Equal(1, fake.ContextsDisposed);
+        // The cancel reached the fake before it had delivered everything.
+        Assert.True(fake.Calls.Count == 1);
+        host.AssertNoLeak();
+    }
+
+    private static async Task<(string Content, string? Finish, int CompletionTokens)> CompleteAsync(BridgeTestHost host, bool stream, int maxTokens, string? stop = null)
     {
         var response = await host.Client.PostAsJsonAsync(Path, new
         {
@@ -311,6 +449,7 @@ public class TokenBudgetCutTests
             stream,
             stream_options = stream ? new { include_usage = true } : null,
             max_tokens = maxTokens,
+            stop,
             messages = new[] { new { role = "user", content = "Say the sentence." } },
         });
         var text = await response.Content.ReadAsStringAsync();
