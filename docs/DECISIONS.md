@@ -1149,9 +1149,16 @@ steps were lifted out before it rather than during it.
 **What moved.** `src/NpuBridge.Core/Api/GenerationPipeline.cs` now holds `DeltaSink` (it was private
 to the streaming endpoint; its channel writer is optional, so the non-streaming path takes its
 first-token timing from the same type instead of an inline lambda that was character-for-character
-`OnDelta`), `CutWatcher` (the non-streaming path's early stop — the `OutputCutter` under a lock plus
-the `TaskCompletionSource` that must not be completed on the backend's callback thread), and
-`CancelGuardedAsync` and the verbose raw-output log, both of which existed in both files.
+`OnDelta`), `CutWatcher` (the non-streaming path's early stop — the `OutputCutter` under a lock plus the
+`TaskCompletionSource` that is deliberately completed *on* the backend's callback thread, carrying
+`RunContinuationsAsynchronously` so that the continuation which cancels the generation is what stays
+off it), and
+`CancelGuardedAsync` and the verbose raw-output log, both of which existed in both files. `DeltaSink`
+takes its destination as a `ChannelWriter<string>` or a `CutWatcher` through one of two factories,
+never as a delegate: the reason the type exists is that "the callback cannot reach the response" is
+checked by the compiler rather than remembered, and an `Action<string>` parameter would accept a
+closure over the response and hand that back. A caller that ever wants both destinations has to add a
+third factory and decide their order there, which is the point at which the question needs answering.
 `GenerationOutcome`, beside `GenerationFailure`, decides failure / filtered / content as three ordered
 rules: filtering outranks everything, a `Cancelled` the handler itself asked for is the cut, anything
 else `FromStatus` calls a failure is one. The non-streaming copy's `!filtered &&` guard was redundant
@@ -1176,6 +1183,13 @@ timeout. `ChatRequestMetrics.CharsPerToken`/`EstimateTokens` are deleted: the ra
 which still compares characters rather than the backend's tokens — deliberately, since an operator's
 hint is not worth tokenizing the whole transcript a second time for, and the preflight is the real
 measurement.
+
+**One thing did change.** Nothing a client can observe — same statuses to the same bodies, finish
+reasons, cache decisions, usage numbers, SSE framing and HTTP statuses on both shapes — but the
+non-streaming path's Debug line for a cancel that threw now reads "draining and disposing anyway"
+with a `{Where}` property, because it is the streaming path's line and there is only one of them now.
+So the claim is no *client-visible* behaviour change, not no behaviour change at all. The suite could
+not have caught it: the test asserts a substring that survived.
 
 **Tests.** `GenerationOutcomeTests` states the classification rules once rather than through two
 endpoints: every status crossed with the handler's own cancel, the finish-reason labels, and the
@@ -1213,3 +1227,36 @@ documented, and replacing them churns every test that sets `Responder` for modes
 inside that bullet — the wall-clock races — was fixed instead. `BackendCapabilities.Cancellation` is
 advertised by `PhiSilicaBackend` and read by nobody; that is its own question (report it in
 `/healthz`, read it in the fake, or drop it) and is issue #17.
+
+**D81 review round (a Claude subagent and Codex, 2026-09-11).** Neither reviewer found a
+client-visible defect, and both independently produced the same equivalence table for
+`GenerationOutcome` — all six statuses plus an unmapped one, crossed with the handler's own cancel,
+answering identically to both hand-written copies. Four things came out of the round.
+
+*The one that mattered.* `Task.WhenAny(wait, delay)` settled a tie by argument order, which put the
+channel first; `wait.WaitAsync(timeout, ct)` settles it by which fired first. So if the timer expires
+and the generation completes in the same gap before the awaiting thread is scheduled, the rewrite
+writes a keep-alive where the old code returned. That matters because a backend with no preflight
+reports an over-length prompt by completing the generation with no delta at all: the keep-alive
+commits HTTP 200 and the refusal that should have been a 400 becomes an SSE error event. Codex
+reasoned it out of the .NET sources rather than reproducing it, and no test could see it, but the
+preference was real and is now spelled out — the timeout path returns the delta if `wait` has since
+completed, instead of inheriting the old behaviour from an overload's parameter order.
+
+*A guarantee given away and taken back.* `DeltaSink` was first hoisted with an `Action<string>?`
+observer, which would have accepted a closure over the `HttpResponse` — the exact thing the type
+exists to make impossible, weakened in the commit that hoisted it for chunk 7 to use. It now takes a
+`ChannelWriter<string>` or a `CutWatcher` through one of two factories, with a private constructor, so
+the compiler is back to checking what the comment claims.
+
+*Comments that were wrong about the framework.* `Task.WaitAsync` does not leave a continuation behind
+per timed-out lap — its promise unregisters itself and releases its timer on the timeout path too —
+and a timeout has no precedence over a cancellation that becomes ready at the same moment; either can
+win, which is why the explicit `ThrowIfCancellationRequested` before the keep-alive write stays. The
+entry above also had the callback-thread invariant backwards: `CutWatcher` completes its
+`TaskCompletionSource` *on* the backend's callback thread on purpose, and
+`RunContinuationsAsynchronously` is what keeps the continuation that cancels the generation off it.
+
+*Coverage the new test file claimed and did not have.* A `Complete` that the handler had also
+cancelled, and a status the mapping has never heard of, are now pinned rather than asserted in a doc
+comment. 655 tests.

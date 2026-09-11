@@ -62,35 +62,51 @@ internal static class GenerationPipeline
 }
 
 /// <summary>
-/// The only thing the backend's callback thread can reach. It holds a channel writer, a stopwatch and
-/// an optional observer and nothing else — no <see cref="Microsoft.AspNetCore.Http.HttpResponse"/>, no
-/// <c>HttpContext</c>, not even a closure over one — so "never write to the response from the callback"
-/// is a property of what is in scope rather than a rule someone has to remember. Every field is touched
-/// through interlocked operations because <see cref="OnDelta"/> and the request's own task run at once.
+/// The only thing the backend's callback thread can reach. It holds a stopwatch and exactly one
+/// destination, which is either a <see cref="ChannelWriter{T}"/> or a <see cref="CutWatcher"/> — no
+/// <see cref="Microsoft.AspNetCore.Http.HttpResponse"/>, no <c>HttpContext</c>, and no delegate that
+/// could close over one. That is deliberate and is the type's reason for existing: "never write to the
+/// response from the callback" stays a property of what is in scope rather than a rule someone has to
+/// remember. An <c>Action&lt;string&gt;</c> parameter here would accept a closure over the response and
+/// give that property away, which is why the two destinations are named types and why the constructor
+/// is private — the factories below are the only two shapes there are.
 ///
-/// Both shapes need the timing; only one of the two destinations is ever set. The streaming path hands
-/// the deltas to its channel, whose single reader owns the response. The non-streaming path has no
-/// channel — it awaits the whole text — but it does watch the deltas go by to decide when to stop the
-/// model early, and that is the <paramref name="observer"/>: a <see cref="CutWatcher"/>, which reaches
-/// no further than an <see cref="OutputCutter"/> and a <see cref="TaskCompletionSource"/>.
+/// The mutable fields are touched through interlocked operations because <see cref="OnDelta"/> and the
+/// request's own task run at once; the destination and the stopwatch are readonly and need none.
 /// </summary>
 internal sealed class DeltaSink
 {
     private readonly Stopwatch _stopwatch;
     private readonly ChannelWriter<string>? _writer;
-    private readonly Action<string>? _observer;
+    private readonly CutWatcher? _watcher;
     private long _firstTokenTicks;
     private int _count;
 
-    /// <param name="stopwatch">Started when the request's generation phase began; read at the first delta.</param>
-    /// <param name="writer">Where deltas go on the streaming path. Null on the non-streaming one.</param>
-    /// <param name="observer">Watches deltas without consuming them. Null when the request set no limits.</param>
-    public DeltaSink(Stopwatch stopwatch, ChannelWriter<string>? writer = null, Action<string>? observer = null)
+    private DeltaSink(Stopwatch stopwatch, ChannelWriter<string>? writer, CutWatcher? watcher)
     {
         _stopwatch = stopwatch;
         _writer = writer;
-        _observer = observer;
+        _watcher = watcher;
     }
+
+    /// <summary>
+    /// The streaming path's sink: deltas cross into the channel whose single reader owns the response.
+    /// That reader runs the cut, so there is no watcher here.
+    /// </summary>
+    /// <param name="stopwatch">Started when the request's generation phase began; read at the first delta.</param>
+    public static DeltaSink ToChannel(Stopwatch stopwatch, ChannelWriter<string> writer)
+    {
+        ArgumentNullException.ThrowIfNull(writer);
+        return new DeltaSink(stopwatch, writer, watcher: null);
+    }
+
+    /// <summary>
+    /// The non-streaming path's sink. There is no channel — the handler awaits the whole text — but the
+    /// deltas are still watched as they go by, to decide when to stop the model early.
+    /// </summary>
+    /// <param name="watcher">Null when the request set no limits, which is the ordinary case.</param>
+    public static DeltaSink ToWatcher(Stopwatch stopwatch, CutWatcher? watcher) =>
+        new(stopwatch, writer: null, watcher);
 
     /// <summary>Callbacks seen. Not a token count: runtimes batch several tokens per callback (D44).</summary>
     public int Count => Volatile.Read(ref _count);
@@ -111,10 +127,14 @@ internal sealed class DeltaSink
             Interlocked.Exchange(ref _firstTokenTicks, _stopwatch.ElapsedTicks);
         }
 
-        // Unbounded channel: TryWrite only fails once the writer is completed, which happens after
-        // GenerateAsync has returned and so after the last callback.
+        // Exactly one of these is ever set, so their order here says nothing and must not be read as a
+        // rule. A future caller that wants both -- a streamed request that also watches its own deltas
+        // -- has to add a third factory and decide the order there, because the watcher seeing a delta
+        // after the channel reader has already acted on it is a different cut from the one this path
+        // makes. Unbounded channel: TryWrite only fails once the writer is completed, which happens
+        // after GenerateAsync has returned and so after the last callback.
         _writer?.TryWrite(delta);
-        _observer?.Invoke(delta);
+        _watcher?.Accept(delta);
     }
 }
 

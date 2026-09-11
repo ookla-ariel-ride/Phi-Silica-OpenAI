@@ -141,7 +141,7 @@ internal sealed class ChatCompletionsStreamEndpoint
                     AllowSynchronousContinuations = false,
                 });
 
-                sink = new DeltaSink(stopwatch, channel.Writer);
+                sink = DeltaSink.ToChannel(stopwatch, channel.Writer);
 
                 // Started, not awaited: the reader loop below runs concurrently with it. The channel is
                 // completed in that method's finally, which is what ends the loop on every outcome,
@@ -270,7 +270,8 @@ internal sealed class ChatCompletionsStreamEndpoint
             // withheld: writing them here would be the one place a filtered reply gained text.
             var tail = outcome.Filtered ? string.Empty : cutter.Flush();
 
-            // Read after the flush, never before. Flush() can be the call that commits the cap: it is
+            // Read after the flush, never before -- except for a filtered reply, which has no flush to
+            // read after and whose label does not depend on the cut anyway. Flush() can be the call that commits the cap: it is
             // deliberately deferred until the text runs Holdback past the budget, so a reply that ends
             // inside that window is only cut here. Reading FinishReason first labelled such a request
             // "stop" on this shape while the JSON path -- which reads it after its own flush -- called
@@ -395,9 +396,11 @@ internal sealed class ChatCompletionsStreamEndpoint
     /// waiting on headers — and it is also the window in which a failure can still be a real HTTP status.
     /// Hence two intervals: about a second, then every fifteen.
     ///
-    /// The wait itself is never cancelled. The channel is completed on every outcome of the generation,
-    /// a cancelled one included, so this returns and the caller always reaches the drain. Only the
-    /// keep-alive timer and the write it guards observe the client's token.
+    /// The channel is completed on every outcome of the generation, a cancelled one included, so this
+    /// returns on its own and the caller always reaches the drain. A client that leaves mid-wait is the
+    /// other way out: the wait ends as an <see cref="OperationCanceledException"/>, which the caller's
+    /// client-gone clause catches and answers with the silent http=0 log line. Both ways lead to the
+    /// finally, which is the only thing that has to be true here — the context is disposed either way.
     /// </summary>
     private static async Task<bool> WaitForFirstDeltaAsync(
         SseStream sse,
@@ -420,18 +423,32 @@ internal sealed class ChatCompletionsStreamEndpoint
             try
             {
                 // WaitAsync returns a task of its own and leaves `wait` -- the channel's, awaited again
-                // on the next lap -- to complete when it completes. Its timer is released either way;
-                // what it does leave behind is one continuation on `wait` per lap, and the laps are
-                // bounded by the generation's own length over the fifteen-second interval.
+                // on the next lap -- to complete when it completes. It costs nothing to lap: its
+                // internal promise unregisters itself from `wait` and releases its timer on the timeout
+                // path as well as on completion, so neither continuations nor timers accumulate however
+                // long the model takes to produce its first token.
                 return await wait.WaitAsync(next, cancellationToken).ConfigureAwait(false);
             }
             catch (TimeoutException)
             {
-                // No delta yet. Say something on the wire and wait again.
+                // No delta yet -- unless one landed in the very gap between the timer firing and this
+                // thread being scheduled to hear about it. Then the timeout is stale, and acting on it
+                // would write a keep-alive that commits 200 to a request whose real answer is still an
+                // ordinary HTTP status: a backend without a preflight reports an over-length prompt by
+                // completing the generation with no delta at all, so "the channel closed" and "the timer
+                // expired" becoming true in the same instant turns a 400 into an SSE error event.
+                // Task.WhenAny used to settle this by argument order, which put `wait` first; WaitAsync
+                // settles it by which fired first, so the preference is spelled out here instead of
+                // inherited from an overload's parameter order.
+                if (wait.IsCompleted)
+                {
+                    return await wait.ConfigureAwait(false);
+                }
             }
 
-            // Belt and braces: a cancel that lands in the same instant as the timeout is reported as the
-            // timeout, and writing to a connection whose client has gone is not worth the exception.
+            // A cancel and a timeout that become ready together can be reported either way round, so the
+            // timeout path has to check: writing to a connection whose client has gone throws, and this
+            // is the write that would do it.
             cancellationToken.ThrowIfCancellationRequested();
 
             await sse.WriteAsync(KeepAliveFrame, cancellationToken).ConfigureAwait(false);

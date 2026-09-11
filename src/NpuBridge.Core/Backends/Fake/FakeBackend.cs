@@ -270,6 +270,13 @@ public sealed partial class FakeBackend : ILanguageModelBackend
     /// wait was still in progress; the caller names the gate it was holding at in the status detail, so
     /// the waiting is shared and the verdict is not. <see cref="InitializeAsync"/> deliberately does not
     /// use this: its gate has no status to report and lets the cancellation throw.
+    ///
+    /// A gate that is already open wins over a token that is already cancelled — <c>WaitAsync</c> takes
+    /// the completed task's fast path without consulting the token — so an open gate does not report
+    /// <see cref="GenerationStatus.Cancelled"/> the way the delay this replaced would have. That is the
+    /// behaviour every other gate here already had, and it is the right one for a gate: an open gate is
+    /// an event that has happened, and a test that wants a cancellation observed at this point holds the
+    /// gate shut.
     /// </summary>
     private static async Task<bool> WaitAtGateAsync(TaskCompletionSource? gate, CancellationToken cancellationToken)
     {

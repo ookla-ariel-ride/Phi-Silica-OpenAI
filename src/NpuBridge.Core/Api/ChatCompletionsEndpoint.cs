@@ -100,8 +100,9 @@ internal sealed class ChatCompletionsEndpoint
             var stopwatch = Stopwatch.StartNew();
 
             // Counts the deltas and times the first one, exactly as it does on the streaming path; the
-            // channel writer that path passes it is the only difference, and it is optional. Assigned
-            // once per attempt inside the loop, so a retry times itself rather than the attempt before it.
+            // destination is the only difference, and there it is the channel rather than the watcher
+            // below. Assigned once per attempt inside the loop, so a retry times itself rather than the
+            // attempt before it.
             DeltaSink sink;
 
             // Set beside the CancelAsync below, when this handler cancels the generation because the
@@ -151,7 +152,7 @@ internal sealed class ChatCompletionsEndpoint
                 // to see. Null when the request set no limits, which is the ordinary case and costs
                 // nothing. Fresh per attempt, like the sink beside it.
                 var watcher = limits.IsEmpty ? null : new CutWatcher(limits);
-                sink = new DeltaSink(stopwatch, observer: watcher is null ? null : watcher.Accept);
+                sink = DeltaSink.ToWatcher(stopwatch, watcher);
 
                 var generation = backend.GenerateAsync(
                     lease.Context,

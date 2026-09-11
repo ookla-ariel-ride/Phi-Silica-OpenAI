@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Http;
 using NpuBridge.Api;
 using NpuBridge.Backends;
 
@@ -82,6 +83,43 @@ public class GenerationOutcomeTests
         Assert.NotNull(uncut.Failure);
         Assert.Equal(uncut.Failure.StatusCode, cut.Failure.StatusCode);
         Assert.Equal(uncut.Failure.Body, cut.Failure.Body);
+    }
+
+    /// <summary>
+    /// A generation that ended <c>Complete</c> is content even if the handler had already cancelled for
+    /// the cut — the cancel lost the race, the model finished anyway, and the reply is whole up to the
+    /// cut. Stated separately because the rest of the file crosses <c>Complete</c> only with
+    /// <c>cancelledByCut: false</c>.
+    /// </summary>
+    [Fact]
+    public void A_complete_generation_the_handler_also_cancelled_is_still_content()
+    {
+        var outcome = GenerationOutcome.Classify(Result(GenerationStatus.Complete), cancelledByCut: true);
+
+        Assert.Null(outcome.Failure);
+        Assert.False(outcome.Filtered);
+        Assert.Equal("length", outcome.FinishReason(cutFinishReason: "length"));
+    }
+
+    /// <summary>
+    /// A status this switch has never heard of — what an adapter added without updating the mapping —
+    /// is a 502, not a success. Both hand-written copies reached that through
+    /// <see cref="GenerationFailure.FromStatus"/>'s <c>_</c> arm and neither had a test for it; a
+    /// classifier that let an unknown status fall through to content would hand the client whatever
+    /// partial text the failure left behind, labelled <c>stop</c>.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void A_status_the_mapping_has_never_heard_of_is_a_failure(bool cancelledByCut)
+    {
+        var unmapped = (GenerationStatus)9999;
+
+        var outcome = GenerationOutcome.Classify(Result(unmapped), cancelledByCut);
+
+        Assert.NotNull(outcome.Failure);
+        Assert.Equal(StatusCodes.Status502BadGateway, outcome.Failure.StatusCode);
+        Assert.False(outcome.Filtered);
     }
 
     /// <summary>The failure body is the one <see cref="GenerationFailure.FromStatus"/> already produced; the classifier only decides whether it applies.</summary>
