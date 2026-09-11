@@ -27,6 +27,49 @@ land here instead of widening the chunk. Each entry says where it came from and 
   Instruct only. When it lands it needs a `ToolCalling` capability that bypasses chunk 7's emulation and
   a per-backend context-window hint. Tracked as a GitHub issue.
 
+## Chunk 6 deferrals (Aion Instruct Preview adapter)
+
+- **Hardware verification of `--backend aion` is blocked on this machine, not on the code (D68).**
+  The adapter resolves both dynamic dependencies, the SDK loads its WinML stack and picks the QNN
+  execution provider, and `LanguageModel.CreateAsync` then fails in the first-run NPU compile
+  (`CacheApi::CreateCache failed: InvalidCache`, per-model `InvalidData`). The SDK's own debug line
+  before that is `TryRegister returned false for WinML EP: QNNExecutionProvider`, and the reason is
+  that every DLL in the `MicrosoftCorporationII.WinML.Qualcomm.QNN.EP.1.8` package fails `LoadLibrary`
+  with `E_ACCESSDENIED`, even from a process that has the package in its dependency graph and even though
+  the files read fine. The Aion framework's own DLLs load from the same `WindowsApps` root without
+  trouble; the difference is the provider package being a sideloaded main package whose folder ACL was
+  written on this Insider build (29648, after the 29661 rollback). Things that were not tried and might
+  clear it: enabling Developer Mode (the sample's `Bootstrap.ps1` turns it on and its validated run had
+  it on; here it is off), a later or earlier Windows build, a newer Qualcomm NPU driver (the sample's
+  issue #6 was fixed by one; this machine's is 30.0.219.1000 from 2025-11). Everything that depends on
+  a generation stays unmeasured: load time, TTFT, tok/s, system-prompt adherence under folded placement,
+  whether cancel stops the device, and the over-length verdict.
+- **`BackendCapabilities.Cancellation` is not advertised on Aion** until the cut measurement earns it.
+  The pipeline reads the flag nowhere yet (chunk 4 deferral above), so this changes no behaviour; the
+  point is that the adapter claims nothing the smoke test has not shown.
+- **The third overflow behaviour is still unknown.** Aion's status enum does have
+  `PromptLargerThanContext`, unlike what Phi Silica returns in practice (D55), so it may be the one
+  backend that reports overflow honestly, or it may fail generically like Phi Silica. Chunk 5's
+  `--truncate-history` loop on a backend with no preflight cannot be designed until this is measured;
+  D67 records what is decided in the meantime.
+- **No setup script for the Aion prerequisites.** Getting to a first run took: the framework MSIX from
+  the sample repo's release (`Add-AppxPackage`, user scope, no elevation), the SDK NuGet into
+  `nuget-local/`, and the QNN execution provider 1.8 package, which is not on the machine by default and
+  is acquired by the sample's `tools/AcquireQnnEp` (its `EnsureReadyAsync` downloads and installs it;
+  the tool targets .NET 9, which is not installed here, so a .NET 10 retarget was built in a scratch
+  folder). A `scripts/aion-setup.ps1` doing those three steps would save the next machine an hour. Not
+  written now because the third step's result does not work here and a script that installs something
+  unusable would mislead.
+- **The sample's unpackaged console could not be built as a control experiment.** With CsWinRT 2.3.1
+  and the NuGet-delivered Windows metadata, the `AionInstructPreview.Text` namespace was not projected
+  in a fresh console project even with `CsWinRTIncludes` set, while the same package reference projects
+  fine inside `NpuBridge.csproj` (which also references the Windows App SDK). Worth understanding before
+  anyone else copies the reference into a new project.
+- **The exe's Windows App SDK 2.4.1-experimental reference and Aion's Windows App Runtime 1.8
+  dependency coexist untested.** `--backend aion` never bootstraps the 2.x runtime and adds 1.8 as a
+  dynamic dependency; `--backend phi-silica` does the opposite. Nothing runs both in one process, and
+  nothing should, but the two `LanguageModel` projections now share one assembly.
+
 ## Chunk 4 review deferrals
 
 - **The drain is unbounded and silent.** The streaming handler cancels the generation, awaits it to

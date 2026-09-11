@@ -43,10 +43,26 @@ machine; the NPU is here.
   the backend advertises the capability. Measured on this NPU: both placements produce the instructed
   reply under the chunk 3 template; only bare `/debug/generate` ignores system text (D45).
 
-## Aion facts (from the SDK IDL)
+## Aion facts (from the SDK IDL, confirmed against the 1.0.0 nupkg on 2026-09-11)
 `CreateAsync`, `CreateContext()`, `GenerateResponseAsync(prompt)`, `GenerateResponseAsync(ctx, prompt)`;
-status enum Complete=0, InProgress=1, Error=2, PromptLargerThanContext=3. Unpackaged via
-`TryCreatePackageDependency`/`AddPackageDependency` on `Microsoft.AionInstructPreview.Framework.1.0_8wekyb3d8bbwe`.
+status enum Complete=0, InProgress=1, Error=2, PromptLargerThanContext=3. `LanguageModelResponseResult`
+has `Text` and `Status` only (no `ExtendedError`). Unpackaged via
+`TryCreatePackageDependency`/`AddPackageDependency` on `Microsoft.AionInstructPreview.Framework.1.0_8wekyb3d8bbwe`
+(minVersion 0) plus `Microsoft.WindowsAppRuntime.1.8_8wekyb3d8bbwe` (min 8000.836.2153.0; the SDK's
+packaged path injects the same two dependencies). The nupkg's props add the winmd to `CsWinRTInputs`
+and the namespace to `CsWinRTIncludes`; it projects inside `NpuBridge.csproj` as-is.
+
+Runtime stack the SDK uses (from its debug output): `Microsoft.Windows.AI.MachineLearning.dll` and
+`onnxruntime.dll` 1.23 from Windows App Runtime 1.8; execution provider chosen through the WinML
+`ExecutionProviderCatalog` (`selected EP=QNN, Device=NPU, reason=catalog-certified, backend=QnnHtp.dll`);
+compiled model cache under `C:\ProgramData\Aion Instruct Preview\Cache\<ver>\QNN\arm64` with a
+`.aion-instruct-preview-cache-state.log` beside it. The QNN provider is a separate, sideloaded main
+package `MicrosoftCorporationII.WinML.Qualcomm.QNN.EP.1.8` (installed here at 1.8.30.0 by
+`ExecutionProvider.EnsureReadyAsync` on 2026-09-11; a `...QNN.EP.2` 2.2450.47.0 arrived with it). Its
+DLLs fail `LoadLibrary` with `E_ACCESSDENIED` on this machine, which is why `CreateAsync` fails (D68).
+
+Installed on this machine (2026-09-11): the framework MSIX 1.0.0.0 (user scope, `Add-AppxPackage`, no
+elevation), the SDK NuGet in `nuget-local/`, both QNN provider packages. Developer Mode is off.
 
 ## Commands
 ```powershell

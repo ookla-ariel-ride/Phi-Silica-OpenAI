@@ -582,3 +582,44 @@ smoke test could not reach a generation, which is why #5, #6 and #8 merged a day
 texts matched; the cut, disconnect and over-length steps behaved as before (early cut 590 ms against
 a 2,965 ms control; over-length verdict a generic error after 8.7 s with the preflight answering
 13,429 usable at once). (#7)
+
+## 2026-09-11 — Chunk 6 (Aion Instruct Preview adapter)
+
+Issue #2. Built on `chunk-6-aion`. The adapter, the plumbing and the unit tests are complete and
+reviewed by the build and the suite; the hardware steps are blocked by the machine (D68), so this
+section records what was decided and what is deliberately still open.
+
+**D66. The Aion SDK is a conditional reference: absent NuGet, absent adapter, one solution everywhere.**
+`AionInstructPreview.Text.Framework.1.0.0.nupkg` is not on nuget.org; it comes from the sample repo's
+GitHub release into `nuget-local/`, which is gitignored. CI has no copy and must stay green, and a
+fresh clone that has not fetched it must still build `--backend fake` and `--backend phi-silica`. Of
+the two options the issue offered, the exe project now references the package only when the file
+exists at build time (`AionSdkAvailable`), defines `AION_SDK`, and otherwise removes
+`Backends\AionBackend.cs` from the compile and maps `--backend aion` to an `UnavailableBackend` whose
+message says the SDK was absent at build time and where to get it. The alternative, building only
+Core and the tests on CI, would have left the exe uncompiled on every push, which is where the Phi
+Silica adapter and the packaging glue live; this way CI compiles everything but the one file it cannot.
+Verified both ways: the full build with the file present, `dotnet build src/NpuBridge
+-p:AionSdkAvailable=false` without it, and the pushed branch's CI run (no NuGet) green. The cost is
+that a machine with a stale `obj/` can carry the wrong decision until it restores again; `dotnet build`
+restores by default, so this is a `--no-restore` hazard only.
+
+**D67. Both adapters share one delta accumulator; Aion inherits the text contract by construction.**
+`PhiSilicaBackend`'s Progress handling — append and deliver under one lock, drain the in-flight
+callbacks after the operation ends, count a callback after a completed generation and a runtime text
+that disagrees with the deltas (D65) — was 120 lines of concurrency code that the Aion adapter would
+otherwise have copied. It is now `DeltaAccumulator`, in the exe project beside the adapters because it
+is WinRT-shaped and has no test seam without a runtime; each adapter supplies its logger, its display
+name for log lines, and the two counter callbacks. The Phi Silica adapter's behaviour is unchanged by
+inspection and by the smoke test re-run after the refactor (D68 has the numbers). Two things stay
+per-adapter on purpose: the Phi Silica `E_ACCESSDENIED` translation and its `ContentFiltered` rule
+(return empty text), because Aion's four-value enum has no moderation status and no access gate.
+Aion's `InProgress` is mapped to `Error` like any unknown value: it is not a terminal status, and a
+result carrying it is a fault rather than a success. Sampling options never reach the adapter (the
+capability is absent, preparation drops them), and it would have nothing to hand the runtime anyway.
+Overflow on this backend, when it can be measured, is expected to be one of two things: Aion's enum
+does carry `PromptLargerThanContext`, so it may be the backend that reports it honestly, or it may fail
+generically like Phi Silica (D55). The pipeline already turns the first into `400
+context_length_exceeded` on both shapes with the context disposed (tested under the Aion capability
+profile), and the second into a 502 or an in-stream error; chunk 5's `--truncate-history` loop for a
+backend with no preflight waits for the measurement.
