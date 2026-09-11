@@ -47,7 +47,8 @@ public class ModelsTests
         var error = doc.RootElement.GetProperty("error");
         Assert.Equal("invalid_request_error", error.GetProperty("type").GetString());
         Assert.Equal("model_not_found", error.GetProperty("code").GetString());
-        Assert.Equal("model", error.GetProperty("param").GetString());
+        // param is null, as on the chat endpoint's model_not_found: the id is in the path, not a parameter.
+        Assert.Equal(JsonValueKind.Null, error.GetProperty("param").ValueKind);
         Assert.Contains("gpt-4o", error.GetProperty("message").GetString());
     }
 

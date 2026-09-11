@@ -158,7 +158,7 @@ internal static class ModelsEndpoint
         string.Equals(id, lifecycle.Backend.ModelId, StringComparison.OrdinalIgnoreCase)
             ? Results.Json(Describe(lifecycle.Backend), JsonDefaults.Options)
             : OpenAiError.NotFoundResult($"The model '{id}' does not exist. This server exposes '{lifecycle.Backend.ModelId}'.",
-                code: "model_not_found", param: "model");
+                code: "model_not_found");
 
     private static ModelObject Describe(ILanguageModelBackend backend) => new(backend.ModelId, CreatedUnix, "npu-bridge");
 }

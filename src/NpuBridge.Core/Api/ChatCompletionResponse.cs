@@ -34,12 +34,14 @@ public sealed record ChatCompletionChoice(
 }
 
 /// <summary>
-/// The assistant message. <see cref="Refusal"/> is always null: neither runtime reports a refusal
-/// separately from a content filter, which is a finish reason here; the schema requires the field.
+/// The assistant message. The schema requires <c>role</c>, <c>content</c> and <c>refusal</c>, the
+/// last two nullable, so a null <see cref="Content"/> is written as a null rather than omitted.
+/// <see cref="Refusal"/> is always null: neither runtime reports a refusal separately from a content
+/// filter, which is a finish reason here.
 /// </summary>
 public sealed record ChatCompletionResponseMessage(
     string Role,
-    string? Content)
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Content)
 {
     [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public string? Refusal { get; init; }

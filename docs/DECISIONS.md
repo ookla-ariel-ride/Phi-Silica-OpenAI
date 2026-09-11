@@ -939,4 +939,9 @@ on every backend, whether or not the backend applies the value. (f) `stream_opti
 `stream: true` is a 400, in the schema's own words. Not changed: `system_fingerprint`,
 `service_tier`, the `usage` detail objects and `annotations` are optional in the schema and stay
 absent; `/v1/completions` is chunk 8. The smoke script already read `finish_reason` and `usage` with
-null-tolerant checks, so it passed unchanged on the fake backend. 488 tests.
+null-tolerant checks, so it passed unchanged on the fake backend and on Phi Silica (one NPU run failed
+at the first generation with an RPC fault from the model runtime before any bridge code ran; the
+re-run passed every step). A Codex review added two more schema rules: `message.content` is also
+required-but-nullable and is now written as a null, and the `/v1/models/{id}` 404 now carries
+`param: null` like the chat endpoint's. The null-usage dictionary is allocated per chunk rather than
+shared. 495 tests.

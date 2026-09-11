@@ -339,12 +339,12 @@ public class ChatCompletionRequestTests
         Assert.Equal(2, usage.GetProperty("completion_tokens").GetInt32());
         Assert.Equal(5, usage.GetProperty("total_tokens").GetInt32());
 
-        // Nulls omitted: the response message's content is non-null here, but a null-content
-        // assistant message should still omit the key rather than emit "content":null.
+        // The schema requires content (nullable) on the response message, so a null-content assistant
+        // message writes "content": null rather than omitting the key (D77).
         var nullContentJson = JsonSerializer.Serialize(
             new ChatCompletionResponseMessage("assistant", null), JsonDefaults.Options);
         using var nullContentDoc = JsonDocument.Parse(nullContentJson);
-        Assert.False(nullContentDoc.RootElement.TryGetProperty("content", out _));
+        Assert.Equal(JsonValueKind.Null, nullContentDoc.RootElement.GetProperty("content").ValueKind);
     }
 
     [Fact]

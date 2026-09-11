@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using NpuBridge.Api;
 using NpuBridge.Backends;
 using NpuBridge.Backends.Fake;
 
@@ -168,6 +169,96 @@ public class OpenAiConformanceTests
 
         Assert.Equal("model", model.GetProperty("object").GetString());
         Assert.Equal("fake", model.GetProperty("id").GetString());
+    }
+
+    [Fact]
+    public async Task An_unknown_model_is_a_404_even_while_the_backend_is_still_loading()
+    {
+        // The model check runs before readiness: a loading server answers 404 for the wrong id, and
+        // param is null, as OpenAI sends it. Both envelopes (this and GET /v1/models/{id}) agree.
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeBackend(new FakeBackendOptions { InitGate = gate });
+        await using var host = await BridgeTestHost.StartAsync(fake, waitForReady: false);
+
+        var post = await host.Client.PostAsJsonAsync(Path, new { model = "gpt-4o", messages = new[] { User("x") } });
+        var get = await host.Client.GetAsync("/v1/models/gpt-4o");
+
+        // A valid id while loading is still the 503; checked before the gate opens.
+        var loading = await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = new[] { User("x") } });
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, loading.StatusCode);
+        gate.SetResult();
+
+        Assert.Equal(HttpStatusCode.NotFound, post.StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, get.StatusCode);
+        var postError = await Error(post);
+        var getError = await Error(get);
+        Assert.Equal("model_not_found", postError.GetProperty("code").GetString());
+        Assert.Equal(JsonValueKind.Null, postError.GetProperty("param").ValueKind);
+        Assert.Equal(JsonValueKind.Null, getError.GetProperty("param").ValueKind);
+        Assert.Equal(postError.GetProperty("message").GetString(), getError.GetProperty("message").GetString());
+    }
+
+    [Theory]
+    [InlineData(float.NaN, null)]
+    [InlineData(float.PositiveInfinity, null)]
+    [InlineData(null, float.NaN)]
+    [InlineData(null, float.NegativeInfinity)]
+    public void Non_finite_sampling_values_fail_validation(float? temperature, float? topP)
+    {
+        // JSON cannot carry these, but the DTO can be built directly; the validator rejects them.
+        var request = new ChatCompletionRequest("fake",
+            [new ChatMessage("user", ChatMessageContent.FromText("x"), null, null)],
+            null, null, temperature, topP, null, null, null, null, null, null, null, null, null, null, null, null);
+
+        var result = ChatCompletionRequestValidator.Validate(request);
+
+        Assert.False(result.IsValid);
+        Assert.Equal(temperature is null ? "top_p" : "temperature", result.Failure!.Param);
+    }
+
+    [Fact]
+    public async Task With_include_usage_a_reply_with_no_deltas_still_carries_usage_null_before_the_usage_chunk()
+    {
+        // No delta at all: the role chunk and the finish chunk are written after the generation ended.
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => [] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var body = await (await host.Client.PostAsJsonAsync(Path, new
+        {
+            model = "fake",
+            stream = true,
+            stream_options = new { include_usage = true },
+            messages = new[] { User("x") },
+        })).Content.ReadAsStringAsync();
+        var chunks = Chunks(body);
+
+        Assert.True(chunks.Count >= 3);
+        Assert.All(chunks.Take(chunks.Count - 1), c => Assert.Equal(JsonValueKind.Null, c.GetProperty("usage").ValueKind));
+        Assert.Equal(JsonValueKind.Object, chunks[^1].GetProperty("usage").ValueKind);
+        Assert.Equal(0, chunks[^1].GetProperty("choices").GetArrayLength());
+    }
+
+    [Fact]
+    public async Task With_include_usage_a_stream_that_fails_carries_usage_null_on_its_chunks_and_a_plain_error_frame()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["a", "b"], FailAfterTokens = 1, FailureStatus = GenerationStatus.Error });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var body = await (await host.Client.PostAsJsonAsync(Path, new
+        {
+            model = "fake",
+            stream = true,
+            stream_options = new { include_usage = true },
+            messages = new[] { User("x") },
+        })).Content.ReadAsStringAsync();
+        var chunks = Chunks(body);
+
+        var frames = chunks.Where(c => c.TryGetProperty("choices", out _)).ToList();
+        Assert.NotEmpty(frames);
+        Assert.All(frames, c => Assert.Equal(JsonValueKind.Null, c.GetProperty("usage").ValueKind));
+        var error = Assert.Single(chunks, c => c.TryGetProperty("error", out _));
+        Assert.False(error.TryGetProperty("usage", out _));
+        Assert.EndsWith("data: [DONE]\n\n", body, StringComparison.Ordinal);
     }
 
     private static async Task<JsonElement> Error(HttpResponseMessage response)

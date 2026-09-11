@@ -32,7 +32,7 @@ All four defects from the 2026-09-10 code review (#5 to #8) are fixed and merged
 Insider flight to build 29661 broke Phi Silica and was rolled back to 29648; if it is offered again,
 expect the same (workload packages fail to register, model `NotReady`). An empty
 `Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'` listing is not proof of breakage on 29648;
-`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D76 so
+`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D77 so
 far); `docs/FUTURE.md` holds deferred work. Update both whenever a chunk changes a choice or defers
 something.
 

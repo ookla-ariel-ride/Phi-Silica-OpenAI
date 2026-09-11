@@ -19,8 +19,6 @@ public sealed record ChatCompletionChunk(
     IReadOnlyList<ChatCompletionChunkChoice> Choices,
     CompletionUsage? Usage = null)
 {
-    private static readonly Dictionary<string, object?> NullUsage = new() { ["usage"] = null };
-
     [JsonPropertyName("object")]
     public string ObjectType { get; init; } = "chat.completion.chunk";
 
@@ -28,8 +26,12 @@ public sealed record ChatCompletionChunk(
     [JsonExtensionData]
     public IDictionary<string, object?>? Extra { get; init; }
 
-    /// <summary>A copy that writes <c>"usage": null</c>, for the chunks before the usage chunk.</summary>
-    public ChatCompletionChunk WithNullUsage() => this with { Extra = NullUsage };
+    /// <summary>
+    /// A copy that writes <c>"usage": null</c>, for the chunks before the usage chunk. A fresh
+    /// dictionary each time: the extension data is exposed as a mutable interface, and one shared
+    /// instance would let any caller that touched it change every later chunk.
+    /// </summary>
+    public ChatCompletionChunk WithNullUsage() => this with { Extra = new Dictionary<string, object?> { ["usage"] = null } };
 }
 
 /// <summary>

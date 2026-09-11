@@ -23,7 +23,7 @@ time.
 |---|---|
 | OS build | 29648 |
 | `dotnet build` | clean, 0 warnings, both with the Aion SDK and `-p:AionSdkAvailable=false` |
-| `dotnet test` | 472 passed, 0 failed |
+| `dotnet test` | 495 passed, 0 failed |
 | `smoke.ps1 -Backend phi-silica -Port 5298` | all steps passed, 1 skipped, 5 informational, twice today (before and after the review fixes) |
 | Branches | only `main`, locally and on origin (the chunk 5 branch was deleted after the fast-forward) |
 | GitHub issues | #1 closed by the merge; #2 open (hardware half of chunk 6); #3, #4, #9, #10, #11 open |
@@ -41,6 +41,11 @@ time.
    throwing preflight leaking its context; Codex also found the JSON retry inheriting a cancelled
    token. All fixed with ten tests (D76); the smoke run repeated clean.
 3. Fast-forward merged, updated `CLAUDE.md`, `docs/PLAN.md`, `memory-bank/` and this file.
+4. Later the same day: the README rewritten for chunk 5, a humanizer pass over the docs, the gitleaks
+   allowlist narrowed (docs and the memory bank are scanned; the placeholder attestation format is
+   excused by regex), and an OpenAI conformance pass (D77: required-but-nullable fields written as
+   nulls, `model` required and served-only with a 404 for any other id, schema ranges enforced),
+   reviewed by Codex and merged.
 
 ## Things learned today worth keeping
 
@@ -101,7 +106,7 @@ time.
 ```powershell
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\Phi-Silica-OpenAI
 git status; git log --oneline -3                          # expect main at or after ef29693, tree clean
-dotnet build; dotnet test                                 # expect 472 passed
+dotnet build; dotnet test                                 # expect 495 passed
 .\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 1 skipped, 5 informational
 gh issue list                                             # #2, #3, #4, #9, #10, #11 open
 ```
