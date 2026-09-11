@@ -125,6 +125,7 @@ public class TruncationTests
         var error = JsonDocument.Parse(body).RootElement.GetProperty("error");
         Assert.Equal("context_length_exceeded", error.GetProperty("code").GetString());
         Assert.Contains("Nothing older than the message being answered is left to drop", error.GetProperty("message").GetString(), StringComparison.Ordinal);
+        Assert.False(response.Headers.Contains("x-npu-bridge-truncated-turns"));
         Assert.Empty(fake.Calls);
         Assert.Equal(0, fake.ActiveContexts);
     }
@@ -245,5 +246,167 @@ public class TruncationTests
         var warning = Assert.Single(capture.Records, r => r.Message.Contains("context pressure", StringComparison.Ordinal));
         Assert.Equal(LogLevel.Warning, warning.Level);
         Assert.Contains("950 chars, 92%", warning.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task An_exchange_with_tool_use_is_dropped_whole_so_no_tool_result_is_orphaned()
+    {
+        // Full render is about 414 characters; dropping the first exchange (question, call, result,
+        // answer: four turns) leaves about 197. A 300-character window therefore fits after one drop.
+        var fake = new FakeBackend(new FakeBackendOptions { MaxPromptChars = 300, Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake,
+            options: new BridgeOptions { Backend = BackendKind.Fake, TruncateHistory = true });
+
+        var response = await host.Client.PostAsJsonAsync(Path, new
+        {
+            model = "fake",
+            messages = new object[]
+            {
+                Msg("user", new string('q', 40)),
+                Msg("assistant", new string('c', 40)),
+                new { role = "tool", name = "t", tool_call_id = "c1", content = new string('r', 40) },
+                Msg("assistant", new string('a', 40)),
+                Msg("user", new string('e', 40)),
+                Msg("assistant", new string('f', 40)),
+                Msg("user", "final question"),
+            },
+        });
+
+        Assert.True(response.StatusCode == HttpStatusCode.OK, await response.Content.ReadAsStringAsync());
+        Assert.Equal("4", Assert.Single(response.Headers.GetValues("x-npu-bridge-truncated-turns")));
+        var call = Assert.Single(fake.Calls);
+        Assert.DoesNotContain("qqqq", call.Prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("Tool result", call.Prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("aaaa", call.Prompt, StringComparison.Ordinal);
+        Assert.StartsWith("### Conversation so far\n[User]\neeee", call.Prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_question_still_being_answered_through_tool_results_is_never_truncated()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { MaxPromptChars = 10, Responder = _ => ["never"] });
+        await using var host = await BridgeTestHost.StartAsync(fake,
+            options: new BridgeOptions { Backend = BackendKind.Fake, TruncateHistory = true });
+
+        var response = await host.Client.PostAsJsonAsync(Path, new
+        {
+            model = "fake",
+            messages = new object[]
+            {
+                Msg("user", "question"),
+                Msg("assistant", "calling"),
+                new { role = "tool", name = "t", tool_call_id = "c1", content = new string('r', 100) },
+            },
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Contains("Nothing older than the message being answered", await response.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+        Assert.False(response.Headers.Contains("x-npu-bridge-truncated-turns"));
+        Assert.Empty(fake.Calls);
+        Assert.Equal(0, fake.ActiveContexts);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_throwing_preflight_is_a_502_and_the_context_it_was_asked_about_is_disposed(bool stream)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { PreflightFailure = new InvalidOperationException("com fault"), Responder = _ => ["never"] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync(Path, new { model = "fake", stream, messages = new[] { Msg("user", "hi") } });
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Contains("backend_error", body, StringComparison.Ordinal);
+        Assert.Contains("com fault", body, StringComparison.Ordinal);
+        Assert.Empty(fake.Calls);
+        Assert.Equal(1, fake.ContextsCreated);
+        Assert.Equal(1, fake.ContextsDisposed);
+        Assert.Equal(0, host.Cache.Count);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_throwing_preflight_on_a_cached_context_disposes_that_context_rather_than_losing_it(bool stream)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var first = await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = new[] { Msg("user", "hi") } });
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        Assert.Equal(1, host.Cache.Count);
+
+        fake.Options.PreflightFailure = new InvalidOperationException("com fault");
+        var second = await host.Client.PostAsJsonAsync(Path, new
+        {
+            model = "fake",
+            stream,
+            messages = new[] { Msg("user", "hi"), Msg("assistant", "ok"), Msg("user", "more") },
+        });
+
+        Assert.Equal(HttpStatusCode.BadGateway, second.StatusCode);
+        Assert.Single(fake.Calls);
+        Assert.Equal(1, fake.ContextsCreated);
+        Assert.Equal(1, fake.ContextsDisposed);
+        Assert.Equal(0, fake.ActiveContexts);
+        Assert.Equal(0, host.Cache.Count);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_generation_that_fails_after_truncation_still_carries_the_header(bool stream)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            MaxPromptChars = 250,
+            Responder = _ => ["a"],
+            FailAfterTokens = 0,
+            FailureStatus = GenerationStatus.Error,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake,
+            options: new BridgeOptions { Backend = BackendKind.Fake, TruncateHistory = true });
+
+        var response = await host.Client.PostAsJsonAsync(Path, new { model = "fake", stream, messages = LongConversation() });
+
+        // No delta went out, so on both shapes this is the ordinary 502 with the ordinary headers.
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Equal("4", Assert.Single(response.Headers.GetValues("x-npu-bridge-truncated-turns")));
+        Assert.Single(fake.Calls);
+        Assert.Equal(0, fake.ActiveContexts);
+    }
+
+    [Fact]
+    public async Task A_retry_after_a_cut_starts_with_its_own_cancellation_state()
+    {
+        // The attempt emits five characters, which trips a one-token cap, and then reports the prompt
+        // as too long. The retry must run on a fresh token and be judged on its own status: with the
+        // previous attempt's cancelled token it returned Cancelled at once, and the stale cut flag
+        // turned that into HTTP 200 with empty content and finish_reason "stop".
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Capabilities = NoPreflight,
+            Responder = _ => ["12345"],
+            FailAfterTokens = 1,
+            FailureStatus = GenerationStatus.PromptLargerThanContext,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake,
+            options: new BridgeOptions { Backend = BackendKind.Fake, TruncateHistory = true });
+
+        var response = await host.Client.PostAsJsonAsync(Path, new
+        {
+            model = "fake",
+            max_tokens = 1,
+            messages = new[] { Msg("user", "a"), Msg("assistant", "b"), Msg("user", "c") },
+        });
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Contains("context_length_exceeded", body, StringComparison.Ordinal);
+        Assert.Equal(2, fake.Calls.Count);
+        Assert.Equal(2, fake.ContextsCreated);
+        Assert.Equal(2, fake.ContextsDisposed);
     }
 }

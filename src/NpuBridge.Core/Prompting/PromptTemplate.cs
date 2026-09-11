@@ -86,8 +86,9 @@ public static class PromptTemplate
     /// and nothing else. No system text — the cached context already holds it, whichever placement put
     /// it there — and never the raw pass-through, which exists for the common single-message
     /// <c>curl</c> case and would here hand the model a bare string in the middle of a marked-up
-    /// conversation. System-role messages in <paramref name="tail"/> are ignored: a system message
-    /// after the cached prefix cannot be applied to a context that has already absorbed its own.
+    /// conversation. System-role messages in <paramref name="tail"/> are ignored rather than
+    /// rendered, defensively: the session never passes any (its turns exclude them, and a system
+    /// message anywhere changes the key), so a caller that does is handing over the wrong list.
     /// </summary>
     public static string RenderTail(IReadOnlyList<ChatMessage> tail)
     {

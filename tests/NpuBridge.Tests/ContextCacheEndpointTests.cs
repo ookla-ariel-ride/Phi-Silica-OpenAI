@@ -414,4 +414,29 @@ public class ContextCacheEndpointTests
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         return doc.RootElement.Clone();
     }
+
+    [Fact]
+    public async Task A_hit_on_a_shorter_prefix_renders_the_rest_of_the_history_into_the_tail()
+    {
+        // Only the first exchange is cached; the client then sends two more turns it produced
+        // itself plus a new question. The tail carries an assistant turn, rendered with its marker.
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        await AskAsync(host, stream: false, Msg("user", "one"));
+        await AskAsync(host, stream: true,
+            Msg("user", "one"), Msg("assistant", "ok"), Msg("user", "two"), Msg("assistant", "client-side"), Msg("user", "three"));
+
+        Assert.Equal(1, fake.ContextsCreated);
+        var hit = fake.Calls[1];
+        Assert.Single(hit.History);
+        Assert.Equal(PromptTemplate.RenderTail(
+        [
+            new ChatMessage("user", ChatMessageContent.FromText("two"), null, null),
+            new ChatMessage("assistant", ChatMessageContent.FromText("client-side"), null, null),
+            new ChatMessage("user", ChatMessageContent.FromText("three"), null, null),
+        ]), hit.Prompt);
+        Assert.Contains("[Assistant]\nclient-side", hit.Prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("one", hit.Prompt, StringComparison.Ordinal);
+    }
 }

@@ -823,13 +823,16 @@ answered.** `ConversationSession.Acquire` asks `GetUsablePromptLength` before ge
 with `PromptLengthPreflight` (D55: Phi Silica never says `PromptLargerThanContext`, and asking the
 generation costs 26 s per attempt); a refusal is the same 400 `context_length_exceeded` as before,
 with a message naming the backend, the characters that fit, the transcript size and the switch. With
-`--truncate-history` the session drops turns from the start of the transcript through the first
-assistant turn inclusive — the oldest exchange, tool results included — re-renders, looks the shorter
-transcript up again and re-checks; the final turn is never dropped, so a single over-length question
-is refused with a message saying nothing is left to drop. A checked-out context whose tail does not
+`--truncate-history` the session drops every turn from the start of the transcript up to the next
+user turn — the oldest exchange: the question and everything the model did in answer to it, tool
+calls and results included (amended by D76; the first cut was at the first assistant turn) —
+re-renders, looks the shorter transcript up again and re-checks; the final turn is never dropped, and
+a transcript with no second user turn is the active exchange and is refused with a message saying
+nothing is left to drop. A checked-out context whose tail does not
 fit goes back untouched and the truncated transcript starts afresh. Each drop is a Warning, the
-response carries `x-npu-bridge-truncated-turns: N` (turns, not exchanges), and the log line carries
-`truncated_turns=N`. On a backend without a preflight (Aion) both endpoints retry on a
+response carries `x-npu-bridge-truncated-turns: N` (turns, not exchanges) once a generation is
+attempted on the truncated transcript, whatever it reports (the 400 refusal carries none: no reply
+was produced; D76), and the log line carries `truncated_turns=N`. On a backend without a preflight (Aion) both endpoints retry on a
 `PromptLargerThanContext` status when the session can drop something, disposing the failed context
 first; on the stream this can only happen before the first delta, and if a keep-alive has already
 committed the headers the header cannot be sent and a Warning says so. Aion's actual overflow
@@ -873,3 +876,34 @@ chunk 6 numbers: text contract 0/0, the cut stops the device, both placements ob
 prompt. Note that the preflight's answer differs with the text (13,179 usable here against 13,429 in
 D55 for a different prompt): it is a tokenizer's verdict, not a constant, which is one more reason
 to ask it every time rather than remember a number.
+
+**D76. Chunk 5 review: an exchange ends at the next user turn, a throwing preflight disposes the
+context it was asked about, and each retry attempt owns its cancellation.** Two reviewers (a Claude
+subagent and Codex) read the branch independently and found the same two defects, and Codex a third.
+(a) `TryDropOldestExchange` dropped through the *first assistant turn*, so with tool use the tool
+results and the final answer that followed it survived as an orphaned head: `[user, assistant(calls),
+tool, assistant(answer), user]` lost its question and its call and kept the result. D73 said "tool
+results included" and the code did not do it. An exchange is now every turn up to, not including,
+the next user turn, so a question and everything the model did in answer to it go together, and a
+transcript with no second user turn (a lone question, or a question still being answered through
+tool results) is the active exchange and cannot be truncated. (b) `Acquire` called the preflight on
+a lease it already owned with nothing to release it if the call threw; on Phi Silica that call is a
+raw WinRT call whose guard translates only access-denied, so any other COM fault would have dropped a
+checked-out context from the cache and never disposed it. The call is now guarded and a throw
+disposes the lease (the runtime just faulted against that very context) before propagating as the
+usual 502. The fake gained `PreflightFailure` so both shapes have the test, fresh and cached. (c) On
+the JSON path the linked cancellation source and the `cancelledByCut` flag lived outside the retry
+loop: an attempt that emitted enough text to trip the cut and then reported `PromptLargerThanContext`
+retried on an already-cancelled token, the retry returned `Cancelled` at once, and the stale flag
+called that a successful cut, HTTP 200 with empty content. Both now belong to the attempt, as the
+stream's channel and sink already did, and the TTFT counters reset with them. (d) The truncation
+header is set at the same moment on both shapes: once a generation is attempted on a truncated
+transcript, whatever it goes on to report, so a 502 after truncation carries it; the 400 refusal
+carries none on either shape, because no reply was produced for the dropped turns to describe. The
+JSON path used to set it only on the 200. Both reviewers also noted that at the default
+`--context-window-hint` of 4,096 tokens the pressure warning cannot fire on Phi Silica, whose
+preflight refuses at about 13,400 characters, below nine tenths of the 16,384 the hint implies; the
+default stays (the option is documented as a hint, and the preflight is the measurement) and the
+note is in `docs/FUTURE.md`. Ten tests were added for the branches the reviews named; 472 pass, and the Phi Silica smoke run
+was repeated after the fixes with every step passing (hit TTFT 274 ms against a 417 ms replay; the
+preflight refusal again in 31 ms; the truncated request answered with the header after 16.1 s).

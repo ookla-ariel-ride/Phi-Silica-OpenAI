@@ -101,6 +101,11 @@ public sealed partial class FakeBackend : ILanguageModelBackend
         }
 
         var fake = Own(context);
+        if (_options.PreflightFailure is { } preflightFailure)
+        {
+            throw preflightFailure;
+        }
+
         if (_options.MaxPromptChars is not { } max)
         {
             return prompt.Length;
@@ -375,6 +380,14 @@ public sealed class FakeBackendOptions
     /// finally, standing immediately before the context is disposed — that trips it.
     /// </summary>
     public bool ThrowFromCancellationRegistration { get; set; }
+
+    /// <summary>
+    /// When set, <see cref="FakeBackend.GetUsablePromptLength"/> throws this instead of answering,
+    /// after the context has been validated. The Phi Silica preflight is a raw WinRT call whose
+    /// guard only translates access-denied; any other COM failure propagates, and the context it was
+    /// asked about was already checked out of the cache or freshly created when it did.
+    /// </summary>
+    public Exception? PreflightFailure { get; set; }
 }
 
 /// <summary>What the fake backend saw for one generation.</summary>

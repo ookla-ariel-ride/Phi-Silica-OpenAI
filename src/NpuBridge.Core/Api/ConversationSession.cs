@@ -193,7 +193,20 @@ internal sealed class ConversationSession
                 return ContextAcquisition.Acquired(lease);
             }
 
-            var usable = _prepared.Backend.GetUsablePromptLength(lease.Context, lease.Prompt);
+            // Guarded: the lease is owned here until it is handed back, and the caller's finally
+            // cannot reach a lease it never received. A preflight that throws is a runtime fault
+            // against this very context, cached or fresh, so it is disposed rather than returned.
+            int? usable;
+            try
+            {
+                usable = _prepared.Backend.GetUsablePromptLength(lease.Context, lease.Prompt);
+            }
+            catch
+            {
+                lease.Dispose();
+                throw;
+            }
+
             if (usable is null || usable.Value >= lease.Prompt.Length)
             {
                 return ContextAcquisition.Acquired(lease);
@@ -214,11 +227,15 @@ internal sealed class ConversationSession
 
     /// <summary>
     /// The one place turns are ever dropped, and only <c>--truncate-history</c> reaches it. Removes
-    /// the oldest exchange: the turns from the start of the transcript through the first assistant
-    /// turn, inclusive, so what remains still begins with a user turn and any tool results between
-    /// go with the call they answered. The final turn — the one being answered — is never dropped,
-    /// so a transcript with no assistant turn before it cannot be truncated and this returns false.
-    /// Each drop is logged at Warning.
+    /// the oldest exchange: every turn from the start of the transcript up to, not including, the
+    /// next user turn. An exchange is a user turn and everything the model did in answer to it —
+    /// the assistant reply, and with tool use the assistant's calls, the tool results and the
+    /// assistant's final answer — so what remains still begins with a user turn and no tool result
+    /// is ever left without the call it answered (the boundary at the first assistant turn did
+    /// exactly that; both chunk 5 reviews found it). The final turn is never dropped, and a
+    /// transcript with no second user turn — a single question, or a question whose tool results
+    /// are still being answered — is the active exchange and cannot be truncated: this returns
+    /// false. Each drop is logged at Warning.
     /// </summary>
     public bool TryDropOldestExchange()
     {
@@ -227,22 +244,22 @@ internal sealed class ConversationSession
             return false;
         }
 
-        var firstAssistant = -1;
-        for (var i = 0; i < _turns.Count - 1; i++)
+        var nextUser = -1;
+        for (var i = 1; i < _turns.Count; i++)
         {
-            if (string.Equals(_turns[i].Role, "assistant", StringComparison.Ordinal))
+            if (string.Equals(_turns[i].Role, "user", StringComparison.Ordinal))
             {
-                firstAssistant = i;
+                nextUser = i;
                 break;
             }
         }
 
-        if (firstAssistant < 0)
+        if (nextUser < 0)
         {
             return false;
         }
 
-        var dropped = firstAssistant + 1;
+        var dropped = nextUser;
         _turns = _turns.Skip(dropped).ToList();
         DroppedTurns += dropped;
         _logger.LogWarning(

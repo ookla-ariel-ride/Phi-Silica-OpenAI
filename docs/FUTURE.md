@@ -61,6 +61,13 @@ land here instead of widening the chunk. Each entry says where it came from and 
   without a preflight, on the streaming path, when the verdict takes longer than the first keep-alive
   (about a second). The reply is still right and the Warning says the header was lost. A trailer or
   a chunk extension could carry it; neither is standard for OpenAI clients, so it waits for a need.
+- **The pressure warning cannot fire on Phi Silica at the default hint.** `--context-window-hint`
+  defaults to 4,096 tokens, so the warning threshold is nine tenths of 16,384 characters; the
+  preflight refuses at about 13,400 (D55, D75), below that. Both chunk 5 reviewers noted it. The
+  warning is real on a backend without a preflight (Aion) and for any hint set below the measured
+  window; the default stays because the option is a hint of the model's advertised size and the
+  preflight is the measurement. Lowering the default to about 3,300 tokens would make the warning
+  fire first on Phi Silica, at the cost of a number that looks wrong next to the model's own.
 - **Eviction disposes on the storing request's thread.** A runtime `Dispose` that blocks would
   delay that request's final bytes. Not observed on Phi Silica; noted so a future slow disposal is
   looked for here first.

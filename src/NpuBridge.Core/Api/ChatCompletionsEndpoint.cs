@@ -94,10 +94,6 @@ internal sealed class ChatCompletionsEndpoint
         var limits = prepared.Limits;
         var session = new ConversationSession(prepared, cache, options, logger);
 
-        // Cancelled either by the client going away or by the client-side cut deciding it has enough
-        // text. Only the latter needs a source of the handler's own; the former arrives through the link.
-        using var generationCts = CancellationTokenSource.CreateLinkedTokenSource(http.RequestAborted);
-
         ContextLease? lease = null;
         try
         {
@@ -129,6 +125,24 @@ internal sealed class ChatCompletionsEndpoint
                 }
 
                 lease = acquisition.Lease!;
+
+                // Once a generation is attempted on a truncated transcript the header says so, whatever
+                // that generation goes on to report -- the same moment the streaming path sets it. A
+                // refusal above carries none: no reply was produced for the dropped turns to describe.
+                // Re-applied on a retry, so a later drop updates the count; the JSON result executes
+                // after this method returns, so the headers are still open.
+                session.ApplyTruncationHeader(http.Response);
+
+                // Everything an attempt cancels with, or learns from its own deltas, belongs to that
+                // attempt. A retry after a cut used to inherit the cancelled token and the cut flag, so
+                // the retried generation returned Cancelled at once and the stale flag reported that as
+                // a successful cut: HTTP 200, empty content, finish_reason "stop". Cancelled either by
+                // the client going away or by the client-side cut deciding it has enough text; only the
+                // latter needs a source of the handler's own, the former arrives through the link.
+                using var generationCts = CancellationTokenSource.CreateLinkedTokenSource(http.RequestAborted);
+                cancelledByCut = false;
+                callbacks = 0;
+                firstTokenTicks = 0;
 
                 // Watches the text as it arrives purely to decide when to stop the generation early; the
                 // authoritative cut is applied below to the text the backend finally reports, with the
@@ -310,7 +324,6 @@ internal sealed class ChatCompletionsEndpoint
                 result.Status.ToString(), finishReason, StatusCodes.Status200OK, totalMs,
                 cache: cacheLabel, tailTurns: lease.TailTurns, truncatedTurns: session.DroppedTurns);
 
-            session.ApplyTruncationHeader(http.Response);
             return Results.Json(body, JsonDefaults.Options);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
