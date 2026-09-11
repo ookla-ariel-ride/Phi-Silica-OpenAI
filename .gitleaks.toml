@@ -16,8 +16,9 @@ useDefault = true
 [[rules]]
 id = "npu-bridge-laf-token"
 description = "Phi Silica LAF unlock token assigned in code or config"
-# Matches: laf-token / laf_token / LafToken / NPU_BRIDGE_LAF_TOKEN followed by a quoted or bare value.
-regex = '''(?i)(npu_bridge_laf_token|laf[-_]?token)\s*[:=]\s*["']?([A-Za-z0-9+/=_\-]{12,})["']?'''
+# Matches: laf-token / laf_token / LafToken / NPU_BRIDGE_LAF_TOKEN followed by a quoted or bare value,
+# including the JSON form "LafToken": "..." where a closing quote sits between the key and the colon.
+regex = '''(?i)(npu_bridge_laf_token|laf[-_]?token)["']?\s*[:=]\s*["']?([A-Za-z0-9+/=_\-]{12,})["']?'''
 secretGroup = 2
 keywords = ["laf_token", "laf-token", "laftoken", "NPU_BRIDGE_LAF_TOKEN"]
 
@@ -48,10 +49,11 @@ keywords = ["pfxpassword", "pfx_password", "pfx-password", "certpassword", "Conv
 
 [allowlist]
 description = "Global allowlist"
+# Deliberately narrow: docs and the memory bank are scanned like everything else, and the placeholder
+# attestation *format* they quote is excused by the regex allowlist below, never by path. A real
+# secret pasted into a note must still fail the scan.
 paths = [
   '''(^|/)\.gitleaks\.toml$''',
-  '''(^|/)docs/PLAN\.md$''',          # contains the documented attestation *format*, not a real one
-  '''(^|/)memory-bank/.*\.md$''',
   '''(^|/)bin/''',
   '''(^|/)obj/''',
 ]
