@@ -27,6 +27,16 @@ land here instead of widening the chunk. Each entry says where it came from and 
   Instruct only. When it lands it needs a `ToolCalling` capability that bypasses chunk 7's emulation and
   a per-backend context-window hint. Tracked as a GitHub issue.
 
+## 2026-09-11 test coverage audit
+
+Three subagent audits (options against tests, the uncovered lines of a coverlet report, the smoke
+script) on the day chunk 5 merged. Core: 94.2 % lines, 89.8 % branches over 496 tests; the exe
+project has no unit coverage by construction. The findings are work items: the unit and TestServer
+gaps, the smoke script's vacuous steps and missing hardware checks, and a CI job that runs the exe
+with the fake backend (blocked on an ARM64 runner). See the three `tech-debt` and `enhancement`
+issues filed that day. `coverlet.collector` is now in the test project; run
+`dotnet test --collect:"XPlat Code Coverage"` for the report.
+
 ## Chunk 5 deferrals (context cache and overflow handling)
 
 - **After a truncation, the next request in that conversation pays refused preflight rounds before it
