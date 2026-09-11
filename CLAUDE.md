@@ -40,15 +40,20 @@ pipeline is written once — `Api/GenerationPipeline.cs` holds the shared `Delta
 guarded cancel and raw-output log, and `GenerationOutcome` beside `GenerationFailure` decides
 failure/filtered/content for both shapes, so the D56 and D57 drifts cannot recur;
 `FakeBackendOptions.StartGate` replaced `StartDelay` and the last three wall-clock races with it;
-655 tests, and the smoke run reproduced D80's numbers exactly). Issues #14, #15 and #17 stay open for
-their remaining items. Next is chunk 7 (tool-call emulation, issue #3). The repository is
+655 tests, and the smoke run reproduced D80's numbers exactly) and D82 (issue #10, closed: the JSON
+path's catch is the streaming path's pair, so a cancellation that is not the client's is a 502 with
+the ordinary body rather than a bare 500; `SseStream.Started` is the response's `HasStarted`, which
+turned out to be a simplification rather than the bug it was filed as; `identity.ps1 -Install` adds
+before it removes, so a failed install no longer leaves nothing registered; 657 tests). Issues #14,
+#15, #17 and #19 stay open for their remaining items. Next is chunk 7 (tool-call emulation, issue
+#3). The repository is
 `ookla-ariel-ride/npu-bridge`; the local folder keeps its old name because package identity is
 registered against the build path.
 All four defects from the 2026-09-10 code review (#5 to #8) are fixed and merged (D62 to D65). The
 Insider flight to build 29661 broke Phi Silica and was rolled back to 29648; if it is offered again,
 expect the same (workload packages fail to register, model `NotReady`). An empty
 `Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'` listing is not proof of breakage on 29648;
-`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D81 so
+`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D82 so
 far); `docs/FUTURE.md` holds deferred work. Update both whenever a chunk changes a choice or defers
 something.
 

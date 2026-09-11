@@ -1,15 +1,16 @@
 # Active Context: npu-bridge
 
-_Last updated: 2026-09-11, latest (D81 one post-generation pipeline merged, issue #9 closed; chunk 7
-next)_
+_Last updated: 2026-09-11, latest (D82 the three 2026-09-10 review notes merged, issue #10 closed;
+chunk 7 next)_
 
 ## Where we are
-Chunks 1 to 6 are merged on `main` (`9c646ec`). Today added chunk 5 (context cache and overflow
+Chunks 1 to 6 are merged on `main` (`43457c0`). Today added chunk 5 (context cache and overflow
 handling, D71 to D76), the OpenAI conformance pass (D77), D78, which closed issue #12 without a
 change, D79, the test hardening from the coverage audit (issue #15's first three smoke items
 and issue #14's first six tests), and D80, real token counts (issue #13 closed): `usage` and the
 `max_tokens` budget are Phi-3 tokens on Phi Silica, the preflight's byte answer is converted, chars/4
-stays on Aion and the fake. D81 then wrote the post-generation pipeline once, closing issue #9.
+stays on Aion and the fake. D81 then wrote the post-generation pipeline once, closing issue #9, and
+D82 took the three low-severity notes from the 2026-09-10 review, closing issue #10.
 Chunk 6, the Aion Instruct Preview adapter, is merged but code-verified only: build 29648
 never appends `WIN://SYSAPPID` for a main-package dynamic dependency, so the Qualcomm QNN provider
 cannot be image-mapped and no Aion generation has ever run here (D70; issue #2 open). Only `main`
@@ -21,13 +22,14 @@ Aion Instruct ships as a model swap behind the Phi Silica API (Microsoft's Phi S
 Feature Rollout with a registry key, retail in November with Phi Silica removed, no LAF token.
 `PhiSilicaBackend` is therefore the production Aion path. Details in `techContext.md`.
 
-655 tests pass. `scripts/smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648,
+657 tests pass. `scripts/smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648,
 including four teardown rows (main server plus three auxiliary servers) and the D80 tokenizer step
 (3581 / 3543 / 3581 tokens at the fox, JSON and CJK boundaries); the D81 run returned every one of
 those numbers again on the refactored pipeline, which the unit suite cannot check because it never
-sees a real backend. `/healthz` is the readiness check, not the package list. The model runtime can
-fail its RPC channel on the first generation after start (seen twice now, 2026-09-11); the re-run is
-clean.
+sees a real backend, and the D82 run is what says the reordered `identity.ps1 -Install` still grants
+identity, since the run relaunches through package activation. `/healthz` is the readiness check,
+not the package list. The model runtime can fail its RPC channel on the first generation after start
+(seen twice now, 2026-09-11); the re-run is clean.
 
 ## What today built
 - Chunk 5: `ConversationKey` (a length-prefixed encoding of `(system, turns)`, never the rendered
@@ -79,6 +81,20 @@ clean.
   slot, which ends the last three wall-clock races. Nothing a client can observe changed. Codex's
   catch: the rewritten first-delta wait preferred a stale timeout over a delta that had just landed,
   which on a preflight-less backend would turn an over-length 400 into an SSE error event.
+- D82 (issue #10): the three low-severity notes from the 2026-09-10 review. `ChatCompletionsEndpoint`
+  now carries the streaming path's pair of catch clauses exactly — one filtered on `RequestAborted`
+  that returns nothing and logs `http=0`, then an unfiltered one through `GenerationFailure` — so a
+  cancellation that is not the client's is a 502 with the ordinary body instead of a bare 500 that
+  matched no clause; one test per clause, each checked to fail against the old
+  `when (ex is not OperationCanceledException)`. `SseStream.Started` is the response's `HasStarted`,
+  which is a simplification and not the fix the note asked for: `WriteAsync` starts the response
+  before it writes a byte, so the old flag was right about a failing write, and the two answers part
+  only when starting the response is itself what fails (D82 says so; do not re-file it).
+  `identity.ps1 -Install` adds before it removes, so the successful path has no window with nothing
+  registered; `Add-AppxPackage` updates a same-identity registration in place, so a re-run after a
+  rebuild removes nothing at all, and remove-then-add survives as a fallback for a refused in-place
+  update. The review's catch was in the test, not the code: see `systemPatterns.md` on why a
+  disconnect never reaches either clause. Two `identity.ps1` defects went out as #19.
 - The README rewritten for chunk 5 and validated again (real layout, two Mermaid diagrams, a
   references section, no contributing section); a humanizer pass over the docs; the gitleaks path
   allowlists for docs removed (notes are scanned; a full-history scan is clean). After D79 the
@@ -97,6 +113,13 @@ clean.
 - Issue #17: `BackendCapabilities.Cancellation` is advertised by `PhiSilicaBackend` and read by
   nobody. Report it on `/healthz`, read it in the fake, or drop it; split out of #9 because that was
   a no-behaviour-change consolidation.
+- Issue #19: two `identity.ps1` defects from the D82 review, both unreachable while the manifest
+  stays at 0.1.0.0. `Get-RegisteredPackage` sorts `Version` as the string it is, so `0.9.0.0`
+  outranks `0.10.0.0` and a bump can leave two registrations; and the superseded removal is
+  unguarded under `$ErrorActionPreference = 'Stop'`, so if a bump replaces the registration rather
+  than adding to it, the removal fails "not found" and kills the script after the install succeeded.
+  D82's reordering is what made the first of those load-bearing. Doing the issue means bumping the
+  manifest and measuring what a bump actually leaves registered.
 - D80 leftovers (`docs/FUTURE.md`): the pressure warning still measures characters against the hint
   × 4; Aion keeps chars/4 until a generation runs there; when Aion Instruct arrives behind the Phi
   Silica API, run the smoke's tokenizer step before trusting the counter for that model.
@@ -115,9 +138,9 @@ clean.
 - Do not re-investigate the Aion blocker on this machine (D70).
 
 ## How to resume
-1. Read `CLAUDE.md`, then `docs/SESSION-HANDOFF.md`, then `docs/DECISIONS.md` D71 to D81 and the
+1. Read `CLAUDE.md`, then `docs/SESSION-HANDOFF.md`, then `docs/DECISIONS.md` D71 to D82 and the
    chunk 5 section of `docs/FUTURE.md`.
-2. `dotnet build; dotnet test` (655). `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298` should
+2. `dotnet build; dotnet test` (657). `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298` should
    pass every step (1 skipped, 5 informational). Do not build while a smoke server is running.
 3. Chunk 7 (issue #3). Read the issue and its comments before starting, and D81 for the pipeline it
    plugs into.

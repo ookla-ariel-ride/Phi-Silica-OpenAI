@@ -12,7 +12,7 @@ machine; the NPU is here.
   version-constants source) + CsWinRT 2.3.1 (direct) + `Microsoft.Windows.SDK.BuildTools` 10.0.26100.4948
   (makeappx/signtool; also used by `identity.ps1`). CsWinRT reads Windows metadata from the
   `Microsoft.Windows.SDK.NET.Ref` 10.0.26100.57 NuGet, so no Windows SDK install is needed.
-- Tests: xunit 2.9.3, `Microsoft.AspNetCore.TestHost` 10.0.11. 655 tests, about 1 s.
+- Tests: xunit 2.9.3, `Microsoft.AspNetCore.TestHost` 10.0.11. 657 tests, about 1 s.
 - `Microsoft.ML.Tokenizers` 2.0.0 is Core's one package reference (D80); it pulls `Google.Protobuf`.
   `LlamaTokenizer.Create(stream, addBeginOfSentence: false)` over the embedded Phi-3.5-mini
   `tokenizer.model` (499,723 bytes, sha256 `9e556afd…8347`, MIT, `src/NpuBridge.Core/Tokenizers/Phi3/`).

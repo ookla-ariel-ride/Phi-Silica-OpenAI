@@ -68,6 +68,10 @@ so those tools can run fully local, offline, and free.
   on 2026-09-11); the request is a 502 `backend_error`, every later request in that process fails
   the same way, and a restart clears it. The bridge does not recreate the model on its own yet
   (`docs/FUTURE.md`). The README tells users this.
+- A failure during a generation always reaches the client in the OpenAI error body: as an HTTP
+  status while the response has not begun, as a `data: {"error":...}` event once it has. Since D82
+  that covers a cancellation the client did not cause, which the non-streaming shape used to let
+  escape as a bare 500 with no body while the streaming shape answered 502 (issue #10).
 - The smoke script is the user-facing statement of what "works on hardware" means: since D79 it
   fails when a Phi Silica server is ready without identity, when the preflight answers nothing, or
   when the relaunched child or the port outlives a stop.

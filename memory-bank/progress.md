@@ -3,8 +3,9 @@
 ## Works today (verified)
 | Area | Status | Evidence |
 |---|---|---|
-| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; 655 xunit tests green (chunk 5, the D77 conformance pass, D78, the D79 test hardening, D80 real token counts and the D81 shared pipeline merged 2026-09-11) |
+| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; 657 xunit tests green (chunk 5, the D77 conformance pass, D78, the D79 test hardening, D80 real token counts, the D81 shared pipeline and the D82 review notes merged 2026-09-11) |
 | One post-generation pipeline for both shapes | ✅ | D81: `Api/GenerationPipeline.cs` (`DeltaSink`, `CutWatcher`, `CancelGuardedAsync`, the raw-output log) and `GenerationOutcome` beside `GenerationFailure`; `GenerationOutcomeTests` pins every status crossed with the handler's own cancel, so the D56 and D57 drifts between the two hand-written copies cannot recur. No client-visible change: the smoke run on the NPU returned D80's numbers exactly |
+| A cancellation that is not the client's | ✅ | D82: the JSON path's catch is the streaming path's pair exactly — one clause filtered on `RequestAborted` that logs `http=0` and returns nothing, then an unfiltered one through `GenerationFailure` — so a backend that lets the runtime's own cancellation escape is answered with 502 and the ordinary error body instead of an unhandled 500. `ChatCompletionsTests` has one test per clause, each checked to fail against the old `when (ex is not OperationCanceledException)` filter |
 | Token counts (`usage`, `max_tokens`) | ✅ | D80: Phi-3 tokens on Phi Silica (`Phi3TokenCounter` over the vendored Phi-3.5-mini model, measured against the runtime's preflight: 3581 tokens at every ASCII boundary), chars/4 on Aion and the fake; `TokenCounterTests`, `TokenUsageTests`, `TokenBudgetCutTests`, `DebugTokenizeTests`; the smoke's tokenizer step repeats the measurement per build (fails above 2 % spread) |
 | Preflight units | ✅ | D80: `GetUsablePromptLength` answers in UTF-8 bytes, converted by `Utf8Offsets`; before the fix a 5,001-char CJK prompt at 1.6 × the window passed the preflight |
 | `/healthz`, `/v1/models`, `/v1` fallback | ✅ | TestServer tests + live curl on the exe; `/healthz` carries identity, cache counters (D74), keep-alive timings (D79) and backend diagnostics, and a test pins that the registered options, not defaults, are reported |
@@ -12,7 +13,7 @@
 | Config precedence json < local < env < CLI | ✅ | real-file test + live probes |
 | CLI verbs `run`, `service`, `task`, `help`, `version` | ✅ | tests + live exit codes |
 | Fake backend with faults/threads/init rules | ✅ | tests |
-| Sparse package identity (`identity.ps1`) | ✅ | registered; PFN `NpuBridge_jtas4mnxdyzpe` |
+| Sparse package identity (`identity.ps1`) | ✅ | registered; PFN `NpuBridge_jtas4mnxdyzpe`. Since D82 `-Install` adds before it removes, so the successful path never leaves the machine unregistered; verified by re-running it over the live registration, which removed nothing because `Add-AppxPackage` updates a same-identity registration in place |
 | Self-relaunch via package activation + supervision | ✅ | child had identity, saw shell env, died with the parent |
 | Phi Silica adapter (experimental SDK) | ✅ | smoke passed 2026-09-11 on build 29648 (generate, preflight, system prompt, disconnect drain, text contract: `text_mismatches=0 late_deltas=0`, D65). Insider flight 29661 broke it on 2026-09-10 (workload packages fail to register, model `NotReady`); rolled back |
 | `/v1/chat/completions` non-streaming | ✅ | `ChatCompletionsTests`; smoke on the real NPU: 415 ms to 453 ms for a one-word reply on 2026-09-11 (677 ms to 899 ms in earlier runs), correct shape and usage |
@@ -52,6 +53,11 @@
   reached only through the endpoint suites (#14).
 - `BackendCapabilities.Cancellation` is advertised by `PhiSilicaBackend` and the fake's default and
   read by nothing: no endpoint branches on it, `/healthz` omits it, no test asserts it (#17).
+- `identity.ps1` is not ready for a version bump (#19): `Get-RegisteredPackage` sorts `Version` as a
+  string, so `0.9.0.0` outranks `0.10.0.0` and a bump can leave two registrations, and the
+  superseded removal is unguarded under `$ErrorActionPreference = 'Stop'`, so a bump that replaces
+  the registration kills the script after the install has succeeded. Neither is reachable at
+  0.1.0.0; D82's add-before-remove is what made the first one decide anything.
 - Experimental Windows App SDK channel in use (no LAF token); APIs may change between releases.
 - Phi Silica returns multi-token progress chunks → callback-based token counts undercount by roughly
   2.3x to 3x; `usage` used `ceil(chars/4)` on both sides (D44) until D80 replaced it with the Phi-3
@@ -89,7 +95,8 @@
   went to `docs/FUTURE.md`'s chunk 4 section. Fast-forward merged to `main` on 2026-09-07.
 - 2026-09-10 whole-project review: the state docs (`CLAUDE.md`, `PLAN.md`, the handoff, this folder)
   still described chunk 4 as unmerged; fixed. Added the build-and-test workflow. Three low-severity
-  code notes were filed in `docs/FUTURE.md` rather than fixed.
+  code notes were filed in `docs/FUTURE.md` rather than fixed; they became issue #10 and were taken
+  on 2026-09-11 as D82.
 - Chunk 6 (2026-09-11): built in a forked subagent; a Claude subagent review and a Codex review found
   the same drain-on-exception and late-delta gaps in both adapters (D69), applied before the merge.
 - Chunk 5 (2026-09-11): built in-session on `chunk-5-context-cache` with 462 tests, then the Phi
@@ -129,3 +136,14 @@
   comment rather than pinning. 655 tests, the NPU run reproduced D80's numbers. Fast-forward merged;
   #9 closed. `BackendCapabilities.Cancellation` went out as #17 and the missing `DeltaSink` and
   `CutWatcher` unit tests onto #14.
+- D82 (2026-09-11, branch `fix/issue-10-review-notes`): the three low-severity notes from the
+  2026-09-10 whole-project review, issue #10. One was a real defect (the JSON path's escaping
+  non-client cancellation), one was wrong about its own premise (`SseStream.Started`; the change
+  stands as a simplification and `docs/FUTURE.md` says not to re-file it), and one was a script
+  ordering fix nobody had hit (`identity.ps1 -Install`). The adversarial review found the bug in the
+  branch's own test rather than in its code: the client-gone test never reached the clause it named,
+  because a disconnect returns `Cancelled` instead of throwing, so it passed identically against the
+  old filter; it now holds `CancellationGate` shut, parks the responder inside `MoveNext` and asserts
+  the exception name on the `http=0` line, fails without the clause, and was stable over eight runs.
+  The same review produced #19. 657 tests, the NPU smoke run passed afterwards. Fast-forward merged;
+  #10 closed from the commit, whose "Filed rather than fixed: #19" line also closed #19 by accident.

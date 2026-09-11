@@ -2,7 +2,7 @@
 
 OpenAI-compatible HTTP endpoint over the Copilot+ PC on-device language model (Phi Silica today,
 Aion Instruct Preview next). Status: **signed off (§4); chunks 1 to 6 of 8 built and merged (6 code-verified only, D70);
-chunk 7 next (real token counts landed as D80, the shared post-generation pipeline as D81).** This document is the historical design record and is not updated to match the code as it
+chunk 7 next (real token counts landed as D80, the shared post-generation pipeline as D81, the 2026-09-10 review notes as D82).** This document is the historical design record and is not updated to match the code as it
 ships — current state lives in `memory-bank/progress.md`, and decisions made since sign-off are in
 `docs/DECISIONS.md`.
 

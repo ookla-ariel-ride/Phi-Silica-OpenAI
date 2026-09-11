@@ -1,25 +1,28 @@
-# Session handoff, 2026-09-11, after the D81 merge
+# Session handoff, 2026-09-11, after the D82 merge
 
-Supersedes the handoff written after the D80 merge earlier today (in git history). Everything
+Supersedes the handoff written after the D81 merge earlier today (in git history). Everything
 below was verified at write time.
 
 ## Where things stand
 
-- `main` is at or after `9c646ec`, tree clean, in sync with origin. The repository is
+- `main` is at or after `43457c0`, tree clean, in sync with origin. The repository is
   `ookla-ariel-ride/npu-bridge` (renamed today; the old `Phi-Silica-OpenAI` URL redirects). The local
   folder keeps its old name on purpose: package identity is registered against the build path, and
   renaming it means `identity.ps1 -Install` again.
 - Chunks 1 to 6 are merged. Chunk 5 (context cache and overflow, D71 to D76), the OpenAI
   conformance pass (D77), D78 (issue #12 closed without a change), D79 (test hardening from the
-  coverage audit), D80 (real token counts, issue #13) and D81 (one post-generation pipeline for both
-  response shapes, issue #9) all landed today. Chunk 6 stays code-verified only (D70; issue #2 open).
-- 655 tests pass. `smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648 on the
+  coverage audit), D80 (real token counts, issue #13), D81 (one post-generation pipeline for both
+  response shapes, issue #9) and D82 (the three 2026-09-10 review notes, issue #10) all landed
+  today. Chunk 6 stays code-verified only (D70; issue #2 open).
+- 657 tests pass. `smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648 on the
   final `main` code: four teardown rows, and the D80 numbers unchanged by the D81 refactor
   (`prompt_tokens` 41 / `completion_tokens` 2 on both shapes, 3581 tokens at the fox and CJK
   preflight boundaries, the eight-token cut streaming 31 characters with `finish=length`, a cache
-  hit on the continuation, `text_mismatches=0`, `late_deltas=0`).
-- Open issues: #2, #3, #4, #10, #11, #14, #15, #16, #17. Closed today: #1, #9, #12, #13. Progress on
-  #14 and #15 is recorded in comments on each.
+  hit on the continuation, `text_mismatches=0`, `late_deltas=0`). It was run again after D82, which
+  is what says the reordered `identity.ps1 -Install` still grants identity: the run relaunches
+  through package activation and reports `identity=True`.
+- Open issues: #2, #3, #4, #11, #14, #15, #16, #17, #19. Closed today: #1, #9, #10, #12, #13.
+  Progress on #14 and #15 is recorded in comments on each.
 
 ## What this session did, in order
 
@@ -96,6 +99,21 @@ below was verified at write time.
     read by nobody, went out as #17; the missing unit tests for `DeltaSink` and `CutWatcher` went on
     #14. Fast-forward merged, #9 closed from the commit, then `CLAUDE.md`, `docs/PLAN.md`, this file
     and the memory bank.
+11. D82 on the branch `fix/issue-10-review-notes`, issue #10: the three low-severity notes from the
+    2026-09-10 review, taken now because two of them live in the endpoint files D81 had just
+    rewritten. The JSON path's catch is the streaming path's pair exactly, so a cancellation that is
+    not the client's is a 502 with the ordinary error body instead of a bare 500 with no envelope;
+    one test per clause, each checked to fail against the old filter. `SseStream.Started` is the
+    response's `HasStarted`, but the note's premise was wrong — `WriteAsync` starts the response
+    before it writes a byte, so the old flag was right about a failing write — which makes it a
+    simplification and not a fix; D82 and `docs/FUTURE.md` both say so, do not re-file it.
+    `identity.ps1 -Install` adds before it removes, so the successful path no longer has a window
+    with nothing registered; the fallback still retries remove-then-add for any add failure, so an
+    expired certificate or a bad manifest ends where it always did. The adversarial review found a
+    bug in one of the new tests (see "Things learned"). Filed rather than fixed: #19, two
+    `identity.ps1` defects a version bump would reach. 657 tests, the smoke run passed afterwards.
+    Fast-forward merged; #10 closed from the commit, which also closed #19 by accident — GitHub read
+    the message's "Filed rather than fixed: #19" as a closing keyword — and it was reopened.
 
 ## Decisions the owner made today
 
@@ -115,32 +133,30 @@ below was verified at write time.
 
 ## Do this next
 
-1. Chunk 7 (issue #3), the work order's next item. `ChatMessage.ToolCalls` is carried and keyed;
-   rendering the model its own protocol, computing the stored key from the parsed calls, and
-   buffering with keep-alives are the chunk's job. Structured JSON output (2.4.x stable) is the
-   design option on the issue. Three things D81 leaves for it: the buffered path calls
+1. Chunk 7 (issue #3), the work order's next item, with none of the small cleanups left in front of
+   it. `ChatMessage.ToolCalls` is carried and keyed; rendering the model its own protocol, computing
+   the stored key from the parsed calls, and buffering with keep-alives are the chunk's job.
+   Structured JSON output (2.4.x stable) is the design option on the issue. Three things D81 leaves
+   for it: the buffered path calls
    `GenerationOutcome.Classify(result, cancelledByCut)` instead of telling failure, filtered and
    content apart for itself; it supplies the cut's post-flush verdict as an argument, because the
    classifier deliberately reads no cutter (when that verdict is legible differs by shape, D57); and
    `DeltaSink`'s destination is a `ChannelWriter<string>` or a `CutWatcher`, never a delegate, so a
    buffering path cannot smuggle the response onto the backend's callback thread. A path that wants
    both destinations adds a third factory and decides their order there.
-2. Issue #10 if a small item is wanted before the chunk: the three low-severity notes from the
-   2026-09-10 review (the JSON path's escaping non-client cancellation, `SseStream.Started` flipping
-   before the first write succeeds, `identity.ps1 -Install` deregistering before it registers). Two
-   of the three land in `ChatCompletionsEndpoint` and `ChatCompletionsStreamEndpoint`, the files D81
-   just rewrote, so they are cheaper now than after chunk 7 grows them again.
-3. Issues #14 and #15 whenever there is an hour to spend: #14's items 7 to 12 plus its "move into
+2. Issues #14 and #15 whenever there is an hour to spend: #14's items 7 to 12 plus its "move into
    Core", "make injectable" and "delete or mark" sections, #15's items 4 to 9 and the manual
    checklist. Each issue carries a comment saying exactly what landed and what each test does and
    does not pin; #14's newest comment is the D81 gap, `DeltaSink` and `CutWatcher` hoisted into Core
    without unit tests of their own. #17 is the same size and needs a choice first: report
-   `BackendCapabilities.Cancellation` on `/healthz`, read it in the fake, or drop it.
-4. When a Windows build with Aion Instruct behind the Phi Silica API arrives: `smoke.ps1 -Backend
+   `BackendCapabilities.Cancellation` on `/healthz`, read it in the fake, or drop it. #19 only bites
+   at the first version bump of the package, and its definition of done is to bump the manifest and
+   measure what a bump leaves registered rather than assume it.
+3. When a Windows build with Aion Instruct behind the Phi Silica API arrives: `smoke.ps1 -Backend
    phi-silica` under the registry key, re-check D31, decide the fate of the preview adapter. Run the
    tokenizer step before trusting the Phi-3 counter for that model. When any Aion generation runs,
    re-check the status-driven overflow path (D73) and measure its tokenizer the way D80 did.
-5. Undecided, waiting on the owner: whether the runtime RPC fault deserves a `bug` issue and a
+4. Undecided, waiting on the owner: whether the runtime RPC fault deserves a `bug` issue and a
    recreate-the-model fix, or stays a documented surprise (`docs/FUTURE.md`, README).
 
 ## Things learned today worth keeping
@@ -191,6 +207,19 @@ below was verified at write time.
 - A gate only orders what happens after it, so check where one sits before reusing it.
   `FirstTokenGate` is held behind the prompt-length verdict and cannot hold a test at "the verdict
   has not landed yet"; that needed a new `StartGate` in front of the verdict.
+- A client disconnect does not reach either endpoint's catch clauses at all. Both real adapters and
+  the fake *return* `Cancelled` rather than throwing, as the `ILanguageModelBackend` contract
+  requires, so a disconnect lands on the status check inside the `try`; a test that names the thrown
+  form therefore passes without ever reaching it, which is how D82's first draft passed against the
+  filter it was meant to fail against. Arranging a real throw takes `CancellationGate` held shut so
+  the generation ignores its token, plus a responder that parks inside `MoveNext`. No gate can do
+  that park, because every gate in the fake awaits with the caller's token and answers the cancel
+  with a `Cancelled` status, and the release cannot wait for the client's own task to throw, because
+  TestServer does not complete that task while the handler is parked.
+- `Add-AppxPackage` updates a registration of the same identity in place, which is what every
+  `identity.ps1 -Install` after a rebuild is, so the reordered script removes nothing on that path.
+- GitHub reads "fixed: #19" as a closing keyword wherever it appears in a commit message, so
+  "Filed rather than fixed: #19" closed the issue it was filing. Spell such a line without a keyword.
 - Deduplicating test helpers surfaced an expectation that had been passing on a coincidence: the
   cache's `prompt_tokens` test counted `"sys" + prompt` as one string, while the bridge counts the
   prompt and the native system text separately, and chars/4 makes those agree unless the prompt's
@@ -225,6 +254,9 @@ below was verified at write time.
   `IAsyncEnumerable<string>` responder redesign issue #9 sketched for `FakeBackend` was deliberately
   not built — each knob models a distinct runtime behaviour, and replacing them churns every test
   that sets `Responder`.
+- `SseStream.Started` is the response's `HasStarted` and the note that asked for the change was
+  wrong about why (D82): a write that fails has already started the response, so the old flag was
+  right about that case. Do not re-file it as a defect.
 - Work happens on a branch and fast-forward merges after a review; after the merge, update this
   file, `CLAUDE.md`, `docs/PLAN.md` and `memory-bank/` in the same session.
 
@@ -232,8 +264,8 @@ below was verified at write time.
 
 ```powershell
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\Phi-Silica-OpenAI
-git status; git log --oneline -3                          # expect main at or after 9c646ec, tree clean
-dotnet build; dotnet test                                 # expect 655 passed
+git status; git log --oneline -3                          # expect main at or after 43457c0, tree clean
+dotnet build; dotnet test                                 # expect 657 passed
 .\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 1 skipped, 5 informational
-gh issue list                                             # #2, #3, #4, #10, #11, #14, #15, #16, #17 open
+gh issue list                                             # #2, #3, #4, #11, #14, #15, #16, #17, #19 open
 ```

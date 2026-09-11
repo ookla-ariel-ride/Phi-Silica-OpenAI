@@ -22,7 +22,7 @@ rather than in a `Context/` folder; `Tools/` (tool-call emulation, chunk 7) does
 streaming lives in `Api/ChatCompletionsStreamEndpoint` beside the JSON shape, not in a separate folder. `AionBackend`
 compiles only when `nuget-local/` holds the Aion nupkg (`AionSdkAvailable`, D66); CI builds without it.
 
-## Request flow (as built through chunk 5 and D81, 2026-09-11)
+## Request flow (as built through chunk 5, D81 and D82, 2026-09-11)
 `ChatRequestPreparer` does the shared part for both shapes, in order: parse the JSON body (malformed
 body → 400, no context created) → validate the DTO against what the deserializer can actually produce,
 not just what the type declares (400 on failure, no context created) → check the backend is `Ready`
@@ -46,6 +46,11 @@ concurrent requests for one conversation never share a context: the second misse
 between the shapes after the classifier is only what they write: `completion_tokens` is
 `TokensCovering` over the text the cutter released on the stream and over the content about to be
 written on the JSON shape (D80), so each assembles its own usage through `CompletionUsage.For`.
+An exception out of any of that meets the same two catch clauses on both shapes, in the same order:
+one filtered on `http.RequestAborted`, which logs `http=0` and hands back nothing because there is
+nobody to answer, then an unfiltered one that reports through `GenerationFailure` (D82). The pair is
+exhaustive on purpose — the JSON shape used to exclude `OperationCanceledException` from the second,
+so a cancellation that was not the client's matched no clause and became a bare 500.
 
 ## Conventions this chunk established
 - **Validate what the deserializer can produce, not just what the type says.** `System.Text.Json` will
@@ -115,7 +120,7 @@ written on the JSON shape (D80), so each assembles its own usage through `Comple
 (`MaxPromptChars`), and full call recording (`Calls`, per-context `History`). Tests that pass against
 it should not pass vacuously on the NPU.
 
-## Test conventions (D43, D54, D79, D81)
+## Test conventions (D43, D54, D79, D81, D82)
 - Never assert on wall-clock timing. Order events with the fake's gates and assert on what had or had
   not happened when the gate opened. Which gate depends on where the hold must be: `StartGate` before
   the generation decides anything at all, the prompt-length verdict included; `FirstTokenGate` after
@@ -143,6 +148,16 @@ it should not pass vacuously on the NPU.
 - A `Responder` iterator that blocks synchronously must run behind an async hop
   (`FirstTokenDelay`), because an awaited `Task.Run` can continue on the caller's thread and would
   then block the handler before it enters its first-delta wait.
+- A client disconnect does not reach the endpoints' catch clauses: both adapters and the fake return
+  `Cancelled` rather than throwing, as the contract requires, so the disconnect lands on the status
+  check inside the `try`. A test that means to reach a thrown cancellation must therefore hold
+  `CancellationGate` shut, so the generation ignores its token, and park the responder inside
+  `MoveNext` before the token the injected failure fires on. No gate can do that park — every gate
+  awaits with the caller's token and would answer the cancel with a `Cancelled` status — and the
+  release cannot wait for the client's own task to throw, because TestServer does not complete that
+  task while the handler is parked. Assert the exception's name on the log line, since that is what
+  separates the clause from the returned-`Cancelled` branch beside it; D82's first draft asserted
+  neither and passed against the filter it was written to fail against.
 - Logic that branches on a counter, a clock or any other injected behaviour gets two kinds of test: a
   stand-in whose behaviour the test can state outright (the word counters in `TokenBudgetCutTests`,
   one of which deliberately recounts a word when it grows), and a handful against the real thing
@@ -213,7 +228,7 @@ whole-branch review → fast-forward merge to `main` → update `CLAUDE.md`, `do
 commit. Chunk 6 was built by a forked subagent and reviewed by the parent session; hardware
 verification is part of an adapter chunk's definition of done and, when the machine cannot provide it,
 the chunk merges labelled code-verified only with the issue left open (chunk 6, D70). Work between
-chunks (D77 to D81) follows the same loop on its own branch; a partial pass over an issue (D79 over
+chunks (D77 to D82) follows the same loop on its own branch; a partial pass over an issue (D79 over
 #14 and #15) leaves the issue open with a comment saying what landed, what each test pins and does
 not, and what remains. The smoke run is repeated on the final code of a branch that touched the
 script or the exe, and a first-generation RPC fault is re-run once before it counts as a failure.
