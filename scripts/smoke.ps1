@@ -430,8 +430,13 @@ try {
             messages       = @(@{ role = 'user'; content = 'Explain in a paragraph how a neural processing unit differs from a GPU.' })
         } | ConvertTo-Json -Depth 5
         $s = Invoke-Sse '/v1/chat/completions' $body
+        # A throughput number is only meaningful for a generation that finished: an in-stream error
+        # frame or a missing done marker is a failed generation, reported as such, not timed.
         if ($s.StatusCode -ne 200) { throw "HTTP $($s.StatusCode): $($s.Body)" }
+        if ($s.ErrorFrames.Count -gt 0) { throw "the generation failed in-stream: $($s.ErrorFrames[0].error | ConvertTo-Json -Compress)" }
+        if (-not $s.Done) { throw 'the stream did not end with the done marker' }
         $u = @($s.Chunks | Where-Object { $null -ne $_.usage })[0].usage
+        if ($null -eq $u) { throw 'no usage chunk, though stream_options.include_usage was set' }
         $decodeMs = if ($null -ne $s.FirstChunkMs) { $s.TotalMs - $s.FirstChunkMs } else { $null }
         $tokS = if ($null -ne $decodeMs -and $decodeMs -gt 0 -and $u.completion_tokens -gt 1) { [Math]::Round(($u.completion_tokens - 1) * 1000.0 / $decodeMs, 1) } else { $null }
         "asked: one user message, max_tokens=128, streaming`nttft=$($s.FirstChunkMs)ms total=$($s.TotalMs)ms chars=$($s.Content.Length) completion_tokens=$($u.completion_tokens) chunks=$($s.Chunks.Count) finish=$((Get-FinishReasons $s.Chunks) -join ',')`nestimated tok/s over the decode phase: $tokS (chars/4 tokens per second after the first chunk; an estimate, D44)"
@@ -605,16 +610,18 @@ not a recollection.
                 $auxProc = Start-AuxServer "placement-$placement" $auxPort @('--system-prompt-placement', $placement)
                 $r = Invoke-WebRequest -Uri "http://127.0.0.1:$auxPort/v1/chat/completions" -Method Post -Body $chatBody `
                     -ContentType 'application/json' -SkipHttpErrorCheck -TimeoutSec 120
-                $c = $r.Content | ConvertFrom-Json -Depth 20
                 # D50: forcing native on a backend with no native system context rejects exactly the
-                # requests that carry system text. On such a backend (Aion) that is the expected answer
-                # here, not an error, and only the folded placement is measurable.
-                if ([int]$r.StatusCode -eq 400 -and $c.error.code -eq 'system_prompt_placement_unsupported') {
+                # requests that carry system text. Only on such a backend (Aion), and only for the native
+                # run, is that the expected answer; the same status from Phi Silica, or from the prompt
+                # run, is a regression and must read as one.
+                $c = try { $r.Content | ConvertFrom-Json -Depth 20 } catch { $null }
+                if ($Backend -eq 'aion' -and $placement -eq 'native' -and [int]$r.StatusCode -eq 400 -and $c.error.code -eq 'system_prompt_placement_unsupported') {
                     $nativeUnsupported = $true
                     $lines.Add("$placement -> rejected as specified (HTTP 400 system_prompt_placement_unsupported): this backend has no native system-prompt context, so a request with system text cannot be forced onto one (D50)")
                     continue
                 }
                 if ([int]$r.StatusCode -ne 200) { throw "HTTP $($r.StatusCode): $($r.Content)" }
+                if ($null -eq $c) { throw "HTTP 200 with a body that is not JSON: $($r.Content)" }
                 $text = $c.choices[0].message.content
                 $obeyed = $text -match 'Ada'
                 $lines.Add("$placement -> got: '$($text.Trim())' obeyed=$obeyed")

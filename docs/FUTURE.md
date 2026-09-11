@@ -70,6 +70,30 @@ land here instead of widening the chunk. Each entry says where it came from and 
   dynamic dependency; `--backend phi-silica` does the opposite. Nothing runs both in one process, and
   nothing should, but the two `LanguageModel` projections now share one assembly.
 
+### From the chunk 6 review (D69)
+
+- **A cut that races a genuine runtime `Error` is reported as `Cancelled`.** Both adapters check
+  `cancellationToken.IsCancellationRequested` before mapping the runtime's status, so a generation
+  that delivered enough text for the cut to fire and then returned `Error` comes back as `Cancelled`,
+  which the pipeline treats as a successful cut (D56 says only a `Cancelled` status may be
+  reinterpreted). The text before the cut is real and the client asked for the stop, so the other
+  reading, a 502 for a request that got exactly what it asked for, is not obviously better; the
+  behaviour is inherited from the Phi Silica adapter as verified in D62 and left alone. Decide when
+  chunk 8's scheduler gives cancellation a second caller.
+- **The drain timeout's window.** `DeltaAccumulator.Drain` waits up to five seconds for in-flight
+  callbacks. A callback that passed the closed check and was then descheduled for that long would
+  append after `Text` had been read. Unreachable in practice; the alternative (wait forever) trades it
+  for a hung request if a sink ever blocks. Noted so the timeout is not "tidied" away either direction.
+- **The delta sink must stay non-blocking.** The accumulator delivers under its append lock, and the
+  drain waits for delivery to finish. Today's sinks (the JSON watcher's lock, the stream's unbounded
+  channel `TryWrite`) never block. Chunk 7's whole-reply buffer and chunk 8's scheduler must keep it
+  that way, or a stuck client could hold the WinRT callback thread and turn the drain timeout into a
+  real path.
+- **`AionCapabilityProfileTests` asserts `SystemPrompt` is null, which the fake guarantees itself.**
+  `FakeBackend.CreateContext` nulls the argument when the capability is absent, so that assertion
+  cannot fail; the `Prompt` equality beside it is the load-bearing one. The two overflow tests pin
+  behaviour chunk 5 will build on rather than a branch that exists today. Both noted in the tests.
+
 ## Chunk 4 review deferrals
 
 - **The drain is unbounded and silent.** The streaming handler cancels the generation, awaits it to

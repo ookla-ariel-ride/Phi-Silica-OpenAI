@@ -145,18 +145,26 @@ internal sealed class AionBackend : ILanguageModelBackend
             cancellationToken);
         op.Progress = (_, delta) => deltas.OnProgress(delta);
 
-        Aion.LanguageModelResponseResult result;
+        // The drain is the callback barrier the pipeline relies on before it disposes the context
+        // (D51: cancel, drain, dispose), so it runs on every exit, a thrown exception included.
+        Aion.LanguageModelResponseResult? result = null;
         try
         {
             result = await op.AsTask(cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
+            // Handled below, after the drain, so the returned text includes a straggling delta.
+        }
+        finally
+        {
             deltas.Drain();
-            return new GenerationResult(deltas.Text, GenerationStatus.Cancelled, "cancelled");
         }
 
-        deltas.Drain();
+        if (result is null)
+        {
+            return new GenerationResult(deltas.Text, GenerationStatus.Cancelled, "cancelled");
+        }
 
         if (deltas.DeltaFailure is { } failure)
         {

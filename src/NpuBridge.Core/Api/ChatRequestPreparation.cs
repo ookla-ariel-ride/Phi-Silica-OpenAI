@@ -150,7 +150,7 @@ internal static class ChatRequestPreparer
 
             if (ignoredLog.ShouldWarn(parameter))
             {
-                logger.LogWarning("Request parameter {Parameter} is accepted but not implemented yet; it is ignored. This is logged once per process.",
+                logger.LogWarning("Request parameter {Parameter} is accepted and ignored: the active backend cannot apply it, or the bridge does not implement it yet. This is logged once per process.",
                     parameter);
             }
         }

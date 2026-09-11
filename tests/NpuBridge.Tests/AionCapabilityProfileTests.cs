@@ -48,6 +48,8 @@ public class AionCapabilityProfileTests
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         var call = Assert.Single(fake.Calls);
+        // The fake nulls the system argument itself when the capability is absent, so this line cannot
+        // fail on its own; the prompt equality below is the assertion that carries the test.
         Assert.Null(call.SystemPrompt);
 
         // Exactly what the template renders under folded placement: the system text leads the prompt,

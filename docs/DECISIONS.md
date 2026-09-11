@@ -608,9 +608,12 @@ restores by default, so this is a `--no-restore` hazard only.
 `PhiSilicaBackend`'s Progress handling — append and deliver under one lock, drain the in-flight
 callbacks after the operation ends, count a callback after a completed generation and a runtime text
 that disagrees with the deltas (D65) — was 120 lines of concurrency code that the Aion adapter would
-otherwise have copied. It is now `DeltaAccumulator`, in the exe project beside the adapters because it
-is WinRT-shaped and has no test seam without a runtime; each adapter supplies its logger, its display
-name for log lines, and the two counter callbacks. The Phi Silica adapter's behaviour is unchanged by
+otherwise have copied. It is now `DeltaAccumulator` in Core: it depends on nothing WinRT, and
+`OnProgress(string)` is the test seam a Progress handler would use, so `DeltaAccumulatorTests` drives
+it from thread-pool threads and pins delivery order, the barrier, the late-delta rule and the
+reconcile count without a runtime (the chunk 6 review moved it; it had first landed in the exe on the
+mistaken claim that it had no test seam). Each adapter supplies its logger, its display name for log
+lines, and the two counter callbacks. The Phi Silica adapter's behaviour is unchanged by
 inspection and by the smoke test re-run after the refactor (D68 has the numbers). Two things stay
 per-adapter on purpose: the Phi Silica `E_ACCESSDENIED` translation and its `ContentFiltered` rule
 (return empty text), because Aion's four-value enum has no moderation status and no access gate.
@@ -657,3 +660,28 @@ text contract `text_mismatches=0 late_deltas=0` with matching texts; the over-le
 in-stream error after 7.0 s with the preflight answering 13,429 usable at once (D55 holds). The
 smoke script's auxiliary server is now stopped on every failure path: the Aion run had leaked one on
 port 5299 and the following Phi Silica placement measurement found the port busy.
+
+**D69. Chunk 6 review: the drain runs in a `finally`, and a straggler is judged by how the generation
+ended, not by the token.** Two reviewers (a Claude subagent and Codex) found the same gaps in the
+shared accumulator and its callers. (a) Both adapters drained the Progress callbacks on the completed
+and the cancelled exits but not on a thrown one, so an exception from the runtime's task returned to
+the pipeline with a callback possibly still inside the sink, and the pipeline's `finally` disposed the
+context behind it; the drain is the barrier D51's cancel-drain-dispose order depends on, so it now
+runs in a `finally` on every exit in both adapters. (b) The late-delta rule read the token when the
+straggler arrived. The streaming endpoint cancels the token in its `finally` on every path, completed
+ones included, so on that shape a callback after a completed generation was always classified as
+"expected after a cancel" and `late_deltas` could never move; the smoke test's assertion that it reads
+zero was vacuous on one of the two shapes. The accumulator now records whether the generation had been
+cancelled at the moment the barrier closes and judges stragglers by that. (c) The gate is closed with a
+full fence (`Interlocked.Exchange`) rather than a release write, so the callback-side "increment then
+read closed" and the drain-side "write closed then read in-flight" cannot both miss on a memory model
+weaker than ARM64's. (d) The accumulator moved to Core with its own tests (D67 amended). (e)
+`smoke.ps1`: the D50 branch of the placement measurement now fires only for the aion backend's native
+run, so the same 400 from Phi Silica or from the prompt run reads as the regression it would be; the
+throughput measurement refuses to time a generation that ended in an in-stream error or without the
+done marker. (f) The once-per-process warning for an ignored parameter no longer says "not implemented
+yet" now that a real backend triggers it for parameters the runtime cannot apply. Deferred to
+`FUTURE.md`: a cut that races a genuine runtime `Error` is reported as `Cancelled` (inherited from the
+Phi Silica adapter as verified in D62), the five-second drain timeout's theoretical window, and the
+requirement that chunk 7's buffering sink and chunk 8's scheduler keep the delta sink non-blocking.
+Phi Silica smoke re-run after these changes, build 29648: every step passed (1 skipped, 5 informational); text contract 0/0, texts match; streamed one-word reply 411 ms with the first chunk at 267 ms; throughput 35 estimated tok/s; early cut 469 ms against a 2,658 ms control; over-length verdict in-stream after 7.4 s, preflight 13,429 usable. (chunk 6 review)

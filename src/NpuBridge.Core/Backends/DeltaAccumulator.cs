@@ -14,7 +14,7 @@ namespace NpuBridge.Backends;
 /// returns; anything arriving after the barrier is dropped rather than delivered to a caller that has
 /// moved on, and counted when it is a contract breach (D65).
 /// </summary>
-internal sealed class DeltaAccumulator
+public sealed class DeltaAccumulator
 {
     /// <summary>Upper bound on waiting for a straggling Progress callback after the operation completed.</summary>
     private static readonly TimeSpan CallbackDrainTimeout = TimeSpan.FromSeconds(5);
@@ -29,13 +29,14 @@ internal sealed class DeltaAccumulator
     private Exception? _deltaFailure;
     private int _inFlight;
     private int _closed;
+    private bool _endedCancelled;
 
     /// <param name="logger">The adapter's logger.</param>
     /// <param name="runtime">The runtime's display name, for log lines ("Phi Silica", "Aion Instruct").</param>
     /// <param name="onDelta">The caller's delta sink. Exceptions it throws are captured, never lost on the WinRT thread.</param>
     /// <param name="onLateDelta">Counts a callback that arrived after a <em>completed</em> generation ended.</param>
     /// <param name="onTextMismatch">Counts a runtime text that disagreed with the delivered deltas.</param>
-    /// <param name="cancellationToken">The generation's token; a callback after a cancelled generation is expected and not counted.</param>
+    /// <param name="cancellationToken">The generation's token, read once when <see cref="Drain"/> closes the barrier: a callback after a generation that ended cancelled is expected and not counted.</param>
     public DeltaAccumulator(
         ILogger logger,
         string runtime,
@@ -78,8 +79,11 @@ internal sealed class DeltaAccumulator
                 // After a cancellation the barrier closes the moment AsTask throws, so a callback the
                 // runtime raises on its way out is expected and its text was going to be discarded
                 // anyway: not a contract breach, not counted. After a completion it is text the runtime
-                // produced that neither shape will ever see, and it is both.
-                if (_cancellationToken.IsCancellationRequested)
+                // produced that neither shape will ever see, and it is both. Which of the two applies
+                // was fixed when the barrier closed: the streaming endpoint cancels the token in its
+                // finally on every path, so the token's state now says nothing about how the generation
+                // ended.
+                if (_endedCancelled)
                 {
                     _logger.LogDebug("A {Runtime} progress callback ({Length} chars) arrived after the cancelled generation ended; dropped.", _runtime, delta.Length);
                 }
@@ -122,7 +126,12 @@ internal sealed class DeltaAccumulator
     /// </summary>
     public void Drain()
     {
-        Volatile.Write(ref _closed, 1);
+        // Written before the gate closes; a callback that sees the gate closed therefore sees this too.
+        _endedCancelled = _cancellationToken.IsCancellationRequested;
+
+        // A full fence, not a release-only write: the callback side increments _inFlight and then reads
+        // _closed, this side writes _closed and then reads _inFlight, and the two must not both miss.
+        Interlocked.Exchange(ref _closed, 1);
         if (!SpinWait.SpinUntil(() => Volatile.Read(ref _inFlight) == 0, CallbackDrainTimeout))
         {
             _logger.LogWarning("A {Runtime} progress callback did not finish within {Timeout}; continuing.", _runtime, CallbackDrainTimeout);
