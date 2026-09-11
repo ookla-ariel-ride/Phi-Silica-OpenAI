@@ -85,7 +85,7 @@ internal sealed class ChatCompletionsStreamEndpoint
 
         // Set when this handler cancels the generation because a limit fired while streaming, and read
         // when the status comes back. A fact recorded at the cancel, not inferred from the cutter
-        // afterwards: the JSON path infers it from a different cutter state, and the two shapes
+        // afterwards: the JSON path used to infer it from a different cutter state, and the two shapes
         // answered a backend's unprompted Cancelled differently (D62).
         var cancelledByCut = false;
 

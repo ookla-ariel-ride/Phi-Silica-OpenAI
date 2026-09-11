@@ -554,7 +554,8 @@ runtime that split the pair across two callbacks — went out whole, and `System
 half as U+FFFD; the low half followed as a second U+FFFD. Any unrelated stop string hid it, because the
 holdback then happened to catch it, so the output depended on a setting with nothing to do with it.
 The release now holds the high half back regardless of holdback; the next delta or the flush releases
-it, so a genuinely lone surrogate is delayed by one delta and never lost. Reachable only if the
+it, so a genuinely lone surrogate is delayed by one delta and never dropped by the cutter (on the
+wire a lone half is U+FFFD either way, which is the model's doing, not the bridge's). Reachable only if the
 runtime ever splits a decoded UTF-16 pair across callbacks, which is not established either way on
 Phi Silica; the cutter should not depend on it. (#6)
 
@@ -568,11 +569,12 @@ the contract by construction, so the suite cannot see either. Of the two fixes t
 honour the contract in the adapter, or relax it and cut the JSON path over the deltas too — the first
 is taken: one adapter-local rule beats a pipeline-wide change of what `Text` means, and chunk 6's
 adapter inherits the same rule. A mismatch between the runtime's text and the deltas, and a callback
-after the barrier, are each a Warning and a counter in `/healthz` (`text_mismatches`, `late_deltas`).
+after a completed generation ended (one after a cancelled generation is expected and only logged at
+Debug), are each a Warning and a counter in `/healthz` (`text_mismatches`, `late_deltas`).
 `scripts/smoke.ps1` gained a text-contract step that sends one prompt on both shapes and asserts both
 counters read zero, reporting (not asserting) whether the wire texts matched. **Not yet run on
 hardware:** the Windows Insider flight to build 29661, installed the evening of 2026-09-10, left the
 three Phi Silica workload packages unregisterable (`0x80073CF6`, access denied registering the
 `windows.accessControl.undocked` extension, elevated or not), so the model reports `NotReady` and the
 smoke test cannot reach a generation. The adapter change is build-verified only until the flight is
-fixed or rolled back; that is why #7 stays open on the branch while #5, #6 and #8 merged. (#7)
+fixed or rolled back; that is why #7 stays open, its commit on the branch, while #5, #6 and #8 merge. (#7)

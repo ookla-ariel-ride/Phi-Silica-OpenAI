@@ -52,6 +52,9 @@ internal sealed class BridgeTestHost : IAsyncDisposable
         builder.Logging.ClearProviders();
         if (loggerProvider is not null)
         {
+            // Everything, Debug included: the host's default floor is Information, and some of the
+            // lines tests need to see -- the guard around a cancel that threw, for one -- are Debug.
+            builder.Logging.SetMinimumLevel(LogLevel.Trace);
             builder.Logging.AddProvider(loggerProvider);
         }
 

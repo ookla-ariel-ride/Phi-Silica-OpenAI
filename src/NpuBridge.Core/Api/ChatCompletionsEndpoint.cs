@@ -109,13 +109,13 @@ internal sealed class ChatCompletionsEndpoint
             // Null when the request set no limits, which is the ordinary case and costs nothing.
             var watcher = limits.IsEmpty ? null : new OutputCutter(limits);
 
-            // Set when this handler cancels the generation because the watcher tripped a limit, and
-            // read when the status comes back: a Cancelled this handler asked for is the cut, any
-            // other Cancelled is a failure. Recorded as a fact rather than inferred from the cutter
-            // afterwards, because the whole-text cut below can commit a cap the watcher never
-            // cancelled for, and the stream reads a different cutter — so inferring it made the two
-            // shapes answer the same backend status differently.
-            var cancelledByCut = 0;
+            // Set beside the CancelAsync below, when this handler cancels the generation because the
+            // watcher tripped a limit, and read when the status comes back: a Cancelled this handler
+            // asked for is the cut, any other Cancelled is a failure (D62). Recorded as a fact rather
+            // than inferred from the cutter afterwards, because the whole-text cut below can commit a
+            // cap the watcher never cancelled for, and the stream reads a different cutter — so
+            // inferring it made the two shapes answer the same backend status differently.
+            var cancelledByCut = false;
 
             // How the callback tells this task that the cut fired. The callback never cancels anything
             // itself: it runs on the backend's thread, and cancelling from there is wrong twice over. A
@@ -162,20 +162,26 @@ internal sealed class ChatCompletionsEndpoint
 
                     if (cut)
                     {
-                        Volatile.Write(ref cancelledByCut, 1);
                         cutSignal.TrySetResult();
                     }
                 },
                 generationCts.Token);
 
-            // Whichever comes first. When it is the cut, cancel here -- on this thread, guarded -- and
-            // then wait for the generation to end as it would have anyway. The overshoot is a delta or
-            // two and costs nothing: the cut itself is applied to the final text below. Cancelling
+            // Whichever comes first. When the cut has fired, cancel here -- on this thread, guarded --
+            // and then wait for the generation to end as it would have anyway. The overshoot is a delta
+            // or two and costs nothing: the cut itself is applied to the final text below. Cancelling
             // faults when a registration on the token throws, and that is a Debug line here rather than
             // a failure, because the generation still ends, the text is still cut, and the finally still
             // disposes the context -- exactly as the streaming path treats its own cancel.
-            if (!ReferenceEquals(await Task.WhenAny(generation, cutSignal.Task).ConfigureAwait(false), generation))
+            //
+            // "Has the cut fired" rather than "did the cut win the race": a generation that ends in the
+            // same instant the watcher trips is still cancelled, so the flag beside the cancel means the
+            // same thing here as on the stream, which cancels whenever a delta trips the cutter no
+            // matter what the generation has done since. Cancelling a finished generation is a no-op.
+            await Task.WhenAny(generation, cutSignal.Task).ConfigureAwait(false);
+            if (cutSignal.Task.IsCompleted)
             {
+                cancelledByCut = true;
                 try
                 {
                     await generationCts.CancelAsync().ConfigureAwait(false);
@@ -226,7 +232,7 @@ internal sealed class ChatCompletionsEndpoint
             // finish_reason "length". And deciding "did the cut fire" from the whole-text cut was wrong
             // too: it can report a cap the watcher never cancelled for, so a backend that reported
             // Cancelled on its own was a success here and a failure on the stream.
-            var selfCancelled = Volatile.Read(ref cancelledByCut) == 1 && result.Status is GenerationStatus.Cancelled;
+            var selfCancelled = cancelledByCut && result.Status is GenerationStatus.Cancelled;
 
             if (!filtered && !selfCancelled && GenerationFailure.FromStatus(result) is { } failure)
             {

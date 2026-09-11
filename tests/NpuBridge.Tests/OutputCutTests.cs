@@ -532,13 +532,19 @@ public class OutputCutTests
             Responder = _ => ["Hello", " world"],
             ThrowFromCancellationRegistration = true,
         });
-        await using var host = await BridgeTestHost.StartAsync(fake);
+        var logs = new CapturingLoggerProvider();
+        await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: logs);
 
         var completion = await CompleteAsync(host, stream, Body(stream, maxTokens: 1));
 
         Assert.Equal("Hell", completion.Content);
         Assert.Equal("length", completion.FinishReason);
         Assert.Equal(1, completion.CompletionTokens);
+
+        // The reply alone would also be produced by a generation that ended before anything cancelled
+        // it; this line is written only by the guard around the cut's own cancel, so it is the proof
+        // that the cancel ran, the registration threw, and the throw was caught.
+        Assert.Contains(logs.Records, r => r.Message.Contains("cancelling the generation at the cut threw", StringComparison.Ordinal));
 
         await WaitUntilAsync(() => fake.ActiveContexts == 0);
     }
