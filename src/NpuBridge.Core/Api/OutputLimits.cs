@@ -263,6 +263,17 @@ internal sealed class OutputCutter
             }
 
             safe = NotSplittingASurrogatePair(_pending, safe);
+
+            // A release that would end on a high surrogate is one whose low half has not arrived yet:
+            // the runtime split the pair across two callbacks. Hold the half back, whatever the
+            // holdback is — with no stop strings it is zero, so nothing else would — and the next
+            // delta (or the flush, if the model really did stop there) releases it. Only here, on a
+            // release: a flush or a cut has no next delta to wait for.
+            if (safe > 0 && safe == _pending.Length && char.IsHighSurrogate(_pending[safe - 1]))
+            {
+                safe--;
+            }
+
             if (safe <= 0)
             {
                 return string.Empty;

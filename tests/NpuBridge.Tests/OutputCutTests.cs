@@ -601,6 +601,45 @@ public class OutputCutTests
     }
 
     /// <summary>
+    /// The ordinary streaming case — no stop strings, so nothing is held back — has the same hole at the
+    /// end of a delta rather than inside it: a runtime that splits a pair across two callbacks delivers
+    /// a delta ending on the high half, and with a holdback of zero "everything pending" is the release.
+    /// The high half must wait for the next delta regardless, or the pair is destroyed exactly as above.
+    /// The existing guard only ever stepped back from an index strictly inside the text, and setting any
+    /// unrelated stop string hid the problem because the holdback then happened to catch it.
+    /// </summary>
+    [Fact]
+    public void A_delta_ending_on_a_high_surrogate_holds_it_back_even_with_no_stop_strings()
+    {
+        var cutter = new OutputCutter(OutputLimits.None);
+
+        var first = cutter.Accept("hi\uD83D");
+        var second = cutter.Accept("\uDE00 there");
+        var tail = cutter.Flush();
+
+        Assert.Equal("hi", first);
+        Assert.Equal("\U0001F600 there", second);
+        Assert.Equal(string.Empty, tail);
+        Assert.Equal(10, cutter.ContentLength);
+    }
+
+    /// <summary>
+    /// A high surrogate that is genuinely the last character the model produced is not the bridge's to
+    /// suppress: the flush releases it, so a held half is delayed by one delta and never lost.
+    /// </summary>
+    [Fact]
+    public void A_held_high_surrogate_is_released_by_the_flush_when_nothing_follows()
+    {
+        var cutter = new OutputCutter(OutputLimits.None);
+
+        var first = cutter.Accept("hi\uD83D");
+        var tail = cutter.Flush();
+
+        Assert.Equal("hi", first);
+        Assert.Equal("\uD83D", tail);
+    }
+
+    /// <summary>
     /// The same for the cap, where stepping back is also what keeps ceil(chars/4) under the budget: the
     /// fourth character of the budget is the low half of the emoji, so the cut takes three.
     /// </summary>
