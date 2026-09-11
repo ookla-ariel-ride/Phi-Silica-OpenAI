@@ -31,6 +31,12 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
     private bool _disposed;
     private string _lafHint = string.Empty;
 
+    // The two ways the runtime can break the text contract (ILanguageModelBackend: Text is the deltas
+    // delivered, concatenated). Neither is silent: each is a Warning and a counter in /healthz, so the
+    // smoke test can assert both stayed at zero and a session that saw one can find it afterwards.
+    private int _textMismatches;
+    private int _lateDeltas;
+
     public PhiSilicaBackend(BridgeOptions options, IProcessIdentity identity, ILogger<PhiSilicaBackend> logger)
     {
         _options = options;
@@ -38,6 +44,8 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
         _logger = logger;
         _diagnostics["sdk"] =
             $"Microsoft.WindowsAppSDK {Microsoft.WindowsAppSDK.Release.Major}.{Microsoft.WindowsAppSDK.Release.Minor}.{Microsoft.WindowsAppSDK.Release.Patch}{Microsoft.WindowsAppSDK.Release.FormattedVersionTag}";
+        _diagnostics["text_mismatches"] = 0;
+        _diagnostics["late_deltas"] = 0;
     }
 
     public string ModelId => "phi-silica";
@@ -168,11 +176,14 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
         // SDK 2.4 has no context overload without options; defaults come from a fresh LanguageModelOptions.
         var op = Guarded(() => model.GenerateResponseAsync(ctx, prompt, ToOptions(sampling)), "GenerateResponseAsync");
 
-        // Progress delivers the newest token(s) only; accumulate here so a cancelled run still has its
-        // partial text. An exception from onDelta would otherwise vanish on the WinRT callback thread.
-        // Completion of the operation does not guarantee the last Progress callback has finished (or even
-        // started), so callbacks are counted and drained before this method returns; anything arriving
-        // after the barrier is dropped rather than delivered to a caller that has moved on.
+        // Progress delivers the newest token(s) only; accumulate here, because the accumulation *is* the
+        // text this method returns (the contract: Text is the deltas delivered, concatenated -- the two
+        // response shapes cut the same characters only because of it). An exception from onDelta would
+        // otherwise vanish on the WinRT callback thread. Completion of the operation does not guarantee
+        // the last Progress callback has finished (or even started), so callbacks are counted and drained
+        // before this method returns; anything arriving after the barrier is dropped rather than
+        // delivered to a caller that has moved on -- and counted, because a dropped delta is text the
+        // runtime produced that neither shape will ever see.
         var accumulated = new StringBuilder();
         Exception? deltaFailure = null;
         var inFlight = 0;
@@ -184,6 +195,8 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
             {
                 if (Volatile.Read(ref closed) == 1)
                 {
+                    _diagnostics["late_deltas"] = Interlocked.Increment(ref _lateDeltas);
+                    _logger.LogWarning("A Phi Silica progress callback ({Length} chars) arrived after the generation completed and was dropped.", delta?.Length ?? 0);
                     return;
                 }
 
@@ -237,9 +250,25 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
         }
 
         var status = MapStatus(result.Status);
-        var text = status == GenerationStatus.ContentFiltered
-            ? string.Empty                                   // never hand back text the runtime withheld
-            : string.IsNullOrEmpty(result.Text) ? Partial() : result.Text;
+        if (status == GenerationStatus.ContentFiltered)
+        {
+            // Never hand back text the runtime withheld, whatever the deltas said.
+            return new GenerationResult(string.Empty, status, DescribeStatus(result));
+        }
+
+        // The delivered deltas are the answer, on every status (D65). The runtime's own Text is a
+        // cross-check, not a source: if it ever differs, the JSON path would have cut different
+        // characters from the ones the stream cut, and the same request would answer differently by
+        // shape. Not observed on hardware; measured by the smoke test's text-contract step from now on.
+        var text = Partial();
+        if (!string.IsNullOrEmpty(result.Text) && !string.Equals(result.Text, text, StringComparison.Ordinal))
+        {
+            _diagnostics["text_mismatches"] = Interlocked.Increment(ref _textMismatches);
+            _logger.LogWarning(
+                "Phi Silica's result text ({ResultLength} chars) differs from the delivered deltas ({DeltaLength} chars); returning the deltas.",
+                result.Text.Length, text.Length);
+        }
+
         return new GenerationResult(text, status, DescribeStatus(result));
 
         string Partial()

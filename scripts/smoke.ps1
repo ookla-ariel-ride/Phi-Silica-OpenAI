@@ -473,6 +473,41 @@ try {
         "max_tokens=$cap -> finish=length, $($capped.Content.Length) chars <= $capChars budget, completion_tokens=$($capUsage.completion_tokens); stop='$stop' -> finish=stop, absent from the reply, $evidence"
     }
 
+    # The contract both shapes rest on: GenerationResult.Text is the concatenation of the deltas the
+    # adapter delivered (ILanguageModelBackend). The fake honours it by construction, so dotnet test
+    # cannot check a real adapter; this does. The adapter now returns the accumulated deltas on every
+    # status and counts, in /healthz, every time the runtime's own text disagreed with them and every
+    # callback that arrived after the completion barrier. Those counters are the assertion. Whether the
+    # two shapes' texts match on the wire is reported but not asserted: temperature 0 on this runtime
+    # is not a documented promise of determinism, so a difference there is a finding about the model.
+    Step 'both shapes return the deltas the adapter delivered (text contract)' {
+        $prompt = 'Reply with exactly the word PONG.'
+        $messages = @(
+            @{ role = 'system'; content = 'You are a terse assistant.' }
+            @{ role = 'user'; content = $prompt }
+        )
+        $json = Get-Json '/v1/chat/completions' 'POST' (@{ model = $Backend; temperature = 0; messages = $messages } | ConvertTo-Json -Depth 5)
+        $sse = Invoke-Sse '/v1/chat/completions' (@{ model = $Backend; temperature = 0; stream = $true; messages = $messages } | ConvertTo-Json -Depth 5)
+        if ($sse.StatusCode -ne 200 -or -not $sse.Done) { throw "stream: HTTP $($sse.StatusCode), done=$($sse.Done)" }
+
+        $jsonText = $json.choices[0].message.content
+        $sseText = $sse.Content
+        $match = if ($jsonText -eq $sseText) { 'texts match' } else { "texts differ (json=$($jsonText.Length) chars, sse=$($sseText.Length) chars)" }
+
+        $h = Get-Json '/healthz'
+        $d = $h.diagnostics
+        if ($Backend -eq 'fake') {
+            Skip "$match; the fake backend keeps no text-contract counters"
+        }
+        if ($null -eq $d.text_mismatches -or $null -eq $d.late_deltas) {
+            throw "healthz diagnostics lack text_mismatches/late_deltas: $($d | ConvertTo-Json -Compress)"
+        }
+        if ($d.text_mismatches -ne 0) { throw "the runtime's text disagreed with the delivered deltas $($d.text_mismatches) time(s) this run" }
+        if ($d.late_deltas -ne 0) { throw "$($d.late_deltas) progress callback(s) arrived after the completion barrier this run" }
+
+        "text_mismatches=0 late_deltas=0 over every generation so far; $match"
+    }
+
     if ($ToolProbeRuns -gt 0) {
         Step "tool-call compliance probe ($ToolProbeRuns runs)" {
             Skip 'tool calling arrives in chunk 7; tools/tool_choice are accepted and ignored in chunk 3'
