@@ -32,13 +32,20 @@ public static class NpuBridgeServiceCollectionExtensions
         services.TryAddSingleton<IProcessIdentity>(NoProcessIdentity.Instance);
         services.TryAddSingleton<IgnoredParameterLog>();
 
+        // The context cache is owned by the lifecycle below, which disposes the cached contexts before
+        // the model they belong to: a LanguageModelContext must not outlive its LanguageModel.
+        services.AddSingleton(sp => new ContextCache(
+            options.ContextCacheSize,
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<ContextCache>>()));
+
         // BackendLifecycle owns the backend and disposes it only after initialization has finished.
         // The backend is deliberately not registered as its own disposable singleton, which would let
         // the container tear it down while a stubborn InitializeAsync is still running.
         services.AddSingleton(sp => new BackendLifecycle(
             backendFactory(sp),
             sp.GetRequiredService<TimeProvider>(),
-            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<BackendLifecycle>>()));
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<BackendLifecycle>>(),
+            sp.GetRequiredService<ContextCache>()));
         services.AddHostedService(sp => sp.GetRequiredService<BackendLifecycle>());
 
         services.Configure<JsonOptions>(o =>

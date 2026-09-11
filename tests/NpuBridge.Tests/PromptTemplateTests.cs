@@ -210,4 +210,52 @@ public class PromptTemplateTests
             result.Prompt);
         Assert.False(result.Prompt.EndsWith('\n'));
     }
+
+    [Fact]
+    public void A_tail_of_one_user_message_uses_the_markers_and_never_the_raw_pass_through()
+    {
+        // The raw form exists for the single-message curl case; a tail continues a marked-up
+        // conversation the context already holds, so it keeps the markers.
+        Assert.Equal(
+            "### Conversation so far\n\n" +
+            "### Reply as the assistant to the latest message.\n" +
+            "[User]\n" +
+            "and london too?",
+            PromptTemplate.RenderTail([User("and london too?  ")]));
+    }
+
+    [Fact]
+    public void A_tail_with_tool_results_renders_them_before_the_reply_heading()
+    {
+        var tail = new ChatMessage[] { Tool("{\"temp\": 21}", "get_weather", "call_01"), User("so?") };
+
+        Assert.Equal(
+            "### Conversation so far\n" +
+            "[Tool result: get_weather (call_01)]\n" +
+            "{\"temp\": 21}\n\n" +
+            "### Reply as the assistant to the latest message.\n" +
+            "[User]\n" +
+            "so?",
+            PromptTemplate.RenderTail(tail));
+    }
+
+    [Fact]
+    public void A_tail_ignores_system_messages_and_an_empty_tail_is_the_reply_heading_alone()
+    {
+        Assert.Equal(PromptTemplate.RenderTail([User("x")]), PromptTemplate.RenderTail([System("late system text"), User("x")]));
+        Assert.Equal(
+            "### Conversation so far\n\n" +
+            "### Reply as the assistant to the latest message.",
+            PromptTemplate.RenderTail([]));
+    }
+
+    [Fact]
+    public void Turn_text_is_the_rendered_body_of_the_turn()
+    {
+        Assert.Equal("hi", PromptTemplate.TurnText(User("hi  \n")));
+        Assert.Equal(string.Empty, PromptTemplate.TurnText(Assistant(null)));
+        ChatMessage[] mixed = [System("s"), User("a"), Developer("d"), Assistant("b")];
+        Assert.Equal(["user", "assistant"], PromptTemplate.Turns(mixed).Select(m => m.Role));
+        Assert.Equal(["system", "developer"], PromptTemplate.SystemMessages(mixed).Select(m => m.Role));
+    }
 }

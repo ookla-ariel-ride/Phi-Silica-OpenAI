@@ -56,7 +56,7 @@ public class AionCapabilityProfileTests
         // the transcript follows. Not a substring check, so a drift in either direction shows up.
         var expected = PromptTemplate.Render(Messages(), nativeSystemPromptSupported: false);
         Assert.Equal(expected.Prompt, call.Prompt);
-        AssertNoLeak(fake);
+        host.AssertNoLeak();
     }
 
     [Fact]
@@ -79,7 +79,7 @@ public class AionCapabilityProfileTests
         var call = Assert.Single(fake.Calls);
         Assert.Null(call.SystemPrompt);
         Assert.Equal("hi", call.Prompt);
-        AssertNoLeak(fake);
+        host.AssertNoLeak();
     }
 
     [Fact]
@@ -113,7 +113,7 @@ public class AionCapabilityProfileTests
             Assert.Single(warnings);
         }
 
-        AssertNoLeak(fake);
+        host.AssertNoLeak();
     }
 
     [Fact]
@@ -128,7 +128,7 @@ public class AionCapabilityProfileTests
         var root = await ReadJson(response);
         Assert.False(root.TryGetProperty("usable_prompt_chars", out _));
         Assert.Equal("Complete", root.GetProperty("status").GetString());
-        AssertNoLeak(fake);
+        host.AssertNoLeak();
     }
 
     /// <summary>
@@ -156,19 +156,13 @@ public class AionCapabilityProfileTests
         Assert.Equal("context_length_exceeded", (await ReadJson(response)).GetProperty("error").GetProperty("code").GetString());
         Assert.Single(fake.Calls);
         Assert.Equal(1, fake.ContextsCreated);
-        AssertNoLeak(fake);
+        host.AssertNoLeak();
     }
 
     private static List<ChatMessage> Messages() =>
         ConversationWithSystem
             .Select(m => JsonSerializer.Deserialize<ChatMessage>(JsonSerializer.Serialize(m), JsonDefaults.Options)!)
             .ToList();
-
-    private static void AssertNoLeak(FakeBackend fake)
-    {
-        Assert.Equal(fake.ContextsCreated, fake.ContextsDisposed);
-        Assert.Equal(0, fake.ActiveContexts);
-    }
 
     private static async Task<JsonElement> ReadJson(HttpResponseMessage response)
     {

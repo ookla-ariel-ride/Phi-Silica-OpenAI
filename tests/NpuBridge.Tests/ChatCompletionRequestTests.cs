@@ -356,4 +356,25 @@ public class ChatCompletionRequestTests
         Assert.StartsWith("chatcmpl-", first, StringComparison.Ordinal);
         Assert.Equal("chatcmpl-".Length + 26, first.Length);
     }
+
+    [Fact]
+    public void Assistant_message_carries_its_tool_calls()
+    {
+        var json = """
+            {"messages":[{"role":"assistant","content":null,"tool_calls":[
+              {"id":"call_01","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}
+            ]}]}
+            """;
+
+        var request = JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!;
+
+        var message = Assert.Single(request.Messages!);
+        Assert.Null(message.Content);
+        var call = Assert.Single(message.ToolCalls!);
+        Assert.Equal("call_01", call.Id);
+        Assert.Equal("function", call.Type);
+        Assert.Equal("get_weather", call.Function!.Name);
+        Assert.Equal("{\"city\":\"Paris\"}", call.Function.Arguments);
+        Assert.True(ChatCompletionRequestValidator.Validate(request).IsValid);
+    }
 }

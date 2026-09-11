@@ -22,9 +22,10 @@ namespace NpuBridge.Api;
 /// a <c>data: {"error":...}</c> event. <see cref="GenerationFailure"/> owns both forms so the two
 /// cannot describe the same condition differently.
 ///
-/// The other thing worth reading twice is the shape of the exit: cancel, drain, dispose. The context is
-/// a live handle the generation task may still be writing to, so it is disposed only after that task
-/// has finished, on every path out of the method including a client that vanished mid-frame.
+/// The other thing worth reading twice is the shape of the exit: cancel, drain, settle. The context is
+/// a live handle the generation task may still be writing to, so its lease is settled -- stored back
+/// in the cache or disposed -- only after that task has finished, on every path out of the method
+/// including a client that vanished mid-frame.
 /// </summary>
 internal sealed class ChatCompletionsStreamEndpoint
 {
@@ -54,6 +55,7 @@ internal sealed class ChatCompletionsStreamEndpoint
         PreparedChatRequest prepared,
         BridgeOptions options,
         StreamingOptions streaming,
+        ContextCache cache,
         TimeProvider time,
         ILogger logger)
     {
@@ -61,7 +63,7 @@ internal sealed class ChatCompletionsStreamEndpoint
 
         var requestId = prepared.RequestId;
         var backendName = prepared.BackendName;
-        var promptChars = prepared.PromptChars;
+        var session = new ConversationSession(prepared, cache, options, logger);
 
         // Identity of the reply, fixed once and repeated on every chunk: a client that stitches the
         // chunks back together must see the same id/created/model a non-streamed reply would carry.
@@ -89,7 +91,7 @@ internal sealed class ChatCompletionsStreamEndpoint
         // answered a backend's unprompted Cancelled differently (D62).
         var cancelledByCut = false;
 
-        IModelContext? context = null;
+        ContextLease? lease = null;
         Task<GenerationResult>? generation = null;
 
         // Linked, not the request's own token: this cancels the generation for reasons of the handler's
@@ -99,70 +101,116 @@ internal sealed class ChatCompletionsStreamEndpoint
 
         try
         {
-            // The hand-off. The backend raises its progress callback on a thread-pool thread (the fake
-            // does this on purpose, mirroring WinRT's Progress), so the callback may not touch the HTTP
-            // response: it only writes into this channel. AllowSynchronousContinuations is false so
-            // that a TryWrite cannot run the reader's continuation inline on the callback thread, which
-            // would smuggle response writes back onto it. One reader — this task — drains it.
-            var channel = Channel.CreateUnbounded<string>(new UnboundedChannelOptions
+            GenerationResult result;
+            DeltaSink sink;
+            while (true)
             {
-                SingleReader = true,
-                SingleWriter = false,
-                AllowSynchronousContinuations = false,
-            });
-
-            var sink = new DeltaSink(channel.Writer, stopwatch);
-
-            // A fresh context per request, disposed in the finally: D11/D43. Streaming makes this easier
-            // to get wrong because the response outlives the generation call, so the try starts here.
-            context = prepared.Backend.CreateContext(prepared.NativeSystem);
-
-            // Started, not awaited: the reader loop below runs concurrently with it. The channel is
-            // completed in that method's finally, which is what ends the loop on every outcome,
-            // including a throw.
-            generation = GenerateAsync(prepared, context, sink, channel.Writer, generationCts.Token);
-
-            // Nothing has been written yet, on purpose. Waiting here — rather than opening with the role
-            // chunk — is what keeps the status line available for a failure that arrives before the
-            // first token. The first keep-alive comment is what ends that window, about a second in.
-            var streamed = await WaitForFirstDeltaAsync(sse, channel.Reader, streaming, aborted)
-                .ConfigureAwait(false);
-
-            if (streamed)
-            {
-                // The role chunk. OpenAI clients rely on it to open the assistant message.
-                roleSent = true;
-                await sse.WriteChunkAsync(Chunk(requestId, created, model,
-                    new ChatCompletionDelta("assistant", string.Empty), finishReason: null), aborted).ConfigureAwait(false);
-
-                // Deliberately not cancelled by `aborted`: the loop must end when the channel completes,
-                // so that `generation` is always reached and always drained below.
-                await foreach (var delta in channel.Reader.ReadAllAsync(CancellationToken.None).ConfigureAwait(false))
+                // The context: checked out of the cache when the transcript extends a cached prefix,
+                // created fresh otherwise, and refused here -- before a byte has gone out -- when a
+                // backend with a preflight says the prompt does not fit (D55). Settled in the finally.
+                // Streaming makes this easier to get wrong because the response outlives the generation
+                // call, so the try starts before it.
+                var acquisition = session.Acquire();
+                if (acquisition.Failure is { } refused)
                 {
-                    // What the cutter releases, not the delta: with stop strings configured this lags
-                    // the backend by up to Holdback characters, and on the delta that trips a limit it
-                    // is the truncated prefix.
-                    var release = cutter.Accept(delta);
-                    if (release.Length > 0)
+                    ChatRequestMetrics.LogRequest(logger, requestId, backendName, prepared.PromptChars, ttftMs: 0, tokens: 0,
+                        status: GenerationStatus.PromptLargerThanContext.ToString(), finish: "-",
+                        httpStatus: sse.Started ? StatusCodes.Status200OK : refused.StatusCode,
+                        truncatedTurns: session.DroppedTurns);
+                    return await FailAsync(sse, refused, logger, requestId, aborted).ConfigureAwait(false);
+                }
+
+                lease = acquisition.Lease!;
+
+                // Before the first frame, while the headers are still ours. On a retry after a
+                // keep-alive the response has started and the session logs that the header is lost.
+                session.ApplyTruncationHeader(http.Response);
+
+                // The hand-off. The backend raises its progress callback on a thread-pool thread (the
+                // fake does this on purpose, mirroring WinRT's Progress), so the callback may not touch
+                // the HTTP response: it only writes into this channel. AllowSynchronousContinuations is
+                // false so that a TryWrite cannot run the reader's continuation inline on the callback
+                // thread, which would smuggle response writes back onto it. One reader — this task —
+                // drains it. Fresh per attempt: a completed channel cannot be reopened.
+                var channel = Channel.CreateUnbounded<string>(new UnboundedChannelOptions
+                {
+                    SingleReader = true,
+                    SingleWriter = false,
+                    AllowSynchronousContinuations = false,
+                });
+
+                sink = new DeltaSink(channel.Writer, stopwatch);
+
+                // Started, not awaited: the reader loop below runs concurrently with it. The channel is
+                // completed in that method's finally, which is what ends the loop on every outcome,
+                // including a throw.
+                generation = GenerateAsync(prepared, lease, sink, channel.Writer, generationCts.Token);
+
+                // Nothing has been written yet, on purpose. Waiting here — rather than opening with the
+                // role chunk — is what keeps the status line available for a failure that arrives before
+                // the first token. The first keep-alive comment is what ends that window, about a second in.
+                var streamed = await WaitForFirstDeltaAsync(sse, channel.Reader, streaming, aborted)
+                    .ConfigureAwait(false);
+
+                if (streamed)
+                {
+                    // The role chunk. OpenAI clients rely on it to open the assistant message.
+                    roleSent = true;
+                    await sse.WriteChunkAsync(Chunk(requestId, created, model,
+                        new ChatCompletionDelta("assistant", string.Empty), finishReason: null), aborted).ConfigureAwait(false);
+
+                    // Deliberately not cancelled by `aborted`: the loop must end when the channel completes,
+                    // so that `generation` is always reached and always drained below.
+                    await foreach (var delta in channel.Reader.ReadAllAsync(CancellationToken.None).ConfigureAwait(false))
                     {
-                        await sse.WriteChunkAsync(Chunk(requestId, created, model,
-                            new ChatCompletionDelta(null, release), finishReason: null), aborted).ConfigureAwait(false);
+                        // What the cutter releases, not the delta: with stop strings configured this lags
+                        // the backend by up to Holdback characters, and on the delta that trips a limit it
+                        // is the truncated prefix.
+                        var release = cutter.Accept(delta);
+                        if (release.Length > 0)
+                        {
+                            await sse.WriteChunkAsync(Chunk(requestId, created, model,
+                                new ChatCompletionDelta(null, release), finishReason: null), aborted).ConfigureAwait(false);
+                        }
+
+                        if (cutter.IsCut)
+                        {
+                            // Stop consuming and stop the model. Whatever is still queued is discarded; the
+                            // finally's cancel-drain-settle then runs unchanged, so the context is still
+                            // disposed exactly once and only after the generation task has ended.
+                            cancelledByCut = true;
+                            await CancelGuardedAsync(generationCts, logger, requestId, "at the cut").ConfigureAwait(false);
+                            break;
+                        }
                     }
 
-                    if (cutter.IsCut)
-                    {
-                        // Stop consuming and stop the model. Whatever is still queued is discarded; the
-                        // finally's cancel-drain-dispose then runs unchanged, so the context is still
-                        // disposed exactly once and only after the generation task has ended.
-                        cancelledByCut = true;
-                        await CancelGuardedAsync(generationCts, logger, requestId, "at the cut").ConfigureAwait(false);
-                        break;
-                    }
+                    result = await generation.ConfigureAwait(false);
+                    break;
                 }
+
+                result = await generation.ConfigureAwait(false);
+
+                // Not one delta, and the backend says the prompt was too long. On a backend without a
+                // preflight this is the only way it can say so; with --truncate-history the answer is
+                // to drop the oldest exchange and go round again on a fresh context. This one ended in a
+                // non-Complete status and is disposed (D11). The stream is unaffected: nothing but
+                // keep-alive comments can have gone out, and those open no message.
+                if (result.Status == GenerationStatus.PromptLargerThanContext && session.TryDropOldestExchange())
+                {
+                    lease.Dispose();
+                    lease = null;
+                    generation = null;
+                    continue;
+                }
+
+                break;
             }
 
-            var result = await generation.ConfigureAwait(false);
             stopwatch.Stop();
+            var cacheLabel = lease.CacheHit ? "hit" : "miss";
+            var tailTurns = lease.TailTurns;
+            var promptChars = lease.PromptChars;
+            var truncatedTurns = session.DroppedTurns;
 
             var totalMs = stopwatch.Elapsed.TotalMilliseconds;
             var ttftMs = sink.Count == 0 ? totalMs : sink.FirstTokenTicks * 1000.0 / Stopwatch.Frequency;
@@ -178,7 +226,8 @@ internal sealed class ChatCompletionsStreamEndpoint
                 // The client is gone: no finish chunk, no error event, nothing. http=0 says so, as it
                 // does on the JSON path. The finally still drains and disposes.
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
-                    status: result.Status.ToString(), finish: "-", httpStatus: 0);
+                    status: result.Status.ToString(), finish: "-", httpStatus: 0,
+                    cache: cacheLabel, tailTurns: tailTurns, truncatedTurns: truncatedTurns);
                 return null;
             }
 
@@ -200,7 +249,8 @@ internal sealed class ChatCompletionsStreamEndpoint
             {
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
                     status: result.Status.ToString(), finish: "-",
-                    httpStatus: sse.Started ? StatusCodes.Status200OK : failure.StatusCode);
+                    httpStatus: sse.Started ? StatusCodes.Status200OK : failure.StatusCode,
+                    cache: cacheLabel, tailTurns: tailTurns, truncatedTurns: truncatedTurns);
                 return await FailAsync(sse, failure, logger, requestId, aborted).ConfigureAwait(false);
             }
 
@@ -237,6 +287,16 @@ internal sealed class ChatCompletionsStreamEndpoint
             // the very same generation "length", and a client that resumes on "length" stopped instead.
             var finishReason = filtered ? "content_filter" : cutter.FinishReason ?? "stop";
 
+            // Back into the cache -- only a context whose generation ended Complete, and only when the
+            // client got the whole reply: after a cut the context holds text the client never saw, so
+            // the transcript it would be stored under is not the one the client will send back. The
+            // generation task has already ended (awaited above), so the context is idle; the finally's
+            // drain finds nothing to wait for and its Dispose finds the lease already settled (D51).
+            if (result.Status == GenerationStatus.Complete && !cutter.IsCut)
+            {
+                lease.Keep(result.Text);
+            }
+
             if (tail.Length > 0)
             {
                 await sse.WriteChunkAsync(Chunk(requestId, created, model,
@@ -251,8 +311,9 @@ internal sealed class ChatCompletionsStreamEndpoint
             // progress-callback count is not a token count. Counted off the cutter rather than the
             // backend's returned text, always: after a cut that text runs past what was sent, after a
             // filtered reply it is empty while deltas did go out, and the cutter is the only thing that
-            // knows exactly how many characters reached the client.
-            var promptTokens = ChatRequestMetrics.EstimateTokens(promptChars);
+            // knows exactly how many characters reached the client. The prompt side is the whole
+            // transcript the model holds, not the tail sent on a cache hit, as on the JSON path.
+            var promptTokens = ChatRequestMetrics.EstimateTokens(lease.TranscriptChars);
             var completionTokens = ChatRequestMetrics.EstimateTokens(cutter.ContentLength);
 
             if (includeUsage)
@@ -269,7 +330,8 @@ internal sealed class ChatCompletionsStreamEndpoint
             await sse.WriteAsync(DoneFrame, aborted).ConfigureAwait(false);
 
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, completionTokens,
-                result.Status.ToString(), finishReason, StatusCodes.Status200OK, totalMs);
+                result.Status.ToString(), finishReason, StatusCodes.Status200OK, totalMs,
+                cache: cacheLabel, tailTurns: tailTurns, truncatedTurns: truncatedTurns);
             return null;
         }
         catch (Exception ex) when (aborted.IsCancellationRequested)
@@ -277,9 +339,10 @@ internal sealed class ChatCompletionsStreamEndpoint
             // A write that failed because the client went away, or the cancellation that follows it.
             // There is nobody to report anything to, and it is not an error: swallow it here rather than
             // let it escape as an unhandled request exception. The finally still drains and disposes.
-            ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs: 0, tokens: 0,
+            ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
                 status: ex is OperationCanceledException ? nameof(GenerationStatus.Cancelled) : ex.GetType().Name,
-                finish: "-", httpStatus: 0);
+                finish: "-", httpStatus: 0,
+                cache: CacheLabel(lease), tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns);
             return null;
         }
         // Unfiltered, so that the two clauses together really are exhaustive. Excluding
@@ -291,17 +354,20 @@ internal sealed class ChatCompletionsStreamEndpoint
         catch (Exception ex)
         {
             var failure = GenerationFailure.FromException(ex);
-            ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs: 0, tokens: 0,
+            ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
                 status: ex.GetType().Name, finish: "-",
-                httpStatus: sse.Started ? StatusCodes.Status200OK : failure.StatusCode);
+                httpStatus: sse.Started ? StatusCodes.Status200OK : failure.StatusCode,
+                cache: CacheLabel(lease), tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns);
             return await FailAsync(sse, failure, logger, requestId, aborted).ConfigureAwait(false);
         }
         finally
         {
-            // Cancel, drain, dispose — in that order, and the order is the whole point. The context is a
+            // Cancel, drain, settle — in that order, and the order is the whole point. The context is a
             // live WinRT handle that the generation task may still be generating against; disposing it
             // while that task runs is a use-after-dispose, not merely an unobserved task. Cancelling
-            // first is what keeps the wait short; awaiting is what makes the disposal safe.
+            // first is what keeps the wait short; awaiting is what makes the disposal safe. The lease's
+            // Dispose is a no-op when Keep already stored the context, which only happens after the
+            // generation was awaited above, so the cache never receives a context still in use.
             // Guarded because this was the one statement in the method outside a try, and it stands
             // between a failure and the disposal below: letting a throw escape would skip both the drain
             // and Dispose(), leaking exactly the handle D43 guarantees is released -- worse than the D51
@@ -323,9 +389,11 @@ internal sealed class ChatCompletionsStreamEndpoint
                 }
             }
 
-            context?.Dispose();
+            lease?.Dispose();
         }
     }
+
+    private static string CacheLabel(ContextLease? lease) => lease is null ? "-" : lease.CacheHit ? "hit" : "miss";
 
     /// <summary>
     /// Cancels the generation without letting the cancel itself fail the request. <c>CancelAsync</c>
@@ -453,7 +521,7 @@ internal sealed class ChatCompletionsStreamEndpoint
     /// </summary>
     private static async Task<GenerationResult> GenerateAsync(
         PreparedChatRequest prepared,
-        IModelContext context,
+        ContextLease lease,
         DeltaSink sink,
         ChannelWriter<string> writer,
         CancellationToken cancellationToken)
@@ -461,8 +529,8 @@ internal sealed class ChatCompletionsStreamEndpoint
         try
         {
             return await prepared.Backend.GenerateAsync(
-                context,
-                prepared.Rendered.Prompt,
+                lease.Context,
+                lease.Prompt,
                 prepared.Sampling,
                 sink.OnDelta,
                 cancellationToken).ConfigureAwait(false);

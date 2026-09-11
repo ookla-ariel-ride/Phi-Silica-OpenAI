@@ -87,7 +87,8 @@ internal static class HealthEndpoint
         BackendLifecycle lifecycle,
         BridgeOptions options,
         IProcessIdentity identity,
-        TimeProvider time)
+        TimeProvider time,
+        ContextCache cache)
     {
         var snapshot = lifecycle.Snapshot;
         var now = time.GetUtcNow();
@@ -112,7 +113,7 @@ internal static class HealthEndpoint
             PackageFamilyName: identity.PackageFamilyName,
             QueueDepth: 0,
             QueueCapacity: options.QueueCapacity,
-            ContextsCached: 0,
+            ContextsCached: cache.Count,
             Error: snapshot.Error,
             Diagnostics: lifecycle.Backend.Diagnostics);
 

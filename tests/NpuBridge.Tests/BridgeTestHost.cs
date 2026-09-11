@@ -31,6 +31,20 @@ internal sealed class BridgeTestHost : IAsyncDisposable
 
     public BackendLifecycle Lifecycle => _app.Services.GetRequiredService<BackendLifecycle>();
 
+    public ContextCache Cache => _app.Services.GetRequiredService<ContextCache>();
+
+    /// <summary>
+    /// The leak invariant since chunk 5: every context the fake created is either in the cache or
+    /// disposed, and nothing is both. Before the cache, "no leak" meant "all disposed"; a successful
+    /// generation now parks its context in the cache instead, so the count of live contexts must
+    /// equal the count the cache holds. Shutdown disposes the rest (see the lifecycle tests).
+    /// </summary>
+    public void AssertNoLeak()
+    {
+        Assert.Equal(Fake.ContextsCreated, Fake.ContextsDisposed + Cache.Count);
+        Assert.Equal(Cache.Count, Fake.ActiveContexts);
+    }
+
     /// <param name="remoteAddress">Remote IP presented to endpoints; TestServer has none, so loopback is simulated by default.</param>
     public static async Task<BridgeTestHost> StartAsync(
         ILanguageModelBackend? backend = null,

@@ -171,4 +171,46 @@ public class BackendLifecycleTests
         await first;
         Assert.True(lifecycle.IsReady);
     }
+
+    [Fact]
+    public async Task Stop_and_dispose_empty_the_context_cache_before_the_backend_is_disposed()
+    {
+        var fake = new FakeBackend();
+        var cache = new ContextCache(4);
+        var lifecycle = new BackendLifecycle(fake, new ManualTimeProvider(T0), NullLogger<BackendLifecycle>.Instance, cache);
+        await lifecycle.StartAsync(CancellationToken.None);
+        await lifecycle.Initialization;
+        cache.Store("k", fake.CreateContext(null));
+        cache.Store("k2", new OrderingContext(fake));
+
+        // Two disposals: the cached fake context, and the one OrderingContext creates and disposes to
+        // prove the backend was still alive.
+        await lifecycle.StopAsync(CancellationToken.None);
+        Assert.Equal(0, cache.Count);
+        Assert.Equal(2, fake.ContextsDisposed);
+
+        // A request finishing after stop hands its context in; the cache no longer keeps anything.
+        cache.Store("late", fake.CreateContext(null));
+        Assert.Equal(0, cache.Count);
+        Assert.Equal(3, fake.ContextsDisposed);
+
+        await lifecycle.DisposeAsync();
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => fake.InitializeAsync(CancellationToken.None));
+    }
+
+    /// <summary>Fails if disposed after its backend: a context must never outlive its model.</summary>
+    private sealed class OrderingContext : IModelContext
+    {
+        private readonly FakeBackend _backend;
+
+        public OrderingContext(FakeBackend backend) => _backend = backend;
+
+        public string Id => "ordering";
+
+        public void Dispose()
+        {
+            // CreateContext throws ObjectDisposedException once the backend is gone.
+            _backend.CreateContext(null).Dispose();
+        }
+    }
 }

@@ -231,13 +231,19 @@ internal static class ChatRequestPreparer
 /// </summary>
 internal static class ChatRequestMetrics
 {
+    /// <summary>Characters per token in every estimate this process makes: usage, the cut (D53), the pressure check.</summary>
+    public const int CharsPerToken = 4;
+
     /// <summary>Documented estimate: four characters per token, rounded up. Never a real tokenizer.</summary>
-    public static int EstimateTokens(int chars) => (chars + 3) / 4;
+    public static int EstimateTokens(int chars) => (chars + CharsPerToken - 1) / CharsPerToken;
 
     /// <summary>
     /// One line per request. <c>http=0</c> means no response was sent because the client had already
-    /// disconnected. Queue wait and cache hits are deliberately absent: neither exists yet, and a
-    /// hard-coded <c>queue_wait_ms=0</c> would read as a measurement.
+    /// disconnected. <c>prompt_chars</c> is what was sent to the backend on this request (the tail, on a
+    /// cache hit); <c>cache</c> is <c>hit</c>, <c>miss</c>, or <c>-</c> when the request failed before
+    /// the lookup; <c>tail_turns</c> counts the turns rendered; <c>truncated_turns</c> the turns
+    /// <c>--truncate-history</c> dropped. Queue wait is deliberately absent: the scheduler does not exist
+    /// yet, and a hard-coded <c>queue_wait_ms=0</c> would read as a measurement.
     /// </summary>
     public static void LogRequest(
         ILogger logger,
@@ -249,11 +255,14 @@ internal static class ChatRequestMetrics
         string status,
         string finish,
         int httpStatus,
-        double? totalMs = null)
+        double? totalMs = null,
+        string cache = "-",
+        int tailTurns = 0,
+        int truncatedTurns = 0)
     {
         var tokensPerSecond = totalMs is > 0 ? tokens * 1000.0 / totalMs.Value : 0;
         logger.LogInformation(
-            "req={RequestId} backend={Backend} prompt_chars={PromptChars} ttft_ms={TtftMs:F1} tokens={Tokens} tok_s={TokensPerSecond:F1} status={Status} finish={Finish} http={Http}",
-            requestId, backend, promptChars, Math.Round(ttftMs, 1), tokens, Math.Round(tokensPerSecond, 1), status, finish, httpStatus);
+            "req={RequestId} backend={Backend} prompt_chars={PromptChars} cache={Cache} tail_turns={TailTurns} truncated_turns={TruncatedTurns} ttft_ms={TtftMs:F1} tokens={Tokens} tok_s={TokensPerSecond:F1} status={Status} finish={Finish} http={Http}",
+            requestId, backend, promptChars, cache, tailTurns, truncatedTurns, Math.Round(ttftMs, 1), tokens, Math.Round(tokensPerSecond, 1), status, finish, httpStatus);
     }
 }

@@ -20,8 +20,10 @@ public sealed record RenderedPrompt(
 /// Flattens an OpenAI chat <c>messages</c> array into the single flat prompt string
 /// <see cref="NpuBridge.Backends.ILanguageModelBackend.GenerateAsync"/> requires, per docs/PLAN.md
 /// section 2.3 / the chunk 3 prompt-rendering constraints (reproduced in the format below). Pure
-/// logic: no I/O, no backend dependency. Deterministic by construction — the same messages always
-/// render to the same string — because chunk 5's context cache hashes this exact output as its key.
+/// logic: no I/O, no backend dependency. Deterministic by construction: the same messages always
+/// render to the same string. It is not the context cache's identity, though: that is
+/// <see cref="ConversationKey"/>, which encodes the same per-turn text with boundaries the rendered
+/// string does not have.
 ///
 /// Format for anything other than a bare single user message:
 /// <code>
@@ -77,6 +79,45 @@ public static class PromptTemplate
 
         var folded = systemText + "\n\n" + body;
         return new RenderedPrompt(systemText, folded, true);
+    }
+
+    /// <summary>
+    /// The prompt for a context-cache hit: only the turns after the cached prefix, in the marker format
+    /// and nothing else. No system text — the cached context already holds it, whichever placement put
+    /// it there — and never the raw pass-through, which exists for the common single-message
+    /// <c>curl</c> case and would here hand the model a bare string in the middle of a marked-up
+    /// conversation. System-role messages in <paramref name="tail"/> are ignored: a system message
+    /// after the cached prefix cannot be applied to a context that has already absorbed its own.
+    /// </summary>
+    public static string RenderTail(IReadOnlyList<ChatMessage> tail)
+    {
+        ArgumentNullException.ThrowIfNull(tail);
+        return BuildBody(tail.Where(m => !IsSystemLike(m.Role)).ToList());
+    }
+
+    /// <summary>The non-system messages of a request, in order: the turns every rendering and the cache key are over.</summary>
+    public static IReadOnlyList<ChatMessage> Turns(IReadOnlyList<ChatMessage> messages)
+    {
+        ArgumentNullException.ThrowIfNull(messages);
+        return messages.Where(m => !IsSystemLike(m.Role)).ToList();
+    }
+
+    /// <summary>The system-role messages of a request, in order, so a caller can rebuild a transcript from truncated turns.</summary>
+    public static IReadOnlyList<ChatMessage> SystemMessages(IReadOnlyList<ChatMessage> messages)
+    {
+        ArgumentNullException.ThrowIfNull(messages);
+        return messages.Where(m => IsSystemLike(m.Role)).ToList();
+    }
+
+    /// <summary>
+    /// The text of one turn exactly as it is rendered into the prompt: content parts joined, trailing
+    /// whitespace trimmed, null content as the empty string. <see cref="ConversationKey"/> hashes this
+    /// rather than the raw content so its identity is the text the model saw.
+    /// </summary>
+    public static string TurnText(ChatMessage message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        return RenderTurnBody(message);
     }
 
     private static bool IsSystemLike(string? role) =>

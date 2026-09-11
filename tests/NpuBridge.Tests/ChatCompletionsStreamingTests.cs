@@ -181,14 +181,20 @@ public class ChatCompletionsStreamingTests
     }
 
     [Fact]
-    public async Task A_streamed_request_creates_exactly_one_context_and_disposes_it()
+    public async Task A_streamed_request_creates_exactly_one_context_and_accounts_for_it()
     {
         var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => LongReply });
-        await using var host = await BridgeTestHost.StartAsync(fake);
+        var host = await BridgeTestHost.StartAsync(fake);
 
         await PostStreamAsync(host);
 
+        // Complete and uncut: the context is in the cache rather than disposed (chunk 5), and
+        // shutdown releases it.
         Assert.Equal(1, fake.ContextsCreated);
+        Assert.Equal(1, host.Cache.Count);
+        host.AssertNoLeak();
+
+        await host.DisposeAsync();
         Assert.Equal(1, fake.ContextsDisposed);
         Assert.Equal(0, fake.ActiveContexts);
     }
@@ -486,8 +492,12 @@ public class ChatCompletionsStreamingTests
     [Fact]
     public async Task An_over_length_prompt_discovered_after_a_keep_alive_is_an_error_event_not_a_stop()
     {
+        // No preflight. On a backend that has one the verdict is known before a byte goes out and
+        // the answer is the 400 of the test above (chunk 5). Only a backend that can say "too long"
+        // solely by failing the generation (Aion, D70) can still deliver it after a keep-alive.
         var fake = new FakeBackend(new FakeBackendOptions
         {
+            Capabilities = BackendCapabilities.SamplingOptions | BackendCapabilities.SystemPromptContext | BackendCapabilities.Cancellation,
             MaxPromptChars = 1,
             StartDelay = TimeSpan.FromMilliseconds(300),
         });
@@ -832,9 +842,11 @@ public class ChatCompletionsStreamingTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Contains("[DONE]", body, StringComparison.Ordinal);
 
-        await WaitUntilAsync(() => fake.ActiveContexts == 0);
+        // The generation ended Complete, so the context went into the cache -- the throwing
+        // registration on the exit cancel changed nothing about that -- and nothing leaked.
         Assert.Equal(1, fake.ContextsCreated);
-        Assert.Equal(1, fake.ContextsDisposed);
+        Assert.Equal(1, host.Cache.Count);
+        host.AssertNoLeak();
     }
 
     /// <summary>

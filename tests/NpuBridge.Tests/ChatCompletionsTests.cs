@@ -39,7 +39,7 @@ public class ChatCompletionsTests
         Assert.Equal("Hello world", choice.GetProperty("message").GetProperty("content").GetString());
         Assert.Equal("stop", choice.GetProperty("finish_reason").GetString());
 
-        AssertNoLeak(fake);
+        host.AssertNoLeak();
     }
 
     [Fact]
@@ -208,7 +208,7 @@ public class ChatCompletionsTests
         Assert.Equal("invalid_request_error", error.GetProperty("type").GetString());
         Assert.Equal("system_prompt_placement_unsupported", error.GetProperty("code").GetString());
         Assert.Empty(fake.Calls);
-        AssertNoLeak(fake);
+        host.AssertNoLeak();
     }
 
     /// <summary>
@@ -239,7 +239,7 @@ public class ChatCompletionsTests
         Assert.Null(call.SystemPrompt);
         Assert.Equal("say hi", call.Prompt);
         Assert.Equal(1, fake.ContextsCreated);
-        AssertNoLeak(fake);
+        host.AssertNoLeak();
     }
 
     [Fact]
@@ -256,7 +256,7 @@ public class ChatCompletionsTests
         var error = (await ReadJson(response)).GetProperty("error");
         Assert.Equal("model_loading", error.GetProperty("code").GetString());
         Assert.Equal("server_error", error.GetProperty("type").GetString());
-        AssertNoLeak(fake);
+        host.AssertNoLeak();
 
         gate.SetResult();
         await host.Lifecycle.Initialization;
@@ -274,7 +274,7 @@ public class ChatCompletionsTests
         Assert.Null(response.Headers.RetryAfter);
         var error = (await ReadJson(response)).GetProperty("error");
         Assert.Equal("model_unavailable", error.GetProperty("code").GetString());
-        AssertNoLeak(fake);
+        host.AssertNoLeak();
     }
 
     [Fact]
@@ -289,7 +289,7 @@ public class ChatCompletionsTests
         var error = (await ReadJson(response)).GetProperty("error");
         Assert.Equal("invalid_request_error", error.GetProperty("type").GetString());
         Assert.Equal("context_length_exceeded", error.GetProperty("code").GetString());
-        AssertNoLeak(fake);
+        host.AssertNoLeak();
     }
 
     [Fact]
@@ -307,7 +307,7 @@ public class ChatCompletionsTests
 
         Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
         Assert.Equal("server_error", (await ReadJson(response)).GetProperty("error").GetProperty("type").GetString());
-        AssertNoLeak(fake);
+        host.AssertNoLeak();
     }
 
     [Fact]
@@ -325,7 +325,7 @@ public class ChatCompletionsTests
 
         Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
         Assert.Equal("backend_error", (await ReadJson(response)).GetProperty("error").GetProperty("code").GetString());
-        AssertNoLeak(fake);
+        host.AssertNoLeak();
     }
 
     [Theory]
@@ -347,7 +347,7 @@ public class ChatCompletionsTests
         var choice = (await ReadJson(response)).GetProperty("choices")[0];
         Assert.Equal(string.Empty, choice.GetProperty("message").GetProperty("content").GetString());
         Assert.Equal("content_filter", choice.GetProperty("finish_reason").GetString());
-        AssertNoLeak(fake);
+        host.AssertNoLeak();
     }
 
     [Fact]
@@ -361,7 +361,7 @@ public class ChatCompletionsTests
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         var error = (await ReadJson(response)).GetProperty("error");
         Assert.Equal("invalid_request_error", error.GetProperty("type").GetString());
-        AssertNoLeak(host.Fake);
+        host.AssertNoLeak();
     }
 
     [Fact]
@@ -411,7 +411,7 @@ public class ChatCompletionsTests
         Assert.Equal("invalid_request_error", error.GetProperty("type").GetString());
         Assert.Equal("messages", error.GetProperty("param").GetString());
         Assert.Empty(host.Fake.Calls);
-        AssertNoLeak(host.Fake);
+        host.AssertNoLeak();
     }
 
     /// <summary>The content-part converter rejects a null part while reading; this pins that it stays a 400.</summary>
@@ -439,7 +439,7 @@ public class ChatCompletionsTests
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         Assert.Equal("messages", (await ReadJson(response)).GetProperty("error").GetProperty("param").GetString());
         Assert.Empty(host.Fake.Calls);
-        AssertNoLeak(host.Fake);
+        host.AssertNoLeak();
     }
 
     [Fact]
@@ -452,7 +452,7 @@ public class ChatCompletionsTests
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(string.Empty, Assert.Single(fake.Calls).Prompt);
-        AssertNoLeak(fake);
+        host.AssertNoLeak();
     }
 
     [Fact]
@@ -681,27 +681,33 @@ public class ChatCompletionsTests
     [Fact]
     public async Task Every_outcome_disposes_every_context_it_created()
     {
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, Simple(), expectedContexts: 1);
-        await AssertBalanced(new FakeBackendOptions { MaxPromptChars = 2, Responder = _ => ["ok"] }, Simple("a long prompt"), expectedContexts: 1);
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureStatus = GenerationStatus.Error }, Simple(), expectedContexts: 1);
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureStatus = GenerationStatus.ContentFiltered }, Simple(), expectedContexts: 1);
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureException = new InvalidOperationException("boom") }, Simple(), expectedContexts: 1);
+        // A generation that ended Complete parks its context in the cache (chunk 5); every other
+        // outcome disposes it (D11). Either way nothing is left dangling, and shutdown empties the cache.
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, Simple(), expectedContexts: 1, expectedCached: 1);
+        await AssertBalanced(new FakeBackendOptions { MaxPromptChars = 2, Responder = _ => ["ok"] }, Simple("a long prompt"), expectedContexts: 1, expectedCached: 0);
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureStatus = GenerationStatus.Error }, Simple(), expectedContexts: 1, expectedCached: 0);
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureStatus = GenerationStatus.ContentFiltered }, Simple(), expectedContexts: 1, expectedCached: 0);
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["a"], FailAfterTokens = 0, FailureException = new InvalidOperationException("boom") }, Simple(), expectedContexts: 1, expectedCached: 0);
 
         // A streamed request reaches the backend like any other, so it creates one context and must
-        // dispose it too -- the response outliving the generation call is exactly what makes streaming
-        // the easy place to leak one.
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, new { model = "fake", stream = true, messages = new[] { new { role = "user", content = "hi" } } }, expectedContexts: 1);
+        // account for it too -- the response outliving the generation call is exactly what makes
+        // streaming the easy place to leak one.
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, new { model = "fake", stream = true, messages = new[] { new { role = "user", content = "hi" } } }, expectedContexts: 1, expectedCached: 1);
 
         // Rejected before the backend is touched: zero created is the right expectation here.
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, new { model = "fake", n = 2, messages = new[] { new { role = "user", content = "hi" } } }, expectedContexts: 0);
-        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, new { model = "fake" }, expectedContexts: 0);
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, new { model = "fake", n = 2, messages = new[] { new { role = "user", content = "hi" } } }, expectedContexts: 0, expectedCached: 0);
+        await AssertBalanced(new FakeBackendOptions { Responder = _ => ["ok"] }, new { model = "fake" }, expectedContexts: 0, expectedCached: 0);
 
-        static async Task AssertBalanced(FakeBackendOptions options, object body, int expectedContexts)
+        static async Task AssertBalanced(FakeBackendOptions options, object body, int expectedContexts, int expectedCached)
         {
             var fake = new FakeBackend(options);
-            await using var host = await BridgeTestHost.StartAsync(fake);
+            var host = await BridgeTestHost.StartAsync(fake);
             await host.Client.PostAsJsonAsync(Path, body);
             Assert.Equal(expectedContexts, fake.ContextsCreated);
+            Assert.Equal(expectedCached, host.Cache.Count);
+            host.AssertNoLeak();
+
+            await host.DisposeAsync();
             Assert.Equal(fake.ContextsCreated, fake.ContextsDisposed);
             Assert.Equal(0, fake.ActiveContexts);
         }
@@ -771,12 +777,6 @@ public class ChatCompletionsTests
     {
         using var content = new StringContent(json, Encoding.UTF8, "application/json");
         return await host.Client.PostAsync(Path, content);
-    }
-
-    private static void AssertNoLeak(FakeBackend fake)
-    {
-        Assert.Equal(fake.ContextsCreated, fake.ContextsDisposed);
-        Assert.Equal(0, fake.ActiveContexts);
     }
 
     private static async Task<JsonElement> ReadJson(HttpResponseMessage response)

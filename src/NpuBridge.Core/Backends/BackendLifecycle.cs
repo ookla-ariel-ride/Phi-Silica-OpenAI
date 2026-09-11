@@ -42,6 +42,7 @@ public sealed class BackendLifecycle : IHostedService, IAsyncDisposable
     private readonly ILanguageModelBackend _backend;
     private readonly TimeProvider _time;
     private readonly ILogger<BackendLifecycle> _logger;
+    private readonly ContextCache? _cache;
     private readonly CancellationTokenSource _shutdown = new();
     private readonly object _gate = new();
 
@@ -49,11 +50,13 @@ public sealed class BackendLifecycle : IHostedService, IAsyncDisposable
     private Task _initialization = Task.CompletedTask;
     private bool _disposed;
 
-    public BackendLifecycle(ILanguageModelBackend backend, TimeProvider time, ILogger<BackendLifecycle> logger)
+    /// <param name="cache">The context cache, when there is one: its contexts are disposed at stop and again at disposal, always before the backend.</param>
+    public BackendLifecycle(ILanguageModelBackend backend, TimeProvider time, ILogger<BackendLifecycle> logger, ContextCache? cache = null)
     {
         _backend = backend;
         _time = time;
         _logger = logger;
+        _cache = cache;
     }
 
     public ILanguageModelBackend Backend => _backend;
@@ -94,6 +97,10 @@ public sealed class BackendLifecycle : IHostedService, IAsyncDisposable
     {
         await _shutdown.CancelAsync().ConfigureAwait(false);
 
+        // Cached contexts first: they are live handles into the model. A request still finishing after
+        // this stores nothing -- the cache disposes anything handed to it once it has shut down.
+        _cache?.Dispose();
+
         // Give an in-flight initialization a moment to observe cancellation; never block shutdown on it.
         // A stubborn runtime is handled by DisposeAsync's grace period instead.
         var finished = await Task.WhenAny(_initialization, Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken))
@@ -122,6 +129,7 @@ public sealed class BackendLifecycle : IHostedService, IAsyncDisposable
                 _backend.DisplayName, DisposeGracePeriod.TotalSeconds);
         }
 
+        _cache?.Dispose();
         await _backend.DisposeAsync().ConfigureAwait(false);
         _shutdown.Dispose();
     }

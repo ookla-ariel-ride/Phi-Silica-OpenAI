@@ -1,0 +1,249 @@
+using System.Net;
+using System.Net.Http.Json;
+using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using NpuBridge.Backends;
+using NpuBridge.Backends.Fake;
+using NpuBridge.Configuration;
+
+namespace NpuBridge.Tests;
+
+/// <summary>
+/// Overflow handling (chunk 5). On a backend with a preflight the verdict comes from
+/// <c>GetUsablePromptLength</c> before anything is generated (D55); on one without, from the
+/// generation's status. Without <c>--truncate-history</c> both are a 400 <c>context_length_exceeded</c>;
+/// with it, the oldest exchange is dropped and the request retried, and the response says how many
+/// turns went. The fake's <c>MaxPromptChars</c> is the window; it counts what a context has absorbed
+/// plus the incoming prompt, like the real thing.
+/// </summary>
+public class TruncationTests
+{
+    private const string Path = "/v1/chat/completions";
+
+    private static readonly BackendCapabilities NoPreflight =
+        BackendCapabilities.SamplingOptions | BackendCapabilities.SystemPromptContext | BackendCapabilities.Cancellation;
+
+    private static object Msg(string role, string content) => new { role, content };
+
+    /// <summary>
+    /// Three exchanges of filler plus the question: 7 turns, 399 rendered characters. Dropping one
+    /// exchange leaves 298, two leave 197, three leave 96 -- so a 250-character window fits after two.
+    /// </summary>
+    private static object[] LongConversation() =>
+    [
+        Msg("user", new string('a', 40)),
+        Msg("assistant", new string('b', 40)),
+        Msg("user", new string('c', 40)),
+        Msg("assistant", new string('d', 40)),
+        Msg("user", new string('e', 40)),
+        Msg("assistant", new string('f', 40)),
+        Msg("user", "final question"),
+    ];
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task With_a_preflight_an_over_length_transcript_is_refused_without_generating(bool stream)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { MaxPromptChars = 150, Responder = _ => ["never"] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync(Path, new { model = "fake", stream, messages = LongConversation() });
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var error = JsonDocument.Parse(body).RootElement.GetProperty("error");
+        Assert.Equal("context_length_exceeded", error.GetProperty("code").GetString());
+        Assert.Contains("'fake'", error.GetProperty("message").GetString(), StringComparison.Ordinal);
+        Assert.Contains("--truncate-history", error.GetProperty("message").GetString(), StringComparison.Ordinal);
+
+        // The point of D55: no generation ran, and the context that was created for the check is gone.
+        Assert.Empty(fake.Calls);
+        Assert.Equal(1, fake.ContextsCreated);
+        Assert.Equal(1, fake.ContextsDisposed);
+        Assert.False(response.Headers.Contains("x-npu-bridge-truncated-turns"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task With_truncate_history_the_oldest_exchanges_are_dropped_until_the_transcript_fits(bool stream)
+    {
+        var capture = new CapturingLoggerProvider();
+        var fake = new FakeBackend(new FakeBackendOptions { MaxPromptChars = 250, Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture,
+            options: new BridgeOptions { Backend = BackendKind.Fake, TruncateHistory = true });
+
+        var response = await host.Client.PostAsJsonAsync(Path, new { model = "fake", stream, messages = LongConversation() });
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.True(response.StatusCode == HttpStatusCode.OK, body);
+        Assert.Equal("4", Assert.Single(response.Headers.GetValues("x-npu-bridge-truncated-turns")));
+
+        // Exactly one generation, on the transcript that fit: the two oldest exchanges are gone, the
+        // third and the question remain.
+        var call = Assert.Single(fake.Calls);
+        Assert.DoesNotContain("aaaa", call.Prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("dddd", call.Prompt, StringComparison.Ordinal);
+        Assert.Contains("eeee", call.Prompt, StringComparison.Ordinal);
+        Assert.Contains("ffff", call.Prompt, StringComparison.Ordinal);
+        Assert.Contains("final question", call.Prompt, StringComparison.Ordinal);
+        Assert.True(call.Prompt.Length <= 250);
+
+        // Each refused attempt created and released a context; the one that generated is cached.
+        Assert.Equal(3, fake.ContextsCreated);
+        Assert.Equal(2, fake.ContextsDisposed);
+        Assert.Equal(1, host.Cache.Count);
+
+        var warnings = capture.Records.Where(r => r.Level == LogLevel.Warning && r.Message.Contains("dropped the oldest", StringComparison.Ordinal)).ToArray();
+        Assert.Equal(2, warnings.Length);
+        Assert.Contains("2 turn(s)", warnings[0].Message, StringComparison.Ordinal);
+        Assert.Contains("4 dropped so far", warnings[1].Message, StringComparison.Ordinal);
+
+        var line = Assert.Single(capture.Records, r => r.Message.Contains("cache=", StringComparison.Ordinal));
+        Assert.Contains("cache=miss tail_turns=3 truncated_turns=4", line.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Nothing_older_than_the_question_is_ever_dropped(bool stream)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { MaxPromptChars = 10, Responder = _ => ["never"] });
+        await using var host = await BridgeTestHost.StartAsync(fake,
+            options: new BridgeOptions { Backend = BackendKind.Fake, TruncateHistory = true });
+
+        var response = await host.Client.PostAsJsonAsync(Path, new
+        {
+            model = "fake",
+            stream,
+            messages = new[] { Msg("user", "a"), Msg("assistant", "b"), Msg("user", new string('q', 100)) },
+        });
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var error = JsonDocument.Parse(body).RootElement.GetProperty("error");
+        Assert.Equal("context_length_exceeded", error.GetProperty("code").GetString());
+        Assert.Contains("Nothing older than the message being answered is left to drop", error.GetProperty("message").GetString(), StringComparison.Ordinal);
+        Assert.Empty(fake.Calls);
+        Assert.Equal(0, fake.ActiveContexts);
+    }
+
+    [Fact]
+    public async Task A_tail_that_does_not_fit_a_cached_context_returns_that_context_untouched_and_truncates_afresh()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { MaxPromptChars = 120, Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake,
+            options: new BridgeOptions { Backend = BackendKind.Fake, TruncateHistory = true });
+
+        // First exchange fits and is cached; the context has absorbed prompt + reply.
+        var first = await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = new[] { Msg("user", new string('a', 60)) } });
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        Assert.Equal(1, host.Cache.Count);
+
+        // The continuation's tail alone is bigger than the room left in the cached context.
+        var second = await host.Client.PostAsJsonAsync(Path, new
+        {
+            model = "fake",
+            messages = new[] { Msg("user", new string('a', 60)), Msg("assistant", "ok"), Msg("user", new string('z', 70)) },
+        });
+        Assert.Equal(HttpStatusCode.OK, second.StatusCode);
+        Assert.Equal("2", Assert.Single(second.Headers.GetValues("x-npu-bridge-truncated-turns")));
+
+        // The generation ran on a fresh context with only the question; the cached context was put
+        // back untouched and is still there beside the new one.
+        Assert.Equal(2, fake.Calls.Count);
+        Assert.NotEqual(fake.Calls[0].ContextId, fake.Calls[1].ContextId);
+        Assert.Empty(fake.Calls[1].History);
+        Assert.DoesNotContain("aaaa", fake.Calls[1].Prompt, StringComparison.Ordinal);
+        Assert.Equal(2, host.Cache.Count);
+        Assert.Equal(2, fake.ContextsCreated);
+        Assert.Equal(0, fake.ContextsDisposed);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Without_a_preflight_the_generation_status_drives_the_same_truncation(bool stream)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Capabilities = NoPreflight, MaxPromptChars = 250, Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake,
+            options: new BridgeOptions { Backend = BackendKind.Fake, TruncateHistory = true });
+
+        var response = await host.Client.PostAsJsonAsync(Path, new { model = "fake", stream, messages = LongConversation() });
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.True(response.StatusCode == HttpStatusCode.OK, body);
+        Assert.Equal("4", Assert.Single(response.Headers.GetValues("x-npu-bridge-truncated-turns")));
+
+        // Three generations: two refused by status, one that answered. Every refused context is gone.
+        Assert.Equal(3, fake.Calls.Count);
+        Assert.Contains("final question", fake.Calls[^1].Prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("dddd", fake.Calls[^1].Prompt, StringComparison.Ordinal);
+        Assert.Equal(3, fake.ContextsCreated);
+        Assert.Equal(2, fake.ContextsDisposed);
+        Assert.Equal(1, host.Cache.Count);
+    }
+
+    [Fact]
+    public async Task Without_a_preflight_and_without_truncate_history_the_status_is_still_the_400()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Capabilities = NoPreflight, MaxPromptChars = 150 });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = LongConversation() });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Single(fake.Calls);
+        Assert.Equal(1, fake.ContextsDisposed);
+        Assert.Equal(0, host.Cache.Count);
+    }
+
+    [Fact]
+    public async Task A_status_driven_truncation_after_a_keep_alive_still_answers_but_cannot_send_the_header()
+    {
+        // The verdict lands after the first keep-alive committed the headers. The retry still happens
+        // and the stream still carries the answer; the header is lost, and the log says so.
+        var capture = new CapturingLoggerProvider();
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Capabilities = NoPreflight,
+            MaxPromptChars = 250,
+            StartDelay = TimeSpan.FromMilliseconds(100),
+            Responder = _ => ["ok"],
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture,
+            keepAliveInterval: TimeSpan.FromMilliseconds(10),
+            options: new BridgeOptions { Backend = BackendKind.Fake, TruncateHistory = true });
+
+        var response = await host.Client.PostAsJsonAsync(Path, new { model = "fake", stream = true, messages = LongConversation() });
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Contains(": keep-alive", body, StringComparison.Ordinal);
+        Assert.Contains("\"content\":\"ok\"", body, StringComparison.Ordinal);
+        Assert.EndsWith("data: [DONE]\n\n", body, StringComparison.Ordinal);
+        Assert.False(response.Headers.Contains("x-npu-bridge-truncated-turns"));
+        Assert.Contains(capture.Records, r => r.Level == LogLevel.Warning && r.Message.Contains("cannot be sent", StringComparison.Ordinal));
+        Assert.Equal(3, fake.Calls.Count);
+        host.AssertNoLeak();
+    }
+
+    [Fact]
+    public async Task Context_pressure_is_warned_once_per_request_near_the_window_hint()
+    {
+        var capture = new CapturingLoggerProvider();
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture,
+            options: new BridgeOptions { Backend = BackendKind.Fake, ContextWindowHint = 256 });
+
+        // 256 tokens is 1024 chars; nine tenths is 922.
+        await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = new[] { Msg("user", new string('x', 900)) } });
+        Assert.DoesNotContain(capture.Records, r => r.Message.Contains("context pressure", StringComparison.Ordinal));
+
+        await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = new[] { Msg("user", new string('x', 950)) } });
+        var warning = Assert.Single(capture.Records, r => r.Message.Contains("context pressure", StringComparison.Ordinal));
+        Assert.Equal(LogLevel.Warning, warning.Level);
+        Assert.Contains("950 chars, 92%", warning.Message, StringComparison.Ordinal);
+    }
+}

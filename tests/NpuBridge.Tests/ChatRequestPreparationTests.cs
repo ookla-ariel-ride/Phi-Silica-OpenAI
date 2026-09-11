@@ -128,7 +128,7 @@ public class ChatRequestPreparationTests
         Assert.Equal(expected.Prompt, call.Prompt);
         Assert.Equal(nativeSystem ? expected.SystemText : null, call.SystemPrompt);
         Assert.Equal(1, fake.ContextsCreated);
-        Assert.Equal(fake.ContextsCreated, fake.ContextsDisposed);
+        host.AssertNoLeak();
     }
 
     private static object Simple() =>

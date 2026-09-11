@@ -44,12 +44,23 @@ public sealed record ChatStreamOptions(bool? IncludeUsage);
 /// One OpenAI chat message. <see cref="Content"/> may be a bare JSON string, an array of content
 /// parts, or (for an assistant message) absent/null. <see cref="ToolCallId"/> and <see cref="Name"/>
 /// are carried through for the <c>tool</c>-role rendering the prompt template (chunk 3 task 2) needs.
+/// <see cref="ToolCalls"/> is the assistant's own tool-call array sent back by a client on the next
+/// turn. It is carried, and it enters the context-cache key (chunk 5), so that an assistant turn
+/// whose content is null and whose meaning is entirely in its tool calls is not an empty turn to the
+/// cache; rendering it to the model is chunk 7's.
 /// </summary>
 public sealed record ChatMessage(
     string? Role,
     ChatMessageContent? Content,
     string? Name,
-    string? ToolCallId);
+    string? ToolCallId,
+    IReadOnlyList<ChatToolCall>? ToolCalls = null);
+
+/// <summary>One entry of an assistant message's <c>tool_calls</c>: <c>{"id","type":"function","function":{...}}</c>.</summary>
+public sealed record ChatToolCall(string? Id, string? Type, ChatFunctionCall? Function);
+
+/// <summary>The <c>function</c> object of a tool call. <see cref="Arguments"/> is the JSON text as the client sent it.</summary>
+public sealed record ChatFunctionCall(string? Name, string? Arguments);
 
 /// <summary>
 /// A single element of an array-form <see cref="ChatMessage.Content"/>, e.g.
