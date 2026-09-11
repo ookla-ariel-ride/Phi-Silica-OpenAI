@@ -5,20 +5,24 @@ NPU). Point OpenCode, Hermes, `curl` or the Python `openai` client at `http://12
 use the NPU model as a provider: local, offline, free.
 
 The model is small: Microsoft documents a context window of about 3.5K tokens, and on a Snapdragon X
-Elite roughly 13,400 characters of prompt fit, generating near 10 tokens per second. Short
-conversations work well. Long agent loops with a dozen tools will not, and this bridge reports that in
-OpenAI's error format rather than hiding it.
+Elite roughly 13,400 characters of prompt fit, decoding at about 35 tokens per second by the bridge's
+own estimate (four characters per token). Short conversations work well, and a continuing conversation
+is cheap because the bridge keeps the model's context between turns. Long agent loops with a dozen
+tools will not fit, and the bridge says so in OpenAI's error format rather than hiding it.
 
 ## Backends
 
 | Backend | API | State |
 |---|---|---|
-| `phi-silica` | `Microsoft.Windows.AI.Text` (Windows App SDK) | works |
+| `phi-silica` | `Microsoft.Windows.AI.Text` (Windows App SDK) | works; every claim below was measured on it |
 | `fake` | in-process, deterministic | for tests and dry runs |
-| `aion` | `AionInstructPreview.Text` (Aion 1.0 Instruct, Microsoft's Phi Silica replacement; preview SDK available now, in-box this fall) | not implemented — the bridge starts, but the backend never reports ready |
+| `aion` | `AionInstructPreview.Text` (Aion 1.0 Instruct preview SDK) | adapter built and unit-tested, never run: on the current Insider build Windows will not let a plain process load the Qualcomm execution provider the SDK needs (`docs/DECISIONS.md` D70). `/healthz` reports the failure |
 
-Aion 1.0 Plan, the 14B reasoning model with a 32K window and native tool calling announced at Build
-2026, is a separate model with no SDK yet. It is tracked as an issue, not a backend.
+Aion 1.0 Instruct, Microsoft's Phi Silica replacement, ships in October and November 2026 as a model
+swap behind the same `Microsoft.Windows.AI.Text` API, so the `phi-silica` backend is the path that will
+serve it. The preview SDK adapter is a stopgap. Aion 1.0 Plan, the 14B reasoning model with a 32K
+window and native tool calling, is a separate model with no SDK yet; it is tracked as an issue, not a
+backend.
 
 ## Requirements
 
@@ -85,15 +89,16 @@ print(reply.choices[0].message.content)
 There is no authentication. The client library insists on a key, so pass anything. Add `stream=True`
 and it streams over server-sent events like any other OpenAI provider.
 
-`scripts/smoke.ps1 -Backend phi-silica` checks the whole surface against the hardware in two to three
-minutes. Re-run `identity.ps1 -Install` whenever the build output folder or the manifest changes.
+`scripts/smoke.ps1 -Backend phi-silica` checks the whole surface against the hardware in three to
+five minutes, including the context cache and the overflow handling. Re-run `identity.ps1 -Install`
+whenever the build output folder or the manifest changes.
 
 ## Endpoints
 
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/chat/completions` | chat completions, streaming and non-streaming |
-| `GET /healthz` | backend state, load time, package identity, diagnostics. 200 when ready, 503 otherwise |
+| `GET /healthz` | backend state, load time, package identity, the context cache's count and hit/miss counters, diagnostics. 200 when ready, 503 otherwise |
 | `GET /v1/models`, `GET /v1/models/{id}` | the active model id |
 | `POST /debug/generate` | one literal prompt into the backend with timing. Diagnostic, loopback only |
 
@@ -101,13 +106,49 @@ Anything else under `/v1` returns an OpenAI-shaped 404, or a 405 with `Allow` wh
 but the method is wrong. Errors use the `{"error":{"message","type","param","code"}}` body, and nothing
 is ever silently truncated.
 
+## Conversations and the context cache
+
+Send the whole conversation each time, as OpenAI clients do. The bridge keeps the model's context
+from the previous turn, so a request whose messages extend a conversation it has already answered
+sends only the new turns to the NPU:
+
+```json
+{"model": "phi-silica", "messages": [
+  {"role": "user", "content": "Name one primary colour. Reply with just the colour."},
+  {"role": "assistant", "content": "Red"},
+  {"role": "user", "content": "Name a different one."}
+]}
+```
+
+The assistant text you echo back has to be what the bridge returned (trailing whitespace is
+forgiven). Change it, or the system prompt, and the request is a different conversation: it replays
+from scratch on a fresh context, which is correct and only slower. Measured on a Snapdragon X Elite,
+the continuation above answered with a first token at 274 ms against 417 ms for the replay, and the
+saving grows with the length of the history.
+
+The cache holds four conversations by default (`--context-cache-size`, `0` disables it) and drops
+the least recently used. A reply that was cut short by `max_tokens` or `stop`, or that failed, never
+goes back into the cache. Two concurrent requests for one conversation never share a context; the
+second replays.
+
+### When the conversation no longer fits
+
+The bridge asks the model how much of the prompt fits before generating, so an over-length
+conversation is refused in about 30 ms with HTTP 400 and code `context_length_exceeded`, and the
+message says how many characters fit. Start the bridge with `--truncate-history` and it instead drops
+the oldest exchange (a user turn and everything the model did in answer to it, tool calls and results
+included) until the conversation fits, never the message being answered, and adds
+`x-npu-bridge-truncated-turns: N` to the reply. Each drop is logged at Warning. A request whose last
+question alone does not fit is still a 400.
+
 ## Request parameters
 
 `temperature`, `top_p` and `top_k` reach Phi Silica. `max_tokens`, `max_completion_tokens` and `stop`
 are enforced by the bridge, since neither Windows API offers them: output is cut at the limit and the
-generation cancelled, which really does stop the accelerator rather than only the client. The tool
-parameters and a few others are accepted and ignored with one warning each per process. `n` above 1 is
-a 400.
+generation cancelled, which really does stop the accelerator rather than only the client. An
+assistant message's `tool_calls` are carried and distinguish conversations in the cache, but tool
+calling itself is not emulated yet: `tools`, `tool_choice` and a few other parameters are accepted and
+ignored with one warning each per process. `n` above 1 is a 400.
 
 ## Configuration
 
@@ -119,17 +160,19 @@ everything.
 |---|---|---|
 | `--backend phi-silica\|aion\|fake` | `phi-silica` | |
 | `--listen <url[;url]>` | `http://127.0.0.1:5273` | localhost only unless you change it, and no auth |
+| `--context-cache-size <n>` | `4` | conversations whose model context is kept between turns; `0` disables |
+| `--truncate-history` | off | drop the oldest exchanges on overflow instead of returning 400 |
+| `--context-window-hint <tokens>` | `4096` | a warning is logged when a conversation reaches nine tenths of it; the model's own answer, not this hint, decides overflow |
 | `--system-prompt-placement auto\|native\|prompt` | `auto` | deliver the system message through the backend's own context, or fold it into the prompt text |
 | `--self-relaunch on\|off` | on | see the note below on why the process relaunches |
 | `--install-model` | off | let Phi Silica fetch its model through Windows Update if missing, several gigabytes |
-| `--verbose` | off | log the rendered prompt and the raw model output |
+| `--verbose` | off | log the rendered prompt, the tail sent on a cache hit, and the raw model output |
 | `--hide-console` | off | hide the console window after startup |
 | `--laf-token`, `--laf-attestation` | none | unused on the experimental channel; prefer the settings file |
 | `--service-name`, `--task-name` | `NpuBridge`, `npu-bridge` | names for the service and logon task |
 
-`--queue-capacity`, `--context-cache-size`, `--truncate-history`, `--tool-emulation`, `--tool-schema`
-and `--context-window-hint` are accepted and range-checked, but nothing reads them; setting one changes
-no behaviour.
+`--queue-capacity`, `--tool-emulation` and `--tool-schema` are accepted and range-checked, but
+nothing reads them yet; setting one changes no behaviour.
 
 Secrets belong in `appsettings.local.json`, which is gitignored. A gitleaks pre-commit hook and a
 GitHub Actions workflow scan for them; enable the hook with `git config core.hooksPath .githooks`.
@@ -148,13 +191,15 @@ never reaches the child and is dropped with a warning.
 Phi Silica uses a logon task (`NpuBridge.exe task install`, elevated); aion and fake use a service
 (`NpuBridge.exe service install`).
 
-**An over-length prompt does not come back as one.** The bridge maps a backend's prompt-too-long
-verdict to a 400 with code `context_length_exceeded`, but Phi Silica never reports one: it fails
-generically after ten to thirty seconds, so you get a 502, or an error frame mid-stream once headers are
-already committed. See `docs/DECISIONS.md` D55.
+**Phi Silica never says a prompt is too long.** Left to itself it fails generically after ten to
+thirty seconds. The 400 you get instead comes from asking the model's prompt-length preflight before
+generating, which is why it arrives in milliseconds. A backend without that preflight (the Aion
+preview SDK) can only say so by failing the generation, and with `--truncate-history` the bridge
+retries after that failure too.
 
 **Token counts are estimates**, characters over four on both sides, not a tokenizer's output. Progress
-callbacks would undercount by about three times on this hardware.
+callbacks would undercount by about three times on this hardware. On a cache hit `prompt_tokens` still
+counts the whole conversation, not only the turns that were sent.
 
 **One request at a time is intent, not enforcement.** Nothing serializes concurrent generations against
 the single model handle, and concurrent requests on hardware are untested.
@@ -166,8 +211,8 @@ endpoint is a finding about the raw model, not about this API.
 ## Repository layout
 
 ```
-src/NpuBridge.Core/     logic: endpoints, DTOs, prompt template, config, backend contract, fake backend
-src/NpuBridge/          ARM64 exe: host, CLI verbs, Phi Silica adapter, package activation, supervisor
+src/NpuBridge.Core/     logic: endpoints, DTOs, prompt template, conversation key, context cache, config, backend contract, fake backend
+src/NpuBridge/          ARM64 exe: host, CLI verbs, Phi Silica and Aion adapters, package activation, supervisor
 tests/NpuBridge.Tests/  xunit against the fake backend through TestServer
 packaging/, scripts/    sparse-package manifest; identity.ps1 and smoke.ps1
 docs/, memory-bank/     plan, decisions, deferred work, session handoff, project notes
@@ -175,7 +220,16 @@ docs/, memory-bank/     plan, decisions, deferred work, session handoff, project
 
 `NpuBridge.Core` has no WinRT references, so the tests run without the NPU. Start with `docs/PLAN.md`
 for the design and the order remaining work lands in, `docs/DECISIONS.md` for why things are the way
-they are, and `docs/FUTURE.md` for what is deliberately not done.
+they are, and `docs/FUTURE.md` for what is deliberately not done. Remaining work is tool-call
+emulation and a request queue with `/v1/completions`; each is a GitHub issue.
+
+## Contributing
+
+Work is tracked in GitHub issues, one per remaining chunk plus defects and cleanups. Each change is
+built on a branch, must keep `dotnet test` green (the suite needs no NPU) and, when it touches a
+backend or the request pipeline, must pass `scripts/smoke.ps1 -Backend phi-silica` on a Copilot+ PC.
+Record a design choice in `docs/DECISIONS.md` and anything you deliberately leave out in
+`docs/FUTURE.md`. Enable the gitleaks hook before your first commit.
 
 ## License
 
