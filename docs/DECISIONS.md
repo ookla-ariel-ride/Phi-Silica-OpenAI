@@ -623,3 +623,37 @@ generically like Phi Silica (D55). The pipeline already turns the first into `40
 context_length_exceeded` on both shapes with the context disposed (tested under the Aion capability
 profile), and the second into a 502 or an in-stream error; chunk 5's `--truncate-history` loop for a
 backend with no preflight waits for the measurement.
+
+**D68. Aion's hardware verification is blocked by the machine; the adapter claims nothing until it
+runs, and Phi Silica is re-verified after the shared refactor.** Measured 2026-09-11 on build 29648.
+`--backend aion` starts by path, resolves both dynamic dependencies
+(`Microsoft.AionInstructPreview.Framework.1.0_1.0.0.0_arm64` and `Microsoft.WindowsAppRuntime.1.8_8000.946.1701.0_arm64`),
+and `LanguageModel.CreateAsync` fails within a second: `CacheApi::CreateCache failed: InvalidCache:
+The model cache is not valid (PsResult=-988)`, per-model `muffin_ctx = -996`, `muffin_iter = -996
+(InvalidData)`. The SDK's own `OutputDebugString` lines, captured with the sample's diagnostic
+listener, say why in order: it loads `Microsoft.Windows.AI.MachineLearning.dll` and `onnxruntime.dll`
+from Windows App Runtime 1.8, then `TryRegister returned false for WinML EP: QNNExecutionProvider`,
+then `selected EP=QNN, Device=NPU, reason=catalog-certified, backend=QnnHtp.dll` regardless, then the
+cache build fails. The registration fails because every DLL in the
+`MicrosoftCorporationII.WinML.Qualcomm.QNN.EP.1.8` package (1.8.30.0, installed today by
+`ExecutionProvider.EnsureReadyAsync`) fails `LoadLibrary` with `E_ACCESSDENIED`, from a process that has
+the package in its dependency graph and can read the files; the Aion framework's DLLs load from the
+same `WindowsApps` root without trouble. The provider package is a sideloaded main package
+(`SignatureKind=Developer`, `IsFramework=False`) whose folder ACL differs from the framework's; the
+sample's validated path had Developer Mode on and this machine has it off, and the sample's issue #6
+was fixed by a newer Qualcomm NPU driver (this machine: 30.0.219.1000, 2025-11). None of that was
+tried here; they are the next things to try (`docs/FUTURE.md`, chunk 6). Consequences: the adapter
+advertises `BackendCapabilities.None` (Cancellation waits for the cut measurement; nothing reads the
+flag yet), `/healthz` carries the SDK's message verbatim, `smoke.ps1 -Backend aion` fails at
+"healthz becomes ready" with that message and 9 steps, and the third overflow behaviour stays
+unmeasured. The sample's own console app could not be built as a control (`FUTURE.md`).
+
+Phi Silica after the D67 refactor, same day, `smoke.ps1 -Backend phi-silica -Port 5298`: every step
+passed. Model create 37 ms warm (9.2 s on the earlier cold run); streamed one-word reply 509 ms end
+to end, first chunk at 344 ms, headers at 338 ms, 0 keep-alives; the new throughput step read 32.9
+estimated tokens per second over the decode phase of a 128-token reply; both placements obeyed the
+Ada system prompt; early cut 518 ms against a 2,808 ms control (0.18 end to end, 0.05 on decode);
+text contract `text_mismatches=0 late_deltas=0` with matching texts; the over-length verdict an
+in-stream error after 7.0 s with the preflight answering 13,429 usable at once (D55 holds). The
+smoke script's auxiliary server is now stopped on every failure path: the Aion run had leaked one on
+port 5299 and the following Phi Silica placement measurement found the port busy.
