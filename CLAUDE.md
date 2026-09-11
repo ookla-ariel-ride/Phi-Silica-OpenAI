@@ -16,14 +16,19 @@ bypass the tool-call emulation rather than use it.
 Status: `docs/PLAN.md` is the signed-off design (read it first). Chunks 1 to 4 of 8 are built and
 merged: skeleton, the Phi Silica adapter, non-streaming `POST /v1/chat/completions` with the prompt
 template, and streaming over server-sent events with the client-side cut for `max_tokens`/`stop`.
+Chunk 6 (the Aion Instruct Preview adapter) merged on 2026-09-11 as **code-verified only** (D66 to
+D70): `AionBackend`, the shared `DeltaAccumulator` in Core, the Aion capability-profile tests and the
+`-Backend aion` smoke steps exist, but no Aion generation has ever run on this machine, because build
+29648 never appends the `WIN://SYSAPPID` token attribute for a main-package dynamic dependency, so the
+Qualcomm QNN provider that Windows ML 1.8 needs cannot be image-mapped (D70; issue #2 stays open for
+the hardware half). Do not spend time on that blocker again: Developer Mode, SFC, DISM, ACLs, drivers
+and package identity are all ruled out; only another Windows build or a Feedback Hub report remains.
 Chunk 5 (context cache + overflow) is next; its blockers are under "Traps for the next chunks" below.
-Code lands in the chunk order listed there. All four defects from the 2026-09-10 code review (#5 to
-#8) are fixed and merged (D62 to D65); #7's adapter text contract was verified on the NPU on 2026-09-11
-after the Windows Insider flight to build 29661, which had broken Phi Silica, was rolled back to 29648.
-If that flight is offered again, expect Phi Silica to break the same way (workload packages fail to
-register, model `NotReady`); do not retry `--install-model` or re-registering on 29661. An empty
+All four defects from the 2026-09-10 code review (#5 to #8) are fixed and merged (D62 to D65). The
+Insider flight to build 29661 broke Phi Silica and was rolled back to 29648; if it is offered again,
+expect the same (workload packages fail to register, model `NotReady`). An empty
 `Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'` listing is not proof of breakage on 29648;
-`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D65 so
+`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D70 so
 far); `docs/FUTURE.md` holds deferred work. Update both whenever a chunk changes a choice or defers
 something.
 
@@ -89,8 +94,11 @@ Three projects, deliberately:
   **Not built yet** — do not describe these as existing: context cache (chunk 5), tool-call
   emulation (chunk 7), generation scheduler and `/v1/completions` (chunk 8).
 - `src/NpuBridge` (net10.0-windows10.0.26100.0, ARM64 exe): `Program.cs`, config, service and task
-  verbs, `PhiSilicaBackend`, `PackageActivation`, packaging manifest. **Not built yet** — `AionBackend`
-  and `FrameworkDependency` are chunk 6.
+  verbs, `PhiSilicaBackend`, `AionBackend` (behind a conditional SDK reference: when
+  `nuget-local/` lacks the Aion nupkg the adapter is excluded and `--backend aion` explains why in
+  `/healthz`, D66), `PackageDependency` (adds the Aion framework and Windows App Runtime 1.8 to the
+  process graph), `PackageActivation`, packaging manifest. The delta accumulator both adapters share
+  lives in Core (`DeltaAccumulator`, D67/D69) so it is unit-tested.
 - `tests/NpuBridge.Tests` (xunit): runs against `FakeBackend` through `TestServer`.
 
 Keep logic out of the exe project; if it needs a test, it belongs in Core.
@@ -183,7 +191,23 @@ request gets its own context and nothing is queued.
   back as a generic `Error` after 26.5 s, while `GetUsablePromptLength` answered 13,429 usable at once
   (D55). So `400 context_length_exceeded` is unreachable on this backend without a preflight. Chunk 5
   must drive overflow detection and the `--truncate-history` loop off `GetUsablePromptLength`, never
-  off a failed generation's status. Aion has no preflight at all, so chunk 6 is a third case.
+  off a failed generation's status. Aion has no preflight at all and its overflow behaviour is still
+  unmeasured (D70), so chunk 5's loop on a preflight-less backend must be designed to learn from the
+  generation status and be re-checked when Aion runs.
+- **Aion Instruct ships as a model swap behind the Phi Silica API, not as a new SDK.** Microsoft's
+  Phi Silica page (updated 2026-07-24) says: a standalone sideloadable package early October 2026;
+  Insider rollout in October with Phi Silica still present, the active model chosen by a Controlled
+  Feature Rollout and a registry key for side-by-side testing; retail in November 2026 with Phi Silica
+  removed; no LAF token. So `PhiSilicaBackend` is the production Aion Instruct path and the preview
+  SDK adapter is a stopgap. When the swap reaches this machine, the work is a `--backend phi-silica`
+  smoke run under the registry key and a re-check of D31, not the Aion adapter. Windows App SDK
+  2.4.8-experimental metadata carries no `Aion` identifier (`memory-bank/techContext.md`).
+- **Windows App SDK 2.4.x has structured JSON output and 2.4.8-experimental has prompt compression.**
+  `LanguageModel.GenerateStructuredJsonResponseAsync(..., jsonSchema)` is in the stable Text metadata
+  of both 2.4.4 and 2.4.8-experimental (a design option for chunk 7's tool calls on Phi Silica);
+  `LanguageModelExperimental.CompressPromptAsync` with `PreferredRetentionRatio` is experimental-only
+  and needs a bump from the 2.4.1-experimental the exe references (an alternative to dropping turns in
+  chunk 5, Phi Silica only). Both noted on issues #3 and #1.
 - **Cancelling really stops the NPU.** Measured on the streaming path with the cut: an early cut
   ended the request in a fraction of the uncut time, and no request is answered until its generation
   has ended. So `Cancellation` is a real capability on Phi Silica, and the cancel → drain → dispose

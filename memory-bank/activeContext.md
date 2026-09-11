@@ -1,16 +1,24 @@
 # Active Context — npu-bridge
 
-_Last updated: 2026-09-11 (all four review bugs merged, #7 verified on the NPU; chunk 5 or 6 next)_
+_Last updated: 2026-09-11 late (chunk 6 merged code-verified only; Aion blocked by the OS; chunk 5 next)_
 
 ## Where we are
-Chunks 1 to 4 are merged on `main`. Chunk 4 (streaming) passed its whole-branch review on 2026-09-07
-(D56 to D59, commit `7817044`) and was fast-forward merged the same day. On 2026-09-10 the four defects
-from the code review became issues and were fixed test-first, reviewed by a Claude subagent and by
-Codex (D62 to D65). #5, #6 and #8 merged that day; #7 (the Phi Silica adapter's text contract) merged
-on 2026-09-11 once the smoke test could run again (`main` at `8f283ca`). All review-fix branches are
-deleted; only `main` exists.
+Chunks 1 to 4 and 6 are merged on `main` (`97243a1`). Chunk 6, the Aion Instruct Preview adapter,
+merged on 2026-09-11 after two adversarial reviews (D66 to D69) but **code-verified only**: build
+29648 never appends `WIN://SYSAPPID` for a main-package dynamic dependency, so the Qualcomm QNN
+provider Windows ML 1.8 needs cannot be image-mapped and no Aion generation has ever run here (D70,
+the full investigation; issue #2 stays open for the hardware half). Chunk 6 also moved the adapters'
+shared delta accumulator into Core with tests, fixed the drain-on-exception and late-delta-counting
+gaps in both adapters (D69), and re-verified Phi Silica after the refactor. All four review defects
+(#5 to #8, D62 to D65) are merged. Only `main` exists.
 
-387 tests pass. `scripts/smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648,
+**Aion Instruct ships as a model swap behind the Phi Silica API** (Microsoft's Phi Silica page,
+2026-07-24): standalone package early October 2026, Insider rollout in October under a Controlled
+Feature Rollout with a registry key for side-by-side testing, retail in November with Phi Silica
+removed, no LAF token. `PhiSilicaBackend` is therefore the production Aion path; the preview SDK
+adapter is a stopgap. Details in `techContext.md`.
+
+404 tests pass. `scripts/smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648,
 including the text-contract step (`text_mismatches=0 late_deltas=0`). The Insider flight to 29661 had
 broken Phi Silica on the evening of 2026-09-10 (workload packages unregisterable, model `NotReady`);
 the owner rolled it back. On 29648 the user-scope `Get-AppxPackage` listing shows no LanguageModel
@@ -59,16 +67,19 @@ serves both shapes.
   defects from the code review, two cleanup items, and one for Aion 1.0 Plan. Read the issue before
   starting; close it from the merge commit.
 - **Aion 1.0 Plan** (14B, 32K, native tool calling) is a different model from Aion Instruct and has no
-  SDK yet; watch for it around late November 2026. Aion Instruct's preview SDK is installable now and
-  is chunk 6's first step; the sample repo was updated 2026-09-10.
-- Owner decision open: whether to do chunk 6 (Aion Instruct adapter) before chunk 5 (context cache).
-  Chunk 5's truncation loop needs to know how a backend without preflight reports overflow, which only
-  chunk 6 can measure.
+  SDK yet; "in the coming months". Windows App SDK 2.4.8-experimental carries no `Aion` identifier.
+- Chunk 6's third overflow behaviour (how Aion reports an over-length prompt) stays unmeasured until
+  Aion runs; chunk 5's truncation loop for a preflight-less backend must learn from the generation
+  status and be re-checked then. Structured JSON output (2.4.x stable) and prompt compression
+  (2.4.8-experimental) are noted on issues #3 and #1 as design options.
+- Do not re-investigate the Aion blocker on this machine: D70 records the mechanism (conditional
+  execute ACE on `WIN://SYSAPPID`, never appended for a dependency), the probes, and everything ruled
+  out (Developer Mode, SFC, DISM, ACLs, signatures, drivers, package identity, the sample's own tool).
 
 ## How to resume
-1. Read `CLAUDE.md`, then `docs/DECISIONS.md` (D51 to D61 are chunk 4, D62 to D65 the review fixes)
-   and the chunk 3 and chunk 4 sections of `docs/FUTURE.md`.
-2. `dotnet build; dotnet test` (387). `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298` should pass
-   every step (1 skipped, 4 informational); if `/healthz` reports `NotReady`, check the OS build first.
-3. Chunk 5 (issue #1, context cache) or chunk 6 (issue #2, Aion Instruct adapter), per the open
-   decision above. Read the issue before starting.
+1. Read `CLAUDE.md`, then `docs/DECISIONS.md` (D51 to D61 chunk 4, D62 to D65 review fixes, D66 to
+   D70 chunk 6) and the chunk 6 section of `docs/FUTURE.md`.
+2. `dotnet build; dotnet test` (404). `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298` should pass
+   every step (1 skipped, 5 informational); if `/healthz` reports `NotReady`, check the OS build first.
+   `-Backend aion` fails at readiness on this machine by design of the blocker.
+3. Chunk 5 (issue #1, context cache). Read the issue and its comments before starting.

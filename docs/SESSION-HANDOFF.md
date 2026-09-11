@@ -1,126 +1,117 @@
-# Session handoff — 2026-09-11
+# Session handoff — 2026-09-11, end of day
 
-Supersedes the 2026-09-10 end-of-day handoff (in git history). Everything below was verified at write
+Supersedes the 2026-09-11 morning handoff (in git history). Everything below was verified at write
 time.
 
 ## TL;DR
 
-- **Chunks 1 to 4 are merged on `main`** (chunk 4's whole-branch review: D56 to D61, commit `7817044`).
-- **All four bugs from the 2026-09-10 code review are fixed and merged: #5, #6, #7, #8** (D62 to D65).
-  #7 (the Phi Silica adapter's text contract) merged this session after the smoke test verified it on
-  the NPU. `main` is at `8f283ca`, 387 tests pass, tree clean, all feature branches deleted.
-- **Phi Silica works again.** The owner rolled the Insider flight to 29661 back to 29648; the full
-  smoke test passes, including the new text-contract step.
-- **Chunk 5 (context cache + overflow) or chunk 6 (Aion Instruct adapter) is next**; see "Open decision".
+- **Chunks 1 to 4 and 6 are merged on `main`** (`main` at or after `97243a1`). All four bugs from the
+  2026-09-10 review are merged too (#5 to #8, D62 to D65).
+- **Chunk 6 (Aion Instruct Preview adapter) is code-verified only.** 404 tests, CI green with and
+  without the Aion NuGet, two adversarial reviews applied (D69), Phi Silica re-verified on the NPU after
+  the shared refactor. No Aion generation has ever run on this machine and none can: see "The Aion
+  blocker". Issue #2 stays open for the hardware half.
+- **Aion Instruct will not need that adapter.** Microsoft ships it in October/November 2026 as a model
+  swap behind the existing Phi Silica API, no LAF token. `PhiSilicaBackend` is the production path.
+- **Chunk 5 (context cache + overflow) is next** (issue #1). The chunk-order decision is closed.
 
 ## State at write time
 
 | Check | Result |
 |---|---|
-| OS build | **29648** (rolled back from 29661) |
-| `dotnet build` | clean, 0 warnings |
-| `dotnet test` | **387 passed**, 0 failed, 1 s |
-| `smoke.ps1 -Backend phi-silica -Port 5298` | **all steps passed**, 1 skipped (tool probe), 4 informational; text-contract step `text_mismatches=0 late_deltas=0`, JSON and SSE texts matched |
-| CI `build` workflow | running on `8f283ca` at write time; green on every earlier push |
-| `main` | `8f283ca`, pushed, tree clean |
-| Branches | only `main`, locally and on origin (`review-fixes` and `chunk-4-streaming` deleted) |
-| GitHub issues | #5 to #8 closed; #1 to #4 (chunks 5 to 8), #9, #10 (tech-debt), #11 (Aion Plan) open |
-
-Smoke numbers this run: model create 38 ms (warm; 9.1 s on the first run after the rollback); first
-token 281 to 454 ms; a one-word streamed reply 423 ms end to end with 5 chunks and 0 keep-alives;
-`max_tokens=8` cut at 32 chars with `finish=length`; `stop` honoured and absent from the reply; early
-cut 590 ms against a 2,965 ms control; the over-length verdict (225,042-char prompt) a generic error
-after 8.7 s, with the preflight answering 13,429 usable at once (D55 holds).
+| OS build | 29648, Developer Mode on (turned on today; changed nothing) |
+| `dotnet build` | clean, 0 warnings, both with the Aion SDK and `-p:AionSdkAvailable=false` |
+| `dotnet test` | **404 passed**, 0 failed |
+| `smoke.ps1 -Backend phi-silica -Port 5298` | all steps passed, 1 skipped, 5 informational; text contract 0/0; 35 est. tok/s |
+| `smoke.ps1 -Backend aion -Port 5298` | fails at "healthz becomes ready" by the blocker; 9 FAIL, 2 PASS, 1 SKIP |
+| Branches | only `main`, locally and on origin |
+| GitHub issues | #7 closed today; #2 open (hardware half of chunk 6); #1, #3, #4, #9, #10, #11 open; #1, #2, #3, #11 carry today's research comments |
 
 ## What this session did
 
-1. Confirmed the rollback: the machine reports build 29648, the sparse-package identity is intact,
-   `/healthz` reports `Ready`, and the smoke test on `main` passed every step.
-2. Rebased `review-fixes` (the two #7 commits) onto `main`, which had gained two docs commits after the
-   branch was cut; build and 387 tests green; smoke test passed with the text-contract step.
-3. Recorded the hardware result in D65 (`docs/DECISIONS.md`), fast-forward merged into `main`, pushed;
-   the merge commit closed #7.
-4. Deleted `review-fixes` and `chunk-4-streaming` locally and on origin.
-5. Brought `CLAUDE.md`, `memory-bank/activeContext.md`, `memory-bank/progress.md` and this file up to
-   date.
+1. Confirmed the 29661 rollback, merged #7 after the smoke test passed, deleted the old branches.
+2. Built chunk 6 in a forked subagent: `AionBackend`, `PackageDependency`, the conditional SDK
+   reference (D66), the shared `DeltaAccumulator` (D67), `AionCapabilityProfileTests`, `-Backend aion`
+   smoke steps, D68 for the blocker as first seen.
+3. Ran the two reviews and applied them (D69): drain in a `finally` in both adapters; stragglers judged
+   by how the generation ended, not by the token (the SSE path could never count a late delta before);
+   accumulator moved to Core with `DeltaAccumulatorTests`; smoke script's D50 branch gated to aion's
+   native run; throughput step refuses a failed generation; ignored-parameter wording.
+4. Traced the Aion blocker to the OS (D70) and exhausted the local remedies.
+5. Researched current docs through Context7 and the web: main-package dynamic dependencies, Windows ML's
+   move to framework-packaged providers in 2.1.3, structured JSON output in 2.4.x, prompt compression in
+   2.4.8-experimental, and how Aion Instruct actually ships. All in `memory-bank/techContext.md`.
+6. Merged chunk 6 (fast-forward, 13 commits), updated `CLAUDE.md`, `docs/PLAN.md`, `memory-bank/` and
+   this file.
 
-## A trap found this session
+## The Aion blocker (do not re-investigate; D70 has everything)
 
-On build 29648, user-scope `Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'` lists **nothing**,
-yet the model is Ready and generates. The previous handoff's resume checklist treated an empty listing
-as "Phi Silica is broken"; that is wrong on this build. **Use `/healthz` (or the smoke test's first
-step) as the check.** The 29661 diagnosis itself stands: if that flight is taken again, the workload
-packages will fail to register with `0x80073CF6` / access denied on the
-`windows.accessControl.undocked` extension, and neither `--install-model` nor re-registering helps.
+A main package's folder under `WindowsApps` grants users execute only through a conditional ACE that
+requires the process token to carry the package family in `WIN://SYSAPPID`. Adding the Qualcomm QNN
+provider (a main package that opts in as a dependency target) with `TryCreatePackageDependency` +
+`AddPackageDependency` returns `S_OK` on this build but never appends that attribute, so every image
+load of the provider fails with error 5, Windows ML 1.8's `TryRegister` fails, and Aion's NPU cache
+build has no provider. Proven by reading the token before and after; reproduced by Microsoft's own
+`AcquireQnnEp` tool and inside a process with sparse-package identity. Ruled out: Developer Mode, SFC
+(no violations), DISM (nothing to repair), folder ACLs, signatures, Smart App Control, AppLocker,
+Defender, the NPU driver, staging on the 29661 flight. The related `windows.accessControl.undocked`
+registration failure predates the flight and recurred after the rollback. Remaining options: a
+different Windows build, or a Feedback Hub report under Developer Platform. The in-box framework
+variant of the provider (1.8.46.0) loads fine but advertises an extension name Windows ML 1.8 does not
+look for.
 
-## Hardware findings that matter for chunks 5 and 6 (2026-09-07, re-confirmed 2026-09-11)
+## What the docs research settled
 
-**Cancelling really does stop the NPU.** An early cut on the streaming path ended in a fifth of the
-control's time, and a request is not answered until its generation ends.
-
-**Phi Silica does not report an over-length prompt as over-length (D55).** It fails with a generic
-`Error` after 7 to 27 s while `GetUsablePromptLength` answers 13,429 usable chars immediately. So
-`400 context_length_exceeded` is unreachable on this backend without a preflight; **chunk 5 must drive
-overflow detection and the `--truncate-history` loop off the preflight**, never off a failed
-generation's status. Aion has no `GetUsablePromptLength`, so chunk 6 is a third behaviour.
-
-## Open decision
-
-Whether to do **chunk 6 (Aion Instruct adapter) before chunk 5 (context cache)**. Chunk 5's
-truncation loop needs to know how a backend without preflight reports overflow, which only chunk 6
-can measure. The 2026-09-10 recommendation was chunk 6 first; the chunk order is the owner's to pick.
+- Aion Instruct: standalone package early October 2026; Insider rollout in October behind a Controlled
+  Feature Rollout with a registry key for side-by-side testing; retail in November with Phi Silica
+  removed; no LAF token. Same `Microsoft.Windows.AI.Text.LanguageModel` API. The preview SDK repo is
+  frozen since 2026-08-07 and `aka.ms/tryaion` points at it.
+- Aion Plan: still no SDK; Windows App SDK 2.4.8-experimental metadata has no `Aion` identifier.
+- Chunk 7 option: `GenerateStructuredJsonResponseAsync(..., jsonSchema)` in 2.4.x stable (issue #3).
+- Chunk 5 option: `CompressPromptAsync` in 2.4.8-experimental only, Phi Silica only (issue #1).
 
 ## Do this next
 
-1. **Chunk 5 (issue #1)** or **chunk 6 (issue #2)**, per the open decision. Read the issue first; it
-   carries scope, constraints, blockers and the definition of done. Chunk 5's two blockers:
-   - The prompt template's output is **not** a safe cache key: turn markers are unescaped, native
-     placement omits the system text from the rendered prompt, and a lone user message passes through
-     raw. The plan's key is a canonical rendering of `(system, turns)`. Do not hash
-     `PromptTemplate.Render`'s output.
-   - `ChatMessage` has no `tool_calls` field, so an assistant message that made a tool call
-     deserializes to an empty turn. Chunk 5 needs it for canonicalization; chunk 7 needs it outright.
-2. Issue #9 (consolidate the duplicated post-generation pipeline) is meant to land before chunk 7.
+1. **Chunk 5 (issue #1).** Read the issue and its comments. Blockers unchanged: the rendered prompt is
+   not a safe cache key (canonical `(system, turns)` key needed), `ChatMessage` lacks `tool_calls`.
+   Aion's overflow behaviour is unmeasured, so the truncation loop for a preflight-less backend must
+   learn from the generation status and be re-checked when Aion runs.
+2. When a Windows build with Aion Instruct behind the Phi Silica API arrives: run
+   `smoke.ps1 -Backend phi-silica` under the registry key, re-check D31 (LAF), and decide the fate of
+   the preview adapter.
+3. Issue #9 (consolidate the duplicated post-generation pipeline) before chunk 7.
 
 ## Machine facts (do not re-discover)
 
-- This PC is the Copilot+ target: Galaxy Book4 Edge, Snapdragon X Elite, Windows 11 ARM64, Insider
-  build **29648** (29661 was taken on 2026-09-10 and rolled back). Git Bash reports `AMD64` under
-  emulation; trust PowerShell.
+- Galaxy Book4 Edge, Snapdragon X Elite, Windows 11 ARM64 Insider build 29648 (29661 was taken on
+  2026-09-10 and rolled back). Git Bash reports `AMD64` under emulation; PowerShell is native Arm64.
 - .NET SDK 10.0.400 arm64. Sparse package registered against the Debug build output, PFN
-  `NpuBridge_jtas4mnxdyzpe`, certificate expires 2031-09-01. The exe binds to Windows App Runtime
-  2.4.1-experimental; `Microsoft.WindowsAppSDK 2.4.1-experimental` is on nuget.org, so CI can restore it.
-- The Aion Instruct framework MSIX and SDK NuGet are not installed; both come from the sample repo's
-  v1.0.0.0 release and are chunk 6's first step. The sample repo was updated 2026-09-10, so re-read its
-  README first. Aion Plan has nothing to install.
-- gitleaks pre-commit hook active (`git config core.hooksPath .githooks`).
-- `smoke.ps1` writes with `Write-Host`; redirecting its stdout to a file captures nothing. Pass `6>&1`
-  for a transcript.
-- A safety hook in the assistant's shell blocks any command that contains a delete and a
-  `C:\Program Files` path together, even when the delete targets somewhere else. Split such commands.
-- No `python` on the machine (the alias points at the Store). Use PowerShell or the Edit tool for
-  scripted file changes. A multi-line `git commit -F -` fed from a PowerShell here-string does not
-  work; write the message to a file and pass `-F <file>`.
-- `Get-AppxPackage -AllUsers`, `Get-WindowsCapability` and listing `C:\ProgramData\Microsoft\Windows\Models`
-  need elevation; `Get-AppxPackage` (user scope), the AppXDeploymentServer event log and
-  `Get-AppPackageLog -ActivityID` do not.
+  `NpuBridge_jtas4mnxdyzpe`. The exe references Windows App SDK 2.4.1-experimental; the local NuGet
+  cache also holds `Microsoft.WindowsAppSDK.AI` 2.4.4 and 2.4.8-experimental from today's checks.
+- Installed today, user scope: `Microsoft.AionInstructPreview.Framework.1.0` 1.0.0.0, the SDK nupkg in
+  `nuget-local/`, `MicrosoftCorporationII.WinML.Qualcomm.QNN.EP.1.8` 1.8.30.0 and `...EP.2`
+  2.2450.47.0. Windows App Runtime 1.8 (8000.946.1701.0) and 2.x were already present.
+- No `python`; use PowerShell or the Edit tool. Multi-line commit messages: write to a file, `-F`.
+- Safety hook: a command combining a delete with a `C:\Program Files` path is blocked; split it.
+- `smoke.ps1` writes with `Write-Host`; pass `6>&1` and split per line before filtering.
+- The session scratchpad held a rebuilt `AcquireQnnEp` (.NET 10), an OutputDebugString capture helper
+  and `run-aion-with-identity.ps1`; scratchpads are session-specific, so rebuild from the sample repo
+  if needed again.
 
 ## Settled, do not re-raise
 
-- Agent skill files are untracked and gitignored; the scaffold `SKILL.md` was deleted.
-- The LAF token is deliberately not being pursued; the experimental channel is the choice.
-- `--install-model` and re-registering the Phi Silica workload packages both fail on 29661; do not
-  retry them on that build. On 29648 nothing needs installing.
-- Work happens on a branch and fast-forward merges when verified, after a subagent review and a Codex
-  review. After the merge, update this file, `CLAUDE.md`, `docs/PLAN.md` and `memory-bank/` in the
-  same session.
+- The LAF token is not pursued; the experimental channel is the choice (and Aion drops LAF anyway).
+- `--install-model` and re-registering Phi Silica workload packages on 29661: fail; not retried.
+- The Aion blocker on this machine: see above.
+- Work happens on a branch and fast-forward merges after a subagent review and a Codex review; after
+  the merge, update this file, `CLAUDE.md`, `docs/PLAN.md` and `memory-bank/` in the same session.
 
 ## Resume checklist
 
 ```powershell
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\Phi-Silica-OpenAI
-git status; git log --oneline -3                          # expect main at or after 8f283ca, tree clean
-dotnet build; dotnet test                                 # expect 387 passed
-.\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 1 skipped, 4 informational
-gh issue list                                             # #1 to #4, #9 to #11 open
+git status; git log --oneline -3                          # expect main at or after 97243a1, tree clean
+dotnet build; dotnet test                                 # expect 404 passed
+.\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 1 skipped, 5 informational
+gh issue list                                             # #1 to #4, #9 to #11 open; #2 is chunk 6's hardware half
 ```

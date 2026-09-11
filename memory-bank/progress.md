@@ -19,13 +19,17 @@
 | Logon task install/status/run/uninstall | ✅ | live, elevated (pre-supervisor build; `/End` path covered by kill-parent probe) |
 | Windows service verbs | ⚠️ | commands verified by tests and emulation; not exercised against the SCM |
 | gitleaks hook + CI | ✅ | planted secrets blocked |
-| Build + test CI (`.github/workflows/build.yml`, windows-latest) | ✅ | added 2026-09-10; first Actions run green in 2 m 22 s |
+| Build + test CI (`.github/workflows/build.yml`, windows-latest) | ✅ | added 2026-09-10; green on every push, including chunk 6 with the Aion nupkg absent (conditional reference, D66) |
+| Aion Instruct adapter (`--backend aion`) | ⚠️ | code-verified: 404 tests incl. `AionCapabilityProfileTests` and `DeltaAccumulatorTests`, two adversarial reviews applied (D69); `/healthz` reports the SDK's `InvalidCache` failure on this machine because the QNN provider cannot be loaded (D70) |
 
 ## Not built yet
 - `/v1/completions` — chunk 8
 - Context cache, `--truncate-history` — chunk 5 (prompt-overflow → HTTP 400 `context_length_exceeded`
   already works, via each backend's preflight capability, not the cache)
-- Aion Instruct adapter — chunk 6 (preview SDK available; not yet installed on the machine)
+- Aion Instruct adapter hardware verification — the adapter merged 2026-09-11 (chunk 6, D66 to D70) but
+  build 29648 never grants a main-package dynamic dependency execute access, so no Aion generation has
+  run; issue #2 stays open. Aion Instruct itself ships in October/November 2026 as a model swap behind
+  the Phi Silica API, so `PhiSilicaBackend` is the production path.
 - Aion Plan backend — unscheduled; the model has no SDK yet (GitHub issue tracks it)
 - Tool-call emulation — chunk 7
 - Scheduler / 429 queue, client docs — chunk 8

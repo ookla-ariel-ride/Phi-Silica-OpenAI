@@ -1,7 +1,7 @@
 # npu-bridge — Plan
 
 OpenAI-compatible HTTP endpoint over the Copilot+ PC on-device language model (Phi Silica today,
-Aion Instruct Preview next). Status: **signed off (§4); chunks 1 to 4 of 8 built and merged; chunk 5
+Aion Instruct Preview next). Status: **signed off (§4); chunks 1 to 4 and 6 of 8 built and merged (6 code-verified only, D70); chunk 5
 next.** This document is the historical design record and is not updated to match the code as it
 ships — current state lives in `memory-bank/progress.md`, and decisions made since sign-off are in
 `docs/DECISIONS.md`.
@@ -390,7 +390,7 @@ build + tests green, an adversarial review pass, and updates to `DECISIONS.md` /
 | 3 | **Done.** **Non-streaming `/v1/chat/completions`.** Request DTOs + validation, `PromptTemplate`, pipeline (no cache yet: fresh context per request), usage estimate, error mapping, per-request log line, `--verbose`. | full test coverage via TestServer + FakeBackend | first real end-to-end on the NPU |
 | 4 | **Done.** **Streaming SSE.** Channel hand-off, chunk framing, `[DONE]`, mid-stream error event, disconnect → cancel + drain, keep-alive, `stream_options.include_usage`, `max_tokens`/`stop` client-side cut. | tests for framing, error, cancel timing | tok/s numbers, does `Cancel()` actually stop the NPU |
 | 5 | **Context cache + overflow.** LRU cache, prefix hashing, exclusive checkout, dispose-on-failure, `context_length_exceeded`, `--truncate-history` loop with preflight, pressure logging, header. | tests incl. leak counting on the fake | cache hit latency on real hardware |
-| 6 | **Aion adapter.** `FrameworkDependency` (from the sample), `AionBackend`, `nuget.config` + `nuget-local/` with the 1.0.0 nupkg, smoke script gains `-Backend aion`. | compiles for ARM64 | smoke test after `Bootstrap.ps1`-style framework install |
+| 6 | **Done (code-verified only, 2026-09-11).** **Aion adapter.** `PackageDependency` (from the sample's `FrameworkDependency`), `AionBackend` behind a conditional SDK reference, `nuget-local/` with the 1.0.0 nupkg, shared `DeltaAccumulator` in Core, capability-profile tests, smoke script gains `-Backend aion`. Hardware half blocked by the OS on this machine (D70); issue #2 open for it. | 404 tests, CI without the nupkg | smoke test after `Bootstrap.ps1`-style framework install: not yet possible here |
 | 7 | **Tool emulation.** Injection, compact schema renderer, tolerant parser, response shaping, tool-result rendering, streaming buffering. Largest test file in the repo. | adversarial parser tests, end-to-end via scripted fake outputs | compliance probe in `smoke.ps1` |
 | 8 | **Concurrency + `/v1/completions` + docs.** Scheduler with bounded queue, 429 + `Retry-After`, queued-cancel, legacy endpoint, `CLIENTS.md` (OpenCode, Hermes, curl, Python), README. | queue tests with a slow fake | OpenCode/Hermes actually driving it |
 
