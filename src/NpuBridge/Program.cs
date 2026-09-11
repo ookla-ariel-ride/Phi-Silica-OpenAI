@@ -202,8 +202,15 @@ internal static class BackendFactory
             BackendKind.Fake => new Backends.Fake.FakeBackend(),
             BackendKind.PhiSilica => new PhiSilicaBackend(options, identity,
                 services.GetRequiredService<ILogger<PhiSilicaBackend>>()),
+#if AION_SDK
+            BackendKind.Aion => new AionInstruct.AionBackend(services.GetRequiredService<ILogger<AionInstruct.AionBackend>>()),
+#else
+            // The SDK NuGet was absent from nuget-local/ when this exe was built (D66).
             BackendKind.Aion => new UnavailableBackend("aion-instruct", "Aion Instruct Preview",
-                "The Aion Instruct adapter is not built yet (planned for chunk 6). Use --backend fake for now."),
+                "This build of npu-bridge was compiled without the Aion Instruct Preview SDK: " +
+                "nuget-local/AionInstructPreview.Text.Framework.1.0.0.nupkg was not present at build time. Download it from " +
+                "https://github.com/microsoft/Aion-Instruct-Preview-Sample/releases into nuget-local/ and rebuild."),
+#endif
             _ => throw new ArgumentOutOfRangeException(nameof(options), options.Backend, "Unknown backend."),
         };
     }

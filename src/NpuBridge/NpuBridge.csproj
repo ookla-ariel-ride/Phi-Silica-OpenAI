@@ -40,7 +40,26 @@
     <WindowsSdkPackageVersion>10.0.26100.57</WindowsSdkPackageVersion>
     <CsWinRTWindowsMetadata>$(NuGetPackageRoot)microsoft.windows.sdk.net.ref\$(WindowsSdkPackageVersion)\winmd</CsWinRTWindowsMetadata>
 
+    <!--
+      Aion Instruct Preview: the SDK NuGet is not on nuget.org. It comes from the sample repo's GitHub
+      release into nuget-local/ (gitignored, wired by nuget.config). When the file is absent (CI, or a
+      fresh clone that has not fetched it) the adapter is left out of the build and the aion backend
+      reports why in /healthz, so one solution builds everywhere and the Core tests still run (D66).
+    -->
+    <AionSdkVersion>1.0.0</AionSdkVersion>
+    <AionSdkNupkg>$(MSBuildThisFileDirectory)..\..\nuget-local\AionInstructPreview.Text.Framework.$(AionSdkVersion).nupkg</AionSdkNupkg>
+    <AionSdkAvailable Condition="Exists('$(AionSdkNupkg)')">true</AionSdkAvailable>
+    <DefineConstants Condition="'$(AionSdkAvailable)' == 'true'">$(DefineConstants);AION_SDK</DefineConstants>
   </PropertyGroup>
+
+  <ItemGroup Condition="'$(AionSdkAvailable)' == 'true'">
+    <!-- Its props feed CsWinRT the AionInstructPreview.Text winmd and add the namespace to CsWinRTIncludes. -->
+    <PackageReference Include="AionInstructPreview.Text.Framework" Version="$(AionSdkVersion)" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(AionSdkAvailable)' != 'true'">
+    <Compile Remove="Backends\AionBackend.cs" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\NpuBridge.Core\NpuBridge.Core.csproj" />
