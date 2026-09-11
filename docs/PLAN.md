@@ -1,8 +1,8 @@
 # npu-bridge — Plan
 
 OpenAI-compatible HTTP endpoint over the Copilot+ PC on-device language model (Phi Silica today,
-Aion Instruct Preview next). Status: **signed off (§4); chunks 1 to 4 and 6 of 8 built and merged (6 code-verified only, D70); chunk 5
-next.** This document is the historical design record and is not updated to match the code as it
+Aion Instruct Preview next). Status: **signed off (§4); chunks 1 to 6 of 8 built and merged (6 code-verified only, D70); issue #9
+then chunk 7 next.** This document is the historical design record and is not updated to match the code as it
 ships — current state lives in `memory-bank/progress.md`, and decisions made since sign-off are in
 `docs/DECISIONS.md`.
 
@@ -389,7 +389,7 @@ build + tests green, an adversarial review pass, and updates to `DECISIONS.md` /
 | 2 | **Done.** **Phi Silica adapter (thin).** `PhiSilicaBackend`: WAR bootstrap, LAF unlock (optional token), ready-state, `CreateAsync`, `CreateContext(system)`, options mapping, status mapping, `GetUsablePromptLength`. `scripts/smoke.ps1` v1 (health + one non-streaming prompt). | compiles for ARM64 | smoke test; you can start it as soon as chunk 3 lands even without a token if the SDK channel doesn't need one |
 | 3 | **Done.** **Non-streaming `/v1/chat/completions`.** Request DTOs + validation, `PromptTemplate`, pipeline (no cache yet: fresh context per request), usage estimate, error mapping, per-request log line, `--verbose`. | full test coverage via TestServer + FakeBackend | first real end-to-end on the NPU |
 | 4 | **Done.** **Streaming SSE.** Channel hand-off, chunk framing, `[DONE]`, mid-stream error event, disconnect → cancel + drain, keep-alive, `stream_options.include_usage`, `max_tokens`/`stop` client-side cut. | tests for framing, error, cancel timing | tok/s numbers, does `Cancel()` actually stop the NPU |
-| 5 | **Context cache + overflow.** LRU cache, prefix hashing, exclusive checkout, dispose-on-failure, `context_length_exceeded`, `--truncate-history` loop with preflight, pressure logging, header. | tests incl. leak counting on the fake | cache hit latency on real hardware |
+| 5 | **Done (2026-09-11, D71 to D75).** **Context cache + overflow.** `ConversationKey` (length-prefixed encoding of `(system, turns)`, not the rendered prompt), `ContextCache` (LRU, exclusive checkout, disposal on eviction/replacement/shutdown), `ConversationSession`/`ContextLease` (lookup, tail rendering, preflight-driven overflow, the `--truncate-history` loop, status-driven retry without a preflight, the header, the pressure warning), `/healthz` cache fields, two smoke steps. | 462 tests incl. leak counting on the fake and both shapes | measured: hit TTFT 235 ms vs 392 ms replay; the preflight refuses 16.6K chars in 31 ms; truncation answers with the header |
 | 6 | **Done (code-verified only, 2026-09-11).** **Aion adapter.** `PackageDependency` (from the sample's `FrameworkDependency`), `AionBackend` behind a conditional SDK reference, `nuget-local/` with the 1.0.0 nupkg, shared `DeltaAccumulator` in Core, capability-profile tests, smoke script gains `-Backend aion`. Hardware half blocked by the OS on this machine (D70); issue #2 open for it. | 404 tests, CI without the nupkg | smoke test after `Bootstrap.ps1`-style framework install: not yet possible here |
 | 7 | **Tool emulation.** Injection, compact schema renderer, tolerant parser, response shaping, tool-result rendering, streaming buffering. Largest test file in the repo. | adversarial parser tests, end-to-end via scripted fake outputs | compliance probe in `smoke.ps1` |
 | 8 | **Concurrency + `/v1/completions` + docs.** Scheduler with bounded queue, 429 + `Retry-After`, queued-cancel, legacy endpoint, `CLIENTS.md` (OpenCode, Hermes, curl, Python), README. | queue tests with a slow fake | OpenCode/Hermes actually driving it |

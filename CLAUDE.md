@@ -13,22 +13,26 @@ and **Aion Instruct Preview** (`AionInstructPreview.Text`, Microsoft's announced
 calling) with no SDK as of 2026-09-10; it is tracked as a GitHub issue, and a backend for it would
 bypass the tool-call emulation rather than use it.
 
-Status: `docs/PLAN.md` is the signed-off design (read it first). Chunks 1 to 4 of 8 are built and
+Status: `docs/PLAN.md` is the signed-off design (read it first). Chunks 1 to 6 of 8 are built and
 merged: skeleton, the Phi Silica adapter, non-streaming `POST /v1/chat/completions` with the prompt
-template, and streaming over server-sent events with the client-side cut for `max_tokens`/`stop`.
-Chunk 6 (the Aion Instruct Preview adapter) merged on 2026-09-11 as **code-verified only** (D66 to
-D70): `AionBackend`, the shared `DeltaAccumulator` in Core, the Aion capability-profile tests and the
-`-Backend aion` smoke steps exist, but no Aion generation has ever run on this machine, because build
-29648 never appends the `WIN://SYSAPPID` token attribute for a main-package dynamic dependency, so the
-Qualcomm QNN provider that Windows ML 1.8 needs cannot be image-mapped (D70; issue #2 stays open for
-the hardware half). Do not spend time on that blocker again: Developer Mode, SFC, DISM, ACLs, drivers
-and package identity are all ruled out; only another Windows build or a Feedback Hub report remains.
-Chunk 5 (context cache + overflow) is next; its blockers are under "Traps for the next chunks" below.
+template, streaming over server-sent events with the client-side cut for `max_tokens`/`stop`, the
+context cache with overflow handling (chunk 5, merged 2026-09-11, D71 to D75: a continuing
+conversation sends only its newest turns on a cached context, an over-length transcript is refused
+by the preflight before a token is generated, and `--truncate-history` drops the oldest exchanges
+instead), and the Aion Instruct Preview adapter (chunk 6, merged 2026-09-11 as **code-verified only**,
+D66 to D70): `AionBackend`, the shared `DeltaAccumulator` in Core, the Aion capability-profile tests
+and the `-Backend aion` smoke steps exist, but no Aion generation has ever run on this machine,
+because build 29648 never appends the `WIN://SYSAPPID` token attribute for a main-package dynamic
+dependency, so the Qualcomm QNN provider that Windows ML 1.8 needs cannot be image-mapped (D70; issue
+#2 stays open for the hardware half). Do not spend time on that blocker again: Developer Mode, SFC,
+DISM, ACLs, drivers and package identity are all ruled out; only another Windows build or a Feedback
+Hub report remains. Next is issue #9 (consolidate the duplicated post-generation pipeline), then
+chunk 7 (tool-call emulation, issue #3).
 All four defects from the 2026-09-10 code review (#5 to #8) are fixed and merged (D62 to D65). The
 Insider flight to build 29661 broke Phi Silica and was rolled back to 29648; if it is offered again,
 expect the same (workload packages fail to register, model `NotReady`). An empty
 `Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'` listing is not proof of breakage on 29648;
-`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D70 so
+`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D76 so
 far); `docs/FUTURE.md` holds deferred work. Update both whenever a chunk changes a choice or defers
 something.
 
@@ -63,7 +67,7 @@ dotnet test --filter "DisplayName~Loading_backend"          # one test by name f
 dotnet run --project src/NpuBridge -- --backend fake --verbose   # run the exe (bin\Debug\...\win-arm64\NpuBridge.exe)
 .\scripts\identity.ps1 -Install                # sparse package identity for Phi Silica; installs the runtime dep; prints the PFN
 .\scripts\identity.ps1 -Status                 # is the package registered, which PFN
-.\scripts\smoke.ps1 -Backend phi-silica        # real NPU run: health, models, /debug/generate, chat (JSON and SSE), the cut, the D53/D55 measurements; the tool probe SKIPs until chunk 7
+.\scripts\smoke.ps1 -Backend phi-silica        # real NPU run: health, models, /debug/generate, chat (JSON and SSE), the cut, the cache hit, the overflow refusal and --truncate-history (on a second server), the D53/D55 measurements; the tool probe SKIPs until chunk 7
 NpuBridge.exe task install|status|uninstall    # logon task that starts Phi Silica with identity (install/uninstall elevated)
 NpuBridge.exe service install|start|stop|uninstall   # Windows service for aion/fake (elevated)
 ```
@@ -79,7 +83,9 @@ Chunk 3 introduced `--system-prompt-placement auto|native|prompt` (default `auto
 backend advertises the capability) and made `POST /v1/chat/completions` real. Chunk 4 made
 `stream: true` real (one `chat.completion.chunk` per delta, `: keep-alive` comments while waiting for
 the first token, `stream_options.include_usage`) and added the client-side cut for `max_tokens`,
-`max_completion_tokens` and `stop` on both response shapes (D53). See "Protocol rules" below.
+`max_completion_tokens` and `stop` on both response shapes (D53). Chunk 5 made `--context-cache-size`
+(default 4, `0` disables) and `--truncate-history` real, and `--context-window-hint` now drives a
+context-pressure warning. See "Protocol rules" below.
 
 ## Architecture (see docs/PLAN.md §2 for the full version)
 
@@ -90,9 +96,12 @@ Three projects, deliberately:
   HTTP framing), message flattening + prompt template (`PromptTemplate`), the shared preparation
   phase (`ChatRequestPreparer`), the JSON and SSE generation phases (`ChatCompletionsEndpoint`,
   `ChatCompletionsStreamEndpoint`), the client-side cut (`OutputLimits`/`OutputCutter`), one failure
-  mapping for both shapes (`GenerationFailure`), `ILanguageModelBackend`, `FakeBackend`.
-  **Not built yet** — do not describe these as existing: context cache (chunk 5), tool-call
-  emulation (chunk 7), generation scheduler and `/v1/completions` (chunk 8).
+  mapping for both shapes (`GenerationFailure`), `ILanguageModelBackend`, `FakeBackend`, the
+  conversation key and the context cache (`ConversationKey`, `ContextCache`), and the session that
+  drives lookup, tail rendering and overflow handling for both shapes (`ConversationSession`,
+  `ContextLease`).
+  **Not built yet** — do not describe these as existing: tool-call emulation (chunk 7), generation
+  scheduler and `/v1/completions` (chunk 8).
 - `src/NpuBridge` (net10.0-windows10.0.26100.0, ARM64 exe): `Program.cs`, config, service and task
   verbs, `PhiSilicaBackend`, `AionBackend` (behind a conditional SDK reference: when
   `nuget-local/` lacks the Aion nupkg the adapter is excluded and `--backend aion` explains why in
@@ -106,24 +115,33 @@ Keep logic out of the exe project; if it needs a test, it belongs in Core.
 Writing tests: never assert on wall-clock timing; gate the fake with `FirstTokenGate`/`InitGate` and
 assert on ordering (D54). `FakeBackend` delivers deltas on the thread pool by default, like WinRT, so
 non-thread-safe state in a delta callback fails in the suite rather than on the NPU. Count contexts
-created against disposed on every new generation path.
+created against disposed plus cached on every new generation path (`BridgeTestHost.AssertNoLeak`): a
+context is in the cache or disposed, never both, never neither.
 
-### Request flow (as of chunk 4)
+### Request flow (as of chunk 5)
 
 ```text
 HTTP → ChatRequestPreparer (shared by both shapes): body → validate DTO → backend readiness
-     → ignored-parameter warnings → placement → PromptTemplate (messages → system + transcript tail)
+     → ignored-parameter warnings → placement → PromptTemplate (messages → system + transcript)
      → OutputLimits (max_tokens/stop) → PreparedChatRequest
-     → stream: false → fresh context → backend.GenerateAsync (deltas watched for the cut)
+     → ConversationSession.Acquire: prefix keys (ConversationKey) → ContextCache.CheckoutLongest
+         hit  → the cached context, prompt = PromptTemplate.RenderTail(turns after the prefix)
+         miss → backend.CreateContext(native system), prompt = the whole rendered transcript
+       → preflight (GetUsablePromptLength) where the backend has one: fits → lease;
+         overflow → cached context returned untouched, then --truncate-history drops the oldest
+         exchange and retries, or 400 context_length_exceeded
+     → stream: false → backend.GenerateAsync on the lease (deltas watched for the cut)
                      → whole-text cut → GenerationFailure mapping → JSON body → usage estimate
-     → stream: true  → fresh context → GenerateAsync started, deltas cross a Channel<string>
+     → stream: true  → GenerateAsync started, deltas cross a Channel<string>
                      → keep-alives until the first delta → role chunk → one chunk per cutter release
                      → finish chunk → optional usage chunk → data: [DONE]
-     → the context is disposed in a finally on both shapes (stream: cancel → drain → dispose, D51)
+     → no preflight (Aion): a PromptLargerThanContext status with --truncate-history drops and retries
+     → the lease is settled once on both shapes: Keep (Complete and uncut → back into the cache under
+       the new key) or Dispose in the finally (stream: cancel → drain → settle, D51)
 ```
 
-No context cache (chunk 5), no scheduler (chunk 8) and no tool-call parse (chunk 7) exist yet; every
-request gets its own context and nothing is queued.
+No scheduler (chunk 8) and no tool-call parse (chunk 7) exist yet; nothing is queued, and two
+concurrent requests for one conversation each get their own context (the second misses).
 
 ### Backend contract facts that must not be "simplified" away
 
@@ -176,24 +194,28 @@ request gets its own context and nothing is queued.
 
 ### Traps for the next chunks
 
-- **The rendered prompt is not a safe cache key.** Chunk 5 must not hash `PromptTemplate.Render`'s
-  output directly: turn markers like `[Assistant]` are not escaped, so a forged user turn can imitate
-  a real one; native placement leaves the system text out of the rendered prompt entirely, so two
-  conversations differing only in system prompt render identically; and the raw-passthrough branch (a
-  lone bare user message) has no markers at all, so a user message that happens to look like a
-  transcript collides with a real one. PLAN §2.5's key is `(system, turns)`, a different function from
-  what `Render` emits today — close that gap before caching lands.
-- **`ChatMessage` has no `tool_calls` field.** An assistant message with `content: null` and a
-  `tool_calls` array deserializes to an empty assistant turn today, silently dropping the tool call.
-  Chunk 7 needs the field to render the model its own protocol back; chunk 5's cache canonicalization
-  needs it so a client that re-serializes our tool-call output still hits the cache.
-- **Phi Silica never reports `PromptLargerThanContext`.** Measured: a 225,042-character prompt came
-  back as a generic `Error` after 26.5 s, while `GetUsablePromptLength` answered 13,429 usable at once
-  (D55). So `400 context_length_exceeded` is unreachable on this backend without a preflight. Chunk 5
-  must drive overflow detection and the `--truncate-history` loop off `GetUsablePromptLength`, never
-  off a failed generation's status. Aion has no preflight at all and its overflow behaviour is still
-  unmeasured (D70), so chunk 5's loop on a preflight-less backend must be designed to learn from the
-  generation status and be re-checked when Aion runs.
+- **The cache key is `ConversationKey`, never the rendered prompt (D71).** The three collision
+  surfaces (unescaped turn markers, native placement dropping the system text from the prompt, the
+  raw pass-through of a lone user message) are closed by a length-prefixed encoding of
+  `(system, turns)`; `ConversationKeyTests` pins each one both ways. Anything chunk 7 adds to a turn
+  (rendered tool calls, injected tool schemas in the system text) must enter the key through
+  `PromptTemplate.TurnText` or the system text, or a cached context will be handed to a conversation
+  the model never saw. Sampling parameters are deliberately not in the key.
+- **`ChatMessage.ToolCalls` is carried and keyed but not rendered.** An assistant message with
+  `content: null` and a `tool_calls` array keys as a distinct turn (D71) but still renders as an
+  empty turn in the prompt. Chunk 7 owns the rendering, and its stored key after a tool-call reply
+  must be computed from the parsed calls so a client that re-serialises our output still hits.
+- **Overflow is decided by the preflight where one exists (D73).** Phi Silica never reports
+  `PromptLargerThanContext` (D55), so `ConversationSession` asks `GetUsablePromptLength` before
+  generating and the 400 now arrives in tens of milliseconds. Aion has no preflight, so both endpoints
+  retry on a `PromptLargerThanContext` status when `--truncate-history` can drop something; Aion's
+  actual overflow status is still unmeasured (D70), so re-check that path when it runs. After a
+  truncation the next request in that conversation misses and truncates again (`docs/FUTURE.md`).
+- **A context in the cache is never in use, and a context that failed is never in the cache (D72).**
+  Keep the lease discipline when chunk 7 buffers replies for tool detection: `Keep` only after the
+  generation task has ended `Complete` with the client-visible text equal to the backend's text;
+  everything else disposes. Chunk 8's scheduler may let the second concurrent request for one
+  conversation wait for the first's context instead of missing.
 - **Aion Instruct ships as a model swap behind the Phi Silica API, not as a new SDK.** Microsoft's
   Phi Silica page (updated 2026-07-24) says: a standalone sideloadable package early October 2026;
   Insider rollout in October with Phi Silica still present, the active model chosen by a Controlled
@@ -217,10 +239,22 @@ request gets its own context and nothing is queued.
 
 Live today:
 
-- Errors use the OpenAI body `{"error":{"message","type","param","code"}}`. `PromptLargerThanContext`
-  is HTTP 400 with code `context_length_exceeded`, and nothing is silently truncated.
-  `--truncate-history` is inert until chunk 5; when it lands it is the only switch that may drop turns
-  instead of returning that 400.
+- Errors use the OpenAI body `{"error":{"message","type","param","code"}}`. An over-length
+  transcript is HTTP 400 with code `context_length_exceeded` — from the preflight before any
+  generation on Phi Silica, from the generation's status on a backend without one — and nothing is
+  silently truncated. `--truncate-history` is the only switch that may drop turns instead: it removes
+  the oldest exchange (every turn up to the next user turn, tool calls and results included) until the
+  transcript fits, never the message being answered, logs each drop at Warning, and adds
+  `x-npu-bridge-truncated-turns: N` (turns dropped) to the response once a generation is attempted on
+  the truncated transcript; the 400 refusal carries no header. On a stream that had already sent
+  a keep-alive when a status-driven truncation happened, the header cannot be sent and the log says so.
+- **The context cache** (D71, D72): a request whose transcript extends a cached prefix (ending in an
+  assistant turn, longest match wins) generates on that context with only the tail rendered, in the
+  marker format; a context goes back in only after a `Complete`, uncut generation, under the key of
+  the transcript plus the reply. `usage.prompt_tokens` estimates the whole transcript on a hit and a
+  miss alike; the log line's `prompt_chars` is what was sent, and it also carries `cache=hit|miss`,
+  `tail_turns=N` and `truncated_turns=N`. `/healthz` reports `contexts_cached`,
+  `context_cache_capacity`, `context_cache_hits` and `context_cache_misses`.
 - Token counts in `usage` are estimates: `ceil(chars/4)` on both `prompt_tokens` and
   `completion_tokens` (D44). On a stream, `completion_tokens` counts the characters the cutter
   actually released, not the backend's returned text.

@@ -1,108 +1,98 @@
-# Session handoff — 2026-09-11, end of day
+# Session handoff — 2026-09-11, after the chunk 5 merge
 
-Supersedes the 2026-09-11 morning handoff (in git history). Everything below was verified at write
+Supersedes the 2026-09-11 end-of-day handoff (in git history). Everything below was verified at write
 time.
 
 ## TL;DR
 
-- **Chunks 1 to 4 and 6 are merged on `main`** (`main` at or after `97243a1`). All four bugs from the
-  2026-09-10 review are merged too (#5 to #8, D62 to D65).
-- **Chunk 6 (Aion Instruct Preview adapter) is code-verified only.** 404 tests, CI green with and
-  without the Aion NuGet, two adversarial reviews applied (D69), Phi Silica re-verified on the NPU after
-  the shared refactor. No Aion generation has ever run on this machine and none can: see "The Aion
-  blocker". Issue #2 stays open for the hardware half.
-- **Aion Instruct will not need that adapter.** Microsoft ships it in October/November 2026 as a model
-  swap behind the existing Phi Silica API, no LAF token. `PhiSilicaBackend` is the production path.
-- **Chunk 5 (context cache + overflow) is next** (issue #1). The chunk-order decision is closed.
+- **Chunks 1 to 6 are merged on `main`** (`main` at or after `ef29693`). Chunk 5 (context cache and
+  overflow handling, issue #1) merged today after two adversarial reviews and two Phi Silica smoke
+  runs; D71 to D76 record it. Chunk 6 stays code-verified only (D70; issue #2 open).
+- **What chunk 5 does:** a continuing conversation hits a cached context and sends only its newest
+  turns (measured: 274 ms TTFT on a hit against 417 ms for the replay); an over-length transcript is
+  refused by the preflight in 31 ms instead of a 26 s failed generation (D55 closed); with
+  `--truncate-history` the oldest exchanges are dropped and the reply carries
+  `x-npu-bridge-truncated-turns`. `/healthz` reports `contexts_cached`, `context_cache_capacity`,
+  `context_cache_hits`, `context_cache_misses`.
+- **Next:** issue #9 (consolidate the duplicated post-generation pipeline) before chunk 7 (tool-call
+  emulation, issue #3).
 
 ## State at write time
 
 | Check | Result |
 |---|---|
-| OS build | 29648, Developer Mode on (turned on today; changed nothing) |
+| OS build | 29648 |
 | `dotnet build` | clean, 0 warnings, both with the Aion SDK and `-p:AionSdkAvailable=false` |
-| `dotnet test` | **404 passed**, 0 failed |
-| `smoke.ps1 -Backend phi-silica -Port 5298` | all steps passed, 1 skipped, 5 informational; text contract 0/0; 35 est. tok/s |
-| `smoke.ps1 -Backend aion -Port 5298` | fails at "healthz becomes ready" by the blocker; 9 FAIL, 2 PASS, 1 SKIP |
-| Branches | only `main`, locally and on origin |
-| GitHub issues | #7 closed today; #2 open (hardware half of chunk 6); #1, #3, #4, #9, #10, #11 open; #1, #2, #3, #11 carry today's research comments |
+| `dotnet test` | **472 passed**, 0 failed |
+| `smoke.ps1 -Backend phi-silica -Port 5298` | all steps passed, 1 skipped, 5 informational, twice today (before and after the review fixes) |
+| Branches | only `main`, locally and on origin (the chunk 5 branch was deleted after the fast-forward) |
+| GitHub issues | #1 closed by the merge; #2 open (hardware half of chunk 6); #3, #4, #9, #10, #11 open |
 
 ## What this session did
 
-1. Confirmed the 29661 rollback, merged #7 after the smoke test passed, deleted the old branches.
-2. Built chunk 6 in a forked subagent: `AionBackend`, `PackageDependency`, the conditional SDK
-   reference (D66), the shared `DeltaAccumulator` (D67), `AionCapabilityProfileTests`, `-Backend aion`
-   smoke steps, D68 for the blocker as first seen.
-3. Ran the two reviews and applied them (D69): drain in a `finally` in both adapters; stragglers judged
-   by how the generation ended, not by the token (the SSE path could never count a late delta before);
-   accumulator moved to Core with `DeltaAccumulatorTests`; smoke script's D50 branch gated to aion's
-   native run; throughput step refuses a failed generation; ignored-parameter wording.
-4. Traced the Aion blocker to the OS (D70) and exhausted the local remedies.
-5. Researched current docs through Context7 and the web: main-package dynamic dependencies, Windows ML's
-   move to framework-packaged providers in 2.1.3, structured JSON output in 2.4.x, prompt compression in
-   2.4.8-experimental, and how Aion Instruct actually ships. All in `memory-bank/techContext.md`.
-6. Merged chunk 6 (fast-forward, 13 commits), updated `CLAUDE.md`, `docs/PLAN.md`, `memory-bank/` and
-   this file.
+1. Built chunk 5 in-session on `chunk-5-context-cache`: `ConversationKey` (a length-prefixed encoding
+   of `(system, turns)`, never the rendered prompt, D71), `ContextCache` (bounded LRU, exclusive
+   checkout, disposal on eviction/replacement/shutdown, D72), `ConversationSession` and
+   `ContextLease` (lookup, tail rendering, preflight-driven overflow, the truncation loop, the
+   status-driven retry for backends without a preflight, the header, the pressure warning, D73),
+   `ChatMessage.ToolCalls`, the `/healthz` fields (D74), two smoke steps.
+2. Ran the Phi Silica smoke test (D75), then two adversarial reviews (a Claude subagent and Codex).
+   Both found the exchange boundary at the first assistant turn (it orphaned tool results) and a
+   throwing preflight leaking its context; Codex also found the JSON retry inheriting a cancelled
+   token. All fixed with ten tests (D76); the smoke run repeated clean.
+3. Fast-forward merged, updated `CLAUDE.md`, `docs/PLAN.md`, `memory-bank/` and this file.
 
-## The Aion blocker (do not re-investigate; D70 has everything)
+## Things learned today worth keeping
 
-A main package's folder under `WindowsApps` grants users execute only through a conditional ACE that
-requires the process token to carry the package family in `WIN://SYSAPPID`. Adding the Qualcomm QNN
-provider (a main package that opts in as a dependency target) with `TryCreatePackageDependency` +
-`AddPackageDependency` returns `S_OK` on this build but never appends that attribute, so every image
-load of the provider fails with error 5, Windows ML 1.8's `TryRegister` fails, and Aion's NPU cache
-build has no provider. Proven by reading the token before and after; reproduced by Microsoft's own
-`AcquireQnnEp` tool and inside a process with sparse-package identity. Ruled out: Developer Mode, SFC
-(no violations), DISM (nothing to repair), folder ACLs, signatures, Smart App Control, AppLocker,
-Defender, the NPU driver, staging on the 29661 flight. The related `windows.accessControl.undocked`
-registration failure predates the flight and recurred after the rollback. Remaining options: a
-different Windows build, or a Feedback Hub report under Developer Platform. The in-box framework
-variant of the provider (1.8.46.0) loads fine but advertises an extension name Windows ML 1.8 does not
-look for.
-
-## What the docs research settled
-
-- Aion Instruct: standalone package early October 2026; Insider rollout in October behind a Controlled
-  Feature Rollout with a registry key for side-by-side testing; retail in November with Phi Silica
-  removed; no LAF token. Same `Microsoft.Windows.AI.Text.LanguageModel` API. The preview SDK repo is
-  frozen since 2026-08-07 and `aka.ms/tryaion` points at it.
-- Aion Plan: still no SDK; Windows App SDK 2.4.8-experimental metadata has no `Aion` identifier.
-- Chunk 7 option: `GenerateStructuredJsonResponseAsync(..., jsonSchema)` in 2.4.x stable (issue #3).
-- Chunk 5 option: `CompressPromptAsync` in 2.4.8-experimental only, Phi Silica only (issue #1).
+- **`contexts_cached` alone cannot prove a cache hit once the cache is full**: a miss evicts one and
+  adds one, so the count is unchanged either way. That is why `/healthz` gained the hit and miss
+  counters and why the smoke step reads them (D74).
+- **The preflight's answer depends on the text**: 13,179 usable characters for the smoke transcript,
+  13,429 for the D55 prompt. It is a tokenizer's verdict, not a constant; ask it every time.
+- **After a truncation the next request in that conversation misses and truncates again** (the
+  stored key is over the truncated transcript, the client sends the full one). Correct but slower;
+  the fix options are in `docs/FUTURE.md`'s chunk 5 section.
+- **Do not run `dotnet build` while `smoke.ps1` has a server up**: the exe is locked and the copy
+  step fails. Wait for the run, then build.
+- Under package activation the server's console output is not in the smoke log (the by-path parent
+  is what the redirect captures), so the server-side log line is not evidence for a smoke assertion;
+  `/healthz` and the response are.
 
 ## Do this next
 
-1. **Chunk 5 (issue #1).** Read the issue and its comments. Blockers unchanged: the rendered prompt is
-   not a safe cache key (canonical `(system, turns)` key needed), `ChatMessage` lacks `tool_calls`.
-   Aion's overflow behaviour is unmeasured, so the truncation loop for a preflight-less backend must
-   learn from the generation status and be re-checked when Aion runs.
-2. When a Windows build with Aion Instruct behind the Phi Silica API arrives: run
+1. **Issue #9**: consolidate the duplicated post-generation pipeline across the two shapes before
+   chunk 7 adds the buffered tool-detection path on top of both. Chunk 5 added a retry loop to each
+   endpoint, which makes the duplication larger, not smaller.
+2. **Chunk 7 (issue #3)**: tool-call emulation. `ChatMessage.ToolCalls` is already carried and keyed;
+   rendering the model its own protocol and computing the stored key from the parsed calls are the
+   chunk's job. Structured JSON output (`GenerateStructuredJsonResponseAsync`, 2.4.x stable) is the
+   design option on the issue.
+3. When a Windows build with Aion Instruct behind the Phi Silica API arrives: run
    `smoke.ps1 -Backend phi-silica` under the registry key, re-check D31 (LAF), and decide the fate of
-   the preview adapter.
-3. Issue #9 (consolidate the duplicated post-generation pipeline) before chunk 7.
+   the preview adapter. When any Aion generation runs, re-check the status-driven overflow path (D73).
 
 ## Machine facts (do not re-discover)
 
 - Galaxy Book4 Edge, Snapdragon X Elite, Windows 11 ARM64 Insider build 29648 (29661 was taken on
   2026-09-10 and rolled back). Git Bash reports `AMD64` under emulation; PowerShell is native Arm64.
 - .NET SDK 10.0.400 arm64. Sparse package registered against the Debug build output, PFN
-  `NpuBridge_jtas4mnxdyzpe`. The exe references Windows App SDK 2.4.1-experimental; the local NuGet
-  cache also holds `Microsoft.WindowsAppSDK.AI` 2.4.4 and 2.4.8-experimental from today's checks.
-- Installed today, user scope: `Microsoft.AionInstructPreview.Framework.1.0` 1.0.0.0, the SDK nupkg in
+  `NpuBridge_jtas4mnxdyzpe`. The exe references Windows App SDK 2.4.1-experimental.
+- Installed, user scope: `Microsoft.AionInstructPreview.Framework.1.0` 1.0.0.0, the SDK nupkg in
   `nuget-local/`, `MicrosoftCorporationII.WinML.Qualcomm.QNN.EP.1.8` 1.8.30.0 and `...EP.2`
-  2.2450.47.0. Windows App Runtime 1.8 (8000.946.1701.0) and 2.x were already present.
-- No `python`; use PowerShell or the Edit tool. Multi-line commit messages: write to a file, `-F`.
+  2.2450.47.0. Windows App Runtime 1.8 (8000.946.1701.0) and 2.x present.
+- No `python`; `perl` is available in Git Bash and is the reliable way to script multi-line edits
+  (shell-quoted heredocs into perl mangled escapes twice today; a `.pl` file written with the Write
+  tool did not). `scripts/smoke.ps1` is CRLF; the `.cs` and `.md` files are LF.
 - Safety hook: a command combining a delete with a `C:\Program Files` path is blocked; split it.
 - `smoke.ps1` writes with `Write-Host`; pass `6>&1` and split per line before filtering.
-- The session scratchpad held a rebuilt `AcquireQnnEp` (.NET 10), an OutputDebugString capture helper
-  and `run-aion-with-identity.ps1`; scratchpads are session-specific, so rebuild from the sample repo
-  if needed again.
 
 ## Settled, do not re-raise
 
 - The LAF token is not pursued; the experimental channel is the choice (and Aion drops LAF anyway).
-- `--install-model` and re-registering Phi Silica workload packages on 29661: fail; not retried.
-- The Aion blocker on this machine: see above.
+- The Aion blocker on this machine: D70 has everything; only another build or a Feedback Hub report.
+- The cache key is `ConversationKey`, never the rendered prompt (D71); the truncation header is set
+  once a generation is attempted and never on the refusal (D76); sampling parameters are not in the
+  key.
 - Work happens on a branch and fast-forward merges after a subagent review and a Codex review; after
   the merge, update this file, `CLAUDE.md`, `docs/PLAN.md` and `memory-bank/` in the same session.
 
@@ -110,8 +100,8 @@ look for.
 
 ```powershell
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\Phi-Silica-OpenAI
-git status; git log --oneline -3                          # expect main at or after 97243a1, tree clean
-dotnet build; dotnet test                                 # expect 404 passed
+git status; git log --oneline -3                          # expect main at or after ef29693, tree clean
+dotnet build; dotnet test                                 # expect 472 passed
 .\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 1 skipped, 5 informational
-gh issue list                                             # #1 to #4, #9 to #11 open; #2 is chunk 6's hardware half
+gh issue list                                             # #2, #3, #4, #9, #10, #11 open
 ```

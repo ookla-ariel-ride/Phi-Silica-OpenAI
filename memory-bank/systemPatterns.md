@@ -9,27 +9,34 @@ NpuBridge (exe, ARM64)          NpuBridge.Core (net10.0, no WinRT)          NpuB
   Backends/PackageDependency                   DeltaAccumulator (shared by both adapters)
   PackageActivation.cs             Configuration/ options, binder, CLI, sources
   ServiceCommands/TaskCommands     Hosting/    sc.exe + schtasks builders, identity
-  ProcessIdentity.cs               Prompting/  PromptTemplate (message flattening)
-                                    (not yet)   Context/ (chunk 5), Tools/ (chunk 7)
+  ProcessIdentity.cs               Prompting/  PromptTemplate (flattening, tail), ConversationKey
+                                   Backends/   ContextCache; Api/ ConversationSession + ContextLease
+                                    (not yet)   Tools/ (chunk 7)
 ```
 Logic lives in Core so it is testable without the NPU; the exe holds only wiring, WinRT adapters and
-Windows-specific glue. Tests boot the real endpoint pipeline in-process. `Context/` (cache, chunk 5)
-and `Tools/` (tool-call emulation, chunk 7) don't exist yet; streaming lives in
-`Api/ChatCompletionsStreamEndpoint` beside the JSON shape, not in a separate folder. `AionBackend`
+Windows-specific glue. Tests boot the real endpoint pipeline in-process. The cache landed beside the
+backends (`Backends/ContextCache`) with its key in `Prompting/` and the per-request session in `Api/`
+rather than in a `Context/` folder; `Tools/` (tool-call emulation, chunk 7) doesn't exist yet;
+streaming lives in `Api/ChatCompletionsStreamEndpoint` beside the JSON shape, not in a separate folder. `AionBackend`
 compiles only when `nuget-local/` holds the Aion nupkg (`AionSdkAvailable`, D66); CI builds without it.
 
-## Request flow (as built through chunk 6)
+## Request flow (as built through chunk 5, 2026-09-11)
 `ChatRequestPreparer` does the shared part for both shapes, in order: parse the JSON body (malformed
 body → 400, no context created) → validate the DTO against what the deserializer can actually produce,
 not just what the type declares (400 on failure, no context created) → check the backend is `Ready`
 (503 if not, no context created) → warn once per process on any accepted-but-ignored parameter →
 choose the system-prompt placement → render the prompt (`PromptTemplate`) → compute the output limits
 (`max_tokens`/`stop`, D53). Then `ChatCompletionsEndpoint` (JSON) or `ChatCompletionsStreamEndpoint`
-(SSE) creates the context → generates, watching deltas for the cut → disposes the context in a
-`finally` on every path that reached this point (success, overflow, content filter, backend
-`Error`/`Cancelled`, a thrown exception, client abort; the stream cancels → drains → disposes, D51) →
-shapes the OpenAI response → logs the outcome. There is no context cache yet (chunk 5): every request
-creates and disposes its own context.
+(SSE) builds a `ConversationSession` and acquires a `ContextLease`: the transcript's prefix keys
+(`ConversationKey`, one per assistant turn) are looked up in `ContextCache`, longest first; a hit
+checks that context out and renders only the tail (`PromptTemplate.RenderTail`), a miss creates a
+context and renders everything; where the backend has a preflight, `GetUsablePromptLength` decides
+overflow before anything is generated, and `--truncate-history` drops the oldest exchange and retries
+(D73). Then it generates on the lease, watching deltas for the cut → settles the lease exactly once
+on every path: `Keep` after a `Complete`, uncut generation puts the context back under the new key,
+anything else disposes it in the `finally` (the stream cancels → drains → settles, D51; D72) → shapes
+the OpenAI response → logs the outcome with `cache=`, `tail_turns=` and `truncated_turns=`. Two
+concurrent requests for one conversation never share a context: the second misses.
 
 ## Conventions this chunk established
 - **Validate what the deserializer can produce, not just what the type says.** `System.Text.Json` will

@@ -3,7 +3,7 @@
 ## Works today (verified)
 | Area | Status | Evidence |
 |---|---|---|
-| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; 404 xunit tests green (chunk 6 merged 2026-09-11) |
+| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; 462 xunit tests green (chunk 5 merged 2026-09-11) |
 | `/healthz`, `/v1/models`, `/v1` fallback | ✅ | TestServer tests + live curl on the exe |
 | Config precedence json < local < env < CLI | ✅ | real-file test + live probes |
 | CLI verbs `run`, `service`, `task`, `help`, `version` | ✅ | tests + live exit codes |
@@ -15,7 +15,9 @@
 | `/v1/chat/completions` streaming (SSE) | ✅ | `ChatCompletionsStreamingTests` (framing, error event, keep-alive, disconnect drain); smoke streaming step on the NPU |
 | Client-side cut: `max_tokens`, `max_completion_tokens`, `stop` | ✅ | `OutputCutTests` on both shapes; smoke shows the cut cancels the NPU (D53) |
 | PromptTemplate (message flattening) | ✅ | exact-string tests; both system-prompt placements measured on hardware |
-| Prompt overflow → HTTP 400 `context_length_exceeded` | ✅ | `ChatCompletionsTests`, `FakeBackendTests` via backend `PromptLengthPreflight`; not yet exercised against the real NPU's own limit |
+| Prompt overflow → HTTP 400 `context_length_exceeded` | ✅ | Decided by the preflight before any generation (D73): the smoke test's 16.6K-character transcript is refused in 31 ms on the real NPU, with the preflight's numbers in the message (D75); `TruncationTests` on both shapes |
+| Context cache (`--context-cache-size`) | ✅ | `ConversationKeyTests`, `ContextCacheTests`, `ContextCacheEndpointTests` (hits/misses/eviction/concurrency/dispose-on-failure on both shapes); smoke on the NPU: continuation hit at 235 ms TTFT against a 392 ms replay, counters on `/healthz` (D71, D72, D74, D75) |
+| `--truncate-history` and `x-npu-bridge-truncated-turns` | ✅ | `TruncationTests` with and without a preflight; smoke on the NPU: the refused transcript answers with `truncated-turns: 4` on a second server (D73, D75) |
 | Logon task install/status/run/uninstall | ✅ | live, elevated (pre-supervisor build; `/End` path covered by kill-parent probe) |
 | Windows service verbs | ⚠️ | commands verified by tests and emulation; not exercised against the SCM |
 | gitleaks hook + CI | ✅ | planted secrets blocked |
@@ -24,8 +26,6 @@
 
 ## Not built yet
 - `/v1/completions` — chunk 8
-- Context cache, `--truncate-history` — chunk 5 (prompt-overflow → HTTP 400 `context_length_exceeded`
-  already works, via each backend's preflight capability, not the cache)
 - Aion Instruct adapter hardware verification — the adapter merged 2026-09-11 (chunk 6, D66 to D70) but
   build 29648 never grants a main-package dynamic dependency execute access, so no Aion generation has
   run; issue #2 stays open. Aion Instruct itself ships in October/November 2026 as a model swap behind
@@ -69,3 +69,7 @@
 - 2026-09-10 whole-project review: the state docs (`CLAUDE.md`, `PLAN.md`, the handoff, this folder)
   still described chunk 4 as unmerged; fixed. Added the build-and-test workflow. Three low-severity
   code notes were filed in `docs/FUTURE.md` rather than fixed.
+- Chunk 6 (2026-09-11): built in a forked subagent; a Claude subagent review and a Codex review found
+  the same drain-on-exception and late-delta gaps in both adapters (D69), applied before the merge.
+- Chunk 5 (2026-09-11): built in-session on `chunk-5-context-cache` with 462 tests, then the Phi
+  Silica smoke run (D75). Two adversarial reviews (a Claude subagent and Codex) found the same two defects, the exchange boundary at the first assistant turn and a throwing preflight leaking its context, and Codex a third, the JSON retry inheriting a cancelled token; all applied with ten tests (D76) and the smoke run repeated. Fast-forward merged to `main`.
