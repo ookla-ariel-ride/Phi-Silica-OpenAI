@@ -770,3 +770,106 @@ process; but it declares the `com.microsoft.windowsmlruntime.osexecutionprovider
 and `WindowsWorkload.EP` family prefixes, so registering the framework variant for the user would not
 be discovered by that runtime. The main package in use, 1.8.30.0, is the one Windows Update ships as
 KB5078978. (chunk 6)
+
+## 2026-09-11 — Chunk 5 (context cache and overflow handling)
+
+Issue #1. Built on `chunk-5-context-cache`. A continuing conversation now sends only its newest
+turns to the NPU, and an over-length transcript is refused before a token is generated wherever the
+backend can be asked.
+
+**D71. The cache key is a boundary-preserving encoding of `(system, turns)`, never the rendered
+prompt.** The three collision surfaces recorded before the cache existed (unescaped turn markers,
+native placement dropping the system text from the prompt, the raw pass-through of a lone user
+message) are closed by construction rather than by escaping: `ConversationKey` hashes a version
+magic, then the system text, then each turn as a tagged sequence of fields, every field written as a
+presence byte, its byte length and its bytes. No content can imitate a boundary, and the system text
+is in the key whichever placement delivered it. A test pins each surface both ways — the two
+transcripts render identically *and* key differently — so a regression to keying on the prompt
+string fails on the twin assertion. What enters a field is the text the model saw for that turn
+(`PromptTemplate.TurnText`: parts joined, trailing whitespace trimmed), so a client that echoes our
+reply with different trailing whitespace still hits. Null, empty and present system text are three
+different keys because they are three different context states. An assistant turn's `tool_calls`
+enter the key field by field (id, type, function name, trimmed arguments); `ChatMessage` gained the
+field for that, and it is carried but not rendered until chunk 7. The stored key after a generation
+is `Compute(system, turns, reply)`, which is exactly the prefix key the next request computes for
+`turns + assistant(reply)`; a lookup walks the prefixes that end in an assistant turn, longest
+first, in one pass with `IncrementalHash.GetCurrentHash`.
+
+**D72. A context goes back into the cache only after a `Complete`, uncut generation; everything else
+disposes it, and a tail is always rendered with the markers.** `ContextLease` settles a context
+exactly once: `Keep(reply)` stores it under the new key, `ReturnUntouched` puts a checked-out context
+back under its old key when a preflight refused the prompt before anything ran (a fresh one is
+disposed instead), and `Dispose`, which the endpoints' `finally` calls after the drain, disposes it
+unless one of the others already settled it. So the D11/D43/D51 guarantees survive unchanged: no
+context is disposed while its generation may still write to it, and none that is not in the cache
+outlives its request. A cut reply is not kept even when the status is `Complete` (the whole-text
+stop-string cut on the JSON path is the case): the context holds text the client never saw, so the
+transcript it would be stored under is not the one the client will send back. Two concurrent
+requests for one conversation cannot share a context — checkout is exclusive under one lock, the
+second misses and creates its own — and when both store under the same key the older is disposed.
+`--context-cache-size 0` disables caching without a second code path: lookups miss and `Store`
+disposes. The cache is owned by `BackendLifecycle`, which empties it at stop and again at dispose,
+before the backend, so a `LanguageModelContext` never outlives its `LanguageModel`; a request that
+finishes after stop hands its context in and the cache disposes it on arrival. The tail on a hit is
+`PromptTemplate.RenderTail`: the marker format with no system text, never the raw pass-through,
+because the context already holds a marked-up conversation and a bare string in the middle of one
+is not the format the model was shown. `usage.prompt_tokens` estimates the whole transcript on a hit
+as on a miss (a client budgeting its window wants that number stable), while the log line's
+`prompt_chars` is what was actually sent.
+
+**D73. Overflow is decided by the preflight where one exists and by the generation's status where
+none does, and `--truncate-history` drops whole exchanges from the front, never the message being
+answered.** `ConversationSession.Acquire` asks `GetUsablePromptLength` before generating on a backend
+with `PromptLengthPreflight` (D55: Phi Silica never says `PromptLargerThanContext`, and asking the
+generation costs 26 s per attempt); a refusal is the same 400 `context_length_exceeded` as before,
+with a message naming the backend, the characters that fit, the transcript size and the switch. With
+`--truncate-history` the session drops turns from the start of the transcript through the first
+assistant turn inclusive — the oldest exchange, tool results included — re-renders, looks the shorter
+transcript up again and re-checks; the final turn is never dropped, so a single over-length question
+is refused with a message saying nothing is left to drop. A checked-out context whose tail does not
+fit goes back untouched and the truncated transcript starts afresh. Each drop is a Warning, the
+response carries `x-npu-bridge-truncated-turns: N` (turns, not exchanges), and the log line carries
+`truncated_turns=N`. On a backend without a preflight (Aion) both endpoints retry on a
+`PromptLargerThanContext` status when the session can drop something, disposing the failed context
+first; on the stream this can only happen before the first delta, and if a keep-alive has already
+committed the headers the header cannot be sent and a Warning says so. Aion's actual overflow
+status is still unmeasured (D70), so that path is exercised by the fake only. A consequence to know:
+after a truncation the context is stored under the truncated transcript's key, and the client's next
+request carries the full transcript, so it misses and truncates again — correct, slower, recorded in
+`docs/FUTURE.md`. Context pressure is a Warning at nine tenths of `--context-window-hint` (tokens,
+times four characters), once per request; the hint is a hint, the preflight is the measurement.
+
+**D74. `/healthz` reports the cache truthfully and the smoke test proves a hit by the counters, not
+by the count.** `contexts_cached` is the live count; `context_cache_capacity`, `context_cache_hits`
+and `context_cache_misses` were added when the first smoke step tried to prove a hit by watching
+`contexts_cached` alone and could not: once the cache is full, a miss evicts one and adds one, so the
+count is unchanged on a hit *and* on a miss. The step now checks that a new conversation misses
+exactly once, its continuation hits exactly once and leaves the count unchanged, and a control with
+the assistant text altered misses; it reports the three TTFTs. The overflow step sends eight
+two-thousand-character exchanges (past the 13,429 characters D55 measured) to the main server and
+requires the 400 within five seconds on a backend with a preflight, then starts a second server with
+`--truncate-history` and requires a 200 with the header. Numbers from the run on this machine are in
+D75.
+
+**D75. Measured on the NPU: a cache hit answers in a little more than half the time of the replay,
+and the preflight turns a 26 s refusal into a 31 ms one.** `scripts/smoke.ps1 -Backend phi-silica
+-Port 5298` on this machine (build 29648, warm model, `create_ms` 7,788), all steps passed, one
+skipped (the chunk 7 tool probe), five informational. The cache step: the first turn missed (TTFT
+250 ms, 399 ms total, reply "Red"); its continuation hit (TTFT 235 ms, 390 ms total, reply "Blue"),
+with `contexts_cached` unchanged at 3 and `context_cache_hits` 0 to 1; the control with the assistant
+text altered missed and replayed (TTFT 392 ms, 808 ms total), `contexts_cached` 3 to 4. So on a
+three-message transcript the hit saved about 40 % of the TTFT and half the total; the saving grows
+with the prefix, since what a hit skips is re-reading it. The overflow step: seventeen messages,
+16,361 characters of content, 16,603 rendered; the main server answered 400 `context_length_exceeded`
+after **31 ms** with the preflight's own numbers in the message (`can take 13179 characters of the
+16603-character prompt`) and no generation; a second server with `--truncate-history` answered 200
+after 17,014 ms with `x-npu-bridge-truncated-turns: 4`, `prompt_tokens` 3,121 and the reply "PONG",
+the 17 s being the prefill of the roughly 12,500 characters that remained. The D52 over-length
+measurement, which sends one 225,042-character user message on the streaming path, now lands on its
+first branch: the verdict is the ordinary HTTP 400 after 151 ms, before a byte is written, with the
+preflight answering 13,429 usable as in D55, instead of the in-stream error frame after 7 to 26 s it
+produced in chunks 4 and 6. Everything else in the run matched the
+chunk 6 numbers: text contract 0/0, the cut stops the device, both placements obey the Ada system
+prompt. Note that the preflight's answer differs with the text (13,179 usable here against 13,429 in
+D55 for a different prompt): it is a tokenizer's verdict, not a constant, which is one more reason
+to ask it every time rather than remember a number.

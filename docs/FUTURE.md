@@ -27,6 +27,47 @@ land here instead of widening the chunk. Each entry says where it came from and 
   Instruct only. When it lands it needs a `ToolCalling` capability that bypasses chunk 7's emulation and
   a per-backend context-window hint. Tracked as a GitHub issue.
 
+## Chunk 5 deferrals (context cache and overflow handling)
+
+- **After a truncation, every later request in that conversation misses and truncates again.** The
+  context is stored under the key of the *truncated* transcript plus the reply; the client keeps
+  sending the full transcript, whose prefixes never match it. Correct — the reply is right and the
+  turns dropped are the same ones — but each request replays the whole transcript and pays the
+  preflight rounds again. Two ways out, both with a catch: also try the suffixes of the transcript
+  as lookup keys when `--truncate-history` is on (a suffix hit is exactly what truncation produced,
+  but only under that switch, since otherwise it would hand a cached context to a longer history it
+  never saw), or remember per stored context how many leading turns it lacks. Either needs a test
+  that a suffix hit is never taken without the switch.
+- **Mixed formats on a hit after a raw first turn.** The common `curl` case sends one bare user
+  message, which is passed through raw; its continuation is rendered as a marker-format tail on the
+  same context, so the model sees a raw string followed by `### Conversation so far`. The smoke test
+  measures that the continuation answers; whether quality differs from a replay is unmeasured. If it
+  does, the fix is to render the first turn with markers whenever caching is enabled, which costs a
+  little quality on the single-message case D-series measurements were taken on.
+- **Sampling parameters are not part of the key.** A conversation continued with a different
+  `temperature` hits the context its earlier turns built. That is right — the context holds text,
+  not sampling state, and Phi Silica takes the options per generation — but it is a fact a reader of
+  the key should not have to infer.
+- **`prompt_tokens` on a hit is an estimate of the whole transcript, not of what the runtime holds.**
+  What the runtime actually keeps in its context after several turns (and whether it compacts) is not
+  observable through the API; the number is the same chars/4 estimate as before, over the transcript
+  the client sent. `CompressPromptAsync` (2.4.8-experimental, Phi Silica only, issue #1's comment) is
+  the one lever if the runtime's window turns out smaller than the transcript suggests.
+- **`ChatMessage.ToolCalls` is carried and keyed but not rendered.** Chunk 7 owns rendering the
+  model its own tool-call protocol; until then an assistant turn with only tool calls renders as an
+  empty turn in the prompt while keying as a distinct one, which is the right half of the behaviour
+  to have first (no cache collision) and the wrong half to leave (the model does not see the call).
+- **A status-driven truncation after a keep-alive loses the header.** Only reachable on a backend
+  without a preflight, on the streaming path, when the verdict takes longer than the first keep-alive
+  (about a second). The reply is still right and the Warning says the header was lost. A trailer or
+  a chunk extension could carry it; neither is standard for OpenAI clients, so it waits for a need.
+- **Eviction disposes on the storing request's thread.** A runtime `Dispose` that blocks would
+  delay that request's final bytes. Not observed on Phi Silica; noted so a future slow disposal is
+  looked for here first.
+- **The same-conversation concurrency test exists because nothing serializes requests yet.** Chunk
+  8's scheduler will queue the second request behind the first, at which point it could wait for the
+  first's context instead of missing. That is an optimisation for chunk 8 to consider, not a defect.
+
 ## Chunk 6 deferrals (Aion Instruct Preview adapter)
 
 - **Hardware verification of `--backend aion` is blocked on this machine, not on the code (D68).**
