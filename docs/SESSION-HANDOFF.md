@@ -65,6 +65,13 @@ time.
 
 ## Do this next
 
+Decisions the owner made on 2026-09-11, in order of work: (1) the suffix lookup so a truncated
+conversation is found again (a new issue); (2) the Phi-3 tokenizer for real token counts, measured
+against the preflight first and adopted only if the vocabularies agree, `tokenizer.model` vendored
+(a new issue); (3) issue #9; (4) chunk 7. Also settled: the strict `model` policy of D77 stays; the
+`--context-window-hint` default stays 4096; the repository was renamed to `npu-bridge`.
+
+0. The two new issues above, in that order, each on its own branch with a review.
 1. Issue #9: consolidate the duplicated post-generation pipeline across the two shapes before
    chunk 7 adds the buffered tool-detection path on top of both. Chunk 5 added a retry loop to each
    endpoint, which made the duplication larger.
