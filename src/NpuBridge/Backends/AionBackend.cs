@@ -51,10 +51,11 @@ internal sealed class AionBackend : ILanguageModelBackend
     /// No <see cref="BackendCapabilities.SamplingOptions"/> (no <c>LanguageModelOptions</c> type), no
     /// <see cref="BackendCapabilities.SystemPromptContext"/> (<c>CreateContext()</c> only), no
     /// <see cref="BackendCapabilities.PromptLengthPreflight"/> (no <c>GetUsablePromptLength</c>).
-    /// <see cref="BackendCapabilities.Cancellation"/> is advertised because the smoke test measured an
-    /// early cut ending in a fraction of a late one on this runtime (D68).
+    /// <see cref="BackendCapabilities.Cancellation"/> is not advertised until the smoke test's cut
+    /// measurement shows an early cut ending in a fraction of a late one on this runtime; that
+    /// measurement is blocked on the machine, not the code (D68, docs/FUTURE.md chunk 6).
     /// </summary>
-    public BackendCapabilities Capabilities => BackendCapabilities.Cancellation;
+    public BackendCapabilities Capabilities => BackendCapabilities.None;
 
     public IReadOnlyDictionary<string, object?> Diagnostics => _diagnostics;
 

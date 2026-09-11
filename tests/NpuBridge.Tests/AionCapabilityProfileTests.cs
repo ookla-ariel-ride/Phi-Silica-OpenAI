@@ -22,10 +22,11 @@ public class AionCapabilityProfileTests
     private const string Path = "/v1/chat/completions";
 
     /// <summary>
-    /// Mirror of <c>AionBackend.Capabilities</c>. Cancellation is the only flag the runtime earned on
-    /// hardware (D68); the three absent ones are the subject here.
+    /// Mirror of <c>AionBackend.Capabilities</c>: nothing, until the cut measurement on hardware earns
+    /// the runtime <see cref="BackendCapabilities.Cancellation"/> (D68). The pipeline reads that flag
+    /// nowhere today, so these tests hold either way; the three always-absent flags are the subject.
     /// </summary>
-    private const BackendCapabilities AionProfile = BackendCapabilities.Cancellation;
+    private const BackendCapabilities AionProfile = BackendCapabilities.None;
 
     private static readonly object[] ConversationWithSystem =
     [
