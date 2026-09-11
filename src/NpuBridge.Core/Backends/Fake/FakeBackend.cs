@@ -137,18 +137,12 @@ public sealed partial class FakeBackend : ILanguageModelBackend
         }
 
         // Before any verdict, including whether the prompt fits: a real runtime answers that instantly,
-        // and a test that needs the answer to arrive late (after a caller has committed to a response)
-        // has no other way to arrange it.
-        if (_options.StartDelay > TimeSpan.Zero)
+        // and a test that needs the answer to arrive late — after the caller has already committed to a
+        // response shape by sending a keep-alive comment — has no other way to arrange it. FirstTokenGate
+        // cannot: it is held after the prompt-length verdict, so it never delays the verdict itself.
+        if (!await WaitAtGateAsync(_options.StartGate, cancellationToken).ConfigureAwait(false))
         {
-            try
-            {
-                await Task.Delay(_options.StartDelay, cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                return new GenerationResult(string.Empty, GenerationStatus.Cancelled, "fake: cancelled before starting");
-            }
+            return new GenerationResult(string.Empty, GenerationStatus.Cancelled, "fake: cancelled at the start gate");
         }
 
         if (_options.MaxPromptChars is { } max && fake.TotalChars + prompt.Length > max)
@@ -159,16 +153,9 @@ public sealed partial class FakeBackend : ILanguageModelBackend
         // Held after the prompt verdict and before the first token, so a test can order events against
         // the stream instead of against a clock: hold this until the response headers have been read and
         // "the headers came before the first token" is an assertion rather than a stopwatch bound.
-        if (_options.FirstTokenGate is { } firstToken)
+        if (!await WaitAtGateAsync(_options.FirstTokenGate, cancellationToken).ConfigureAwait(false))
         {
-            try
-            {
-                await firstToken.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                return new GenerationResult(string.Empty, GenerationStatus.Cancelled, "fake: cancelled at the first-token gate");
-            }
+            return new GenerationResult(string.Empty, GenerationStatus.Cancelled, "fake: cancelled at the first-token gate");
         }
 
         // While a CancellationGate is set and incomplete the token is not looked at: the generation keeps
@@ -278,6 +265,30 @@ public sealed partial class FakeBackend : ILanguageModelBackend
 
     internal void OnContextDisposed() => Interlocked.Increment(ref _contextsDisposed);
 
+    /// <summary>
+    /// Waits at one of the generation's gates. False means the caller's token was cancelled while the
+    /// wait was still in progress; the caller names the gate it was holding at in the status detail, so
+    /// the waiting is shared and the verdict is not. <see cref="InitializeAsync"/> deliberately does not
+    /// use this: its gate has no status to report and lets the cancellation throw.
+    /// </summary>
+    private static async Task<bool> WaitAtGateAsync(TaskCompletionSource? gate, CancellationToken cancellationToken)
+    {
+        if (gate is null)
+        {
+            return true;
+        }
+
+        try
+        {
+            await gate.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+    }
+
     private FakeContext Own(IModelContext context)
     {
         ArgumentNullException.ThrowIfNull(context);
@@ -331,11 +342,14 @@ public sealed class FakeBackendOptions
     public TimeSpan FirstTokenDelay { get; set; }
 
     /// <summary>
-    /// Delay before the generation decides anything at all, the prompt-length verdict included. Real
-    /// runtimes answer that instantly; a test that needs a slow verdict — one that lands after the caller
-    /// has already committed to a response shape — has no other way to arrange it.
+    /// While set and incomplete, the generation waits before deciding anything at all, the
+    /// prompt-length verdict included. <see cref="FirstTokenGate"/> is held after that verdict and so
+    /// cannot arrange a test whose subject is a verdict that lands late, once a keep-alive comment has
+    /// already committed the response headers. Released by the test that holds it rather than by a
+    /// clock, so "the keep-alive went out before the verdict" is a property of the arrangement instead
+    /// of a millisecond bound that a loaded machine will break.
     /// </summary>
-    public TimeSpan StartDelay { get; set; }
+    public TaskCompletionSource? StartGate { get; set; }
 
     /// <summary>
     /// While set and incomplete, the generation waits after the prompt-length verdict and before its

@@ -90,3 +90,9 @@ scripts/out/
 .agents/skills/
 .claude/skills/
 skills-lock.json
+
+# ---- agent scratch worktrees ----
+# A tool-created git worktree lands here, and a worktree that is abandoned rather than removed
+# leaves a whole second copy of the repository behind as untracked files. Without this line the
+# next `git add -A` commits that copy.
+.claude/worktrees/

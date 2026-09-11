@@ -1136,3 +1136,80 @@ those can only lower the settled prefix's count, so the budget still cannot be o
 that review: the Phi-3 counter is warmed during the adapter's initialization rather than on the first
 request; the tokenizer smoke step no longer spends a generation to learn whether the preflight exists;
 folded system placement has a usage test; D55 carries a pointer to the amendment.
+
+**D81. The post-generation pipeline is written once, and the two response shapes differ only in what
+they write.** Issue #9. Phase two of `/v1/chat/completions` existed twice: once in
+`ChatCompletionsEndpoint` and once in `ChatCompletionsStreamEndpoint`, with comments in each copy
+telling the reader it had to agree with the other. That is not a hypothetical cost — D56 and D57 are
+each a recorded drift between exactly those two copies, one answering a backend `Error` with HTTP 200
+on one shape and 502 on the other, one labelling the same generation `stop` on one shape and `length`
+on the other. Chunk 7's buffer-the-whole-reply path would have been the third copy, so the shared
+steps were lifted out before it rather than during it.
+
+**What moved.** `src/NpuBridge.Core/Api/GenerationPipeline.cs` now holds `DeltaSink` (it was private
+to the streaming endpoint; its channel writer is optional, so the non-streaming path takes its
+first-token timing from the same type instead of an inline lambda that was character-for-character
+`OnDelta`), `CutWatcher` (the non-streaming path's early stop — the `OutputCutter` under a lock plus
+the `TaskCompletionSource` that must not be completed on the backend's callback thread), and
+`CancelGuardedAsync` and the verbose raw-output log, both of which existed in both files.
+`GenerationOutcome`, beside `GenerationFailure`, decides failure / filtered / content as three ordered
+rules: filtering outranks everything, a `Cancelled` the handler itself asked for is the cut, anything
+else `FromStatus` calls a failure is one. The non-streaming copy's `!filtered &&` guard was redundant
+against `FromStatus` and is gone with it.
+
+**What deliberately did not move.** The cut's verdict stays an argument rather than something the
+classifier reads, because when it is legible differs by shape: the streaming path may only read
+`FinishReason` after `Flush()`, which can be the call that commits the cap (D57), while the
+non-streaming path cuts the whole text in one go. The two shapes also count `completion_tokens` from
+different lengths on purpose (the stream counts what the cutter released, D80), so usage is assembled
+by each caller; only `CompletionUsage.For` is shared, and only because `total_tokens` is a sum rather
+than a third fact.
+
+**Smaller things from the same review.** `ChatRequestPreparer`'s catch hand-built the 502
+`backend_error` envelope `GenerationFailure.FromException` already produces. `roleSent` was always
+equal to `streamed` at its only read, so `streamed` is hoisted out of the retry loop and `roleSent` is
+gone. `WaitForFirstDeltaAsync` is `wait.WaitAsync(next, ct)` with a `TimeoutException` catch instead
+of a linked source and `Task.WhenAny` against a `Task.Delay`; the `ThrowIfCancellationRequested`
+before the write stays, because a cancel landing in the same instant as the timeout is reported as the
+timeout. `ChatRequestMetrics.CharsPerToken`/`EstimateTokens` are deleted: the ratio is spelled in
+`CharEstimateTokenCounter` and the one caller left is the `--context-window-hint` pressure warning,
+which still compares characters rather than the backend's tokens — deliberately, since an operator's
+hint is not worth tokenizing the whole transcript a second time for, and the preflight is the real
+measurement.
+
+**Tests.** `GenerationOutcomeTests` states the classification rules once rather than through two
+endpoints: every status crossed with the handler's own cancel, the finish-reason labels, and the
+caching rule. It does not replace the endpoint tests; it is the guard that says which of them is right
+when they disagree. Four copies of `WaitUntilAsync`, six hand-rolled SSE body parsers and four
+rebuilds of the minimal request body collapsed into `TestWait.UntilAsync`, `Sse.Payloads`/`Sse.Chunks`
+and `ChatBody.User` in `BridgeTestHost.cs`; the tests that are *about* the raw framing still read raw
+lines, since parsing through the shared helper would assume what they check. One expectation was
+wrong in a way the deduplication surfaced: the cache's `prompt_tokens` test counted `"sys" + prompt`
+as one string, while the bridge counts the prompt and the native system text separately (the runtime
+holds the system text in the context, outside the prompt string). The two agree only when the
+prompt's length is not 1 modulo 4, so the test had been passing on the length that conversation
+happens to render. It now mirrors the bridge.
+
+**The last three clocks in the suite are gone.** `FakeBackendOptions.StartDelay` existed so a test
+could arrange "the prompt-length verdict lands after a keep-alive comment has already committed the
+headers", and its three users each did that by racing a 300 ms or 100 ms delay against a 20 ms or
+10 ms keep-alive interval — the style D54 replaced everywhere else. `StartDelay` is deleted and
+`StartGate` takes its slot: a `TaskCompletionSource` held in the same position, before any verdict.
+`FirstTokenGate` cannot stand in for it, because it is held *after* the prompt-length verdict and so
+never delays the verdict itself. The three tests now follow the pattern the keep-alive-ordering test
+already used — `HttpCompletionOption.ResponseHeadersRead`, assert the headers arrived, release the
+gate, then read the body — so "a keep-alive went out before the verdict" is a property of the
+arrangement rather than a millisecond bound. The remaining first-keep-alive delay decides only how
+long the test takes, never what it asserts, and removing the gate makes all three fail at once, which
+was checked. The knob count did not grow: four before, four after, and `StartGate` and
+`FirstTokenGate` now share one `WaitAtGateAsync` while each keeps its own status detail.
+`InitializeAsync`'s gate is deliberately left out of it — it has no `GenerationResult` to report and
+lets the cancellation throw — and `CancellationGate` is a predicate read inside the token loop rather
+than a wait at all.
+
+**Not done here.** The `IAsyncEnumerable<string>` responder the issue sketched for `FakeBackend` was
+not built: each of the four knobs models a distinct real-runtime behaviour and is separately
+documented, and replacing them churns every test that sets `Responder` for modest gain. The defect
+inside that bullet — the wall-clock races — was fixed instead. `BackendCapabilities.Cancellation` is
+advertised by `PhiSilicaBackend` and read by nobody; that is its own question (report it in
+`/healthz`, read it in the fake, or drop it) and is issue #17.

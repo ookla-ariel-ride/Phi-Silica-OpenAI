@@ -492,6 +492,11 @@ public class ChatCompletionsStreamingTests
     /// The same condition once the headers are gone: a keep-alive comment has already committed 200, so
     /// the refusal has to travel as an error event. Either way the answer is an error — <c>stop</c> is
     /// not a reachable outcome for a prompt that did not fit.
+    ///
+    /// "After a keep-alive" is arranged, not raced: the generation waits at a start gate this test opens
+    /// only once it holds the response headers, and the headers can only have come from a keep-alive
+    /// comment because nothing else has been written. The delays below decide how long the test takes,
+    /// never what it asserts.
     /// </summary>
     [Fact]
     public async Task An_over_length_prompt_discovered_after_a_keep_alive_is_an_error_event_not_a_stop()
@@ -499,16 +504,30 @@ public class ChatCompletionsStreamingTests
         // No preflight. On a backend that has one the verdict is known before a byte goes out and
         // the answer is the 400 of the test above (chunk 5). Only a backend that can say "too long"
         // solely by failing the generation (Aion, D70) can still deliver it after a keep-alive.
+        var start = new TaskCompletionSource();
         var fake = new FakeBackend(new FakeBackendOptions
         {
             Capabilities = BackendCapabilities.SamplingOptions | BackendCapabilities.SystemPromptContext | BackendCapabilities.Cancellation,
             MaxPromptChars = 1,
-            StartDelay = TimeSpan.FromMilliseconds(300),
+            StartGate = start,
         });
-        await using var host = await BridgeTestHost.StartAsync(fake, keepAliveInterval: TimeSpan.FromMilliseconds(20));
+        await using var host = await BridgeTestHost.StartAsync(
+            fake,
+            keepAliveInterval: TimeSpan.FromSeconds(30),
+            firstKeepAliveDelay: TimeSpan.FromMilliseconds(20));
 
-        var response = await PostStreamAsync(host);
-        var body = await response.Content.ReadAsStringAsync();
+        using var guard = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var request = new HttpRequestMessage(HttpMethod.Post, Path)
+        {
+            Content = JsonContent.Create(Body(model: "fake", stream: true)),
+        };
+        var response = await host.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, guard.Token);
+
+        // Headers in hand, so the keep-alive has gone out and the response shape is settled. Only now
+        // may the prompt-length verdict happen; the guard token is a deadlock guard, not a measurement.
+        Assert.Equal("text/event-stream", response.Content.Headers.ContentType?.MediaType);
+        start.SetResult();
+        var body = await response.Content.ReadAsStringAsync(guard.Token);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Contains(": keep-alive", body, StringComparison.Ordinal);
@@ -586,18 +605,35 @@ public class ChatCompletionsStreamingTests
     /// An empty reply that arrived slowly: keep-alive comments have already started the stream, but they
     /// are comments, not the assistant message. The role chunk still has to open it before the finish
     /// chunk closes it, or a client has a finish_reason for a message it was never told began.
+    ///
+    /// The generation is held at a start gate until the headers have been read, so the comment precedes
+    /// the empty reply by construction rather than because one delay was set shorter than another.
     /// </summary>
     [Fact]
     public async Task An_empty_reply_after_a_keep_alive_still_opens_with_the_role_chunk()
     {
+        var start = new TaskCompletionSource();
         var fake = new FakeBackend(new FakeBackendOptions
         {
             Responder = _ => [],
-            StartDelay = TimeSpan.FromMilliseconds(300),
+            StartGate = start,
         });
-        await using var host = await BridgeTestHost.StartAsync(fake, keepAliveInterval: TimeSpan.FromMilliseconds(20));
+        await using var host = await BridgeTestHost.StartAsync(
+            fake,
+            keepAliveInterval: TimeSpan.FromSeconds(30),
+            firstKeepAliveDelay: TimeSpan.FromMilliseconds(20));
 
-        var body = await (await PostStreamAsync(host)).Content.ReadAsStringAsync();
+        using var guard = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var request = new HttpRequestMessage(HttpMethod.Post, Path)
+        {
+            Content = JsonContent.Create(Body(model: "fake", stream: true)),
+        };
+        var response = await host.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, guard.Token);
+
+        Assert.Equal("text/event-stream", response.Content.Headers.ContentType?.MediaType);
+        start.SetResult();
+
+        var body = await response.Content.ReadAsStringAsync(guard.Token);
         var chunks = Sse.Chunks(body);
 
         Assert.Contains(": keep-alive", body, StringComparison.Ordinal);

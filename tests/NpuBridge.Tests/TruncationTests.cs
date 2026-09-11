@@ -207,20 +207,36 @@ public class TruncationTests
     {
         // The verdict lands after the first keep-alive committed the headers. The retry still happens
         // and the stream still carries the answer; the header is lost, and the log says so.
+        //
+        // The first generation waits at the start gate, which this test opens only once it holds the
+        // headers — and the only thing that can have committed them is a keep-alive comment, since no
+        // generation has returned anything yet. So "the verdict came too late for the header" is
+        // arranged rather than raced against the keep-alive interval (D54). The gate is opened once and
+        // the retries run straight through it.
         var capture = new CapturingLoggerProvider();
+        var start = new TaskCompletionSource();
         var fake = new FakeBackend(new FakeBackendOptions
         {
             Capabilities = NoPreflight,
             MaxPromptChars = 250,
-            StartDelay = TimeSpan.FromMilliseconds(100),
+            StartGate = start,
             Responder = _ => ["ok"],
         });
         await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture,
-            keepAliveInterval: TimeSpan.FromMilliseconds(10),
+            keepAliveInterval: TimeSpan.FromSeconds(30),
+            firstKeepAliveDelay: TimeSpan.FromMilliseconds(20),
             options: new BridgeOptions { Backend = BackendKind.Fake, TruncateHistory = true });
 
-        var response = await host.Client.PostAsJsonAsync(Path, new { model = "fake", stream = true, messages = LongConversation() });
-        var body = await response.Content.ReadAsStringAsync();
+        using var guard = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var request = new HttpRequestMessage(HttpMethod.Post, Path)
+        {
+            Content = JsonContent.Create(new { model = "fake", stream = true, messages = LongConversation() }),
+        };
+        var response = await host.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, guard.Token);
+
+        Assert.Equal("text/event-stream", response.Content.Headers.ContentType?.MediaType);
+        start.SetResult();
+        var body = await response.Content.ReadAsStringAsync(guard.Token);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Contains(": keep-alive", body, StringComparison.Ordinal);

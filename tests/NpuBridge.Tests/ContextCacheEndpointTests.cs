@@ -313,16 +313,21 @@ public class ContextCacheEndpointTests
         var hit = await ReadJson(await host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = conversation }));
 
         Assert.Equal("miss then hit", $"{(fake.Calls[0].History.Count == 0 ? "miss" : "?")} then {(fake.Calls[2].History.Count == 1 ? "hit" : "?")}");
-        // What usage counts is the native system text plus the whole rendered transcript, so the
-        // expectation counts that concatenation through the fake's own counter (chars/4, D80).
-        var counted = "sys" + PromptTemplate.Render(
+        // What usage counts is the whole rendered transcript plus the native system text, each through
+        // the backend's own counter (chars/4 on the fake, D80) and each rounded on its own -- the
+        // runtime holds the system text in the context, outside the prompt string, so the bridge never
+        // counts the concatenation. Spelled the same way here: counting "sys" + prompt as one string
+        // agrees with the bridge only when the prompt's length is not 1 modulo 4, so a test written
+        // that way passes on the length this conversation happens to render and fails on the next one.
+        var prompt = PromptTemplate.Render(
         [
             new ChatMessage("system", ChatMessageContent.FromText("sys"), null, null),
             new ChatMessage("user", ChatMessageContent.FromText("hi"), null, null),
             new ChatMessage("assistant", ChatMessageContent.FromText("ok"), null, null),
             new ChatMessage("user", ChatMessageContent.FromText("more"), null, null),
         ], nativeSystemPromptSupported: true).Prompt;
-        var expected = CharEstimateTokenCounter.Instance.Count(counted);
+        var counter = CharEstimateTokenCounter.Instance;
+        var expected = counter.Count(prompt) + counter.Count("sys");
         Assert.Equal(expected, miss.GetProperty("usage").GetProperty("prompt_tokens").GetInt32());
         Assert.Equal(expected, hit.GetProperty("usage").GetProperty("prompt_tokens").GetInt32());
     }
