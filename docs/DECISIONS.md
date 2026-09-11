@@ -572,9 +572,13 @@ adapter inherits the same rule. A mismatch between the runtime's text and the de
 after a completed generation ended (one after a cancelled generation is expected and only logged at
 Debug), are each a Warning and a counter in `/healthz` (`text_mismatches`, `late_deltas`).
 `scripts/smoke.ps1` gained a text-contract step that sends one prompt on both shapes and asserts both
-counters read zero, reporting (not asserting) whether the wire texts matched. **Not yet run on
-hardware:** the Windows Insider flight to build 29661, installed the evening of 2026-09-10, left the
-three Phi Silica workload packages unregisterable (`0x80073CF6`, access denied registering the
-`windows.accessControl.undocked` extension, elevated or not), so the model reports `NotReady` and the
-smoke test cannot reach a generation. The adapter change is build-verified only until the flight is
-fixed or rolled back; that is why #7 stays open, its commit on the branch, while #5, #6 and #8 merge. (#7)
+counters read zero, reporting (not asserting) whether the wire texts matched. **Verified on hardware
+2026-09-11** on build 29648, after the owner rolled back the Insider flight to 29661 that had left the
+Phi Silica workload packages unregisterable (`0x80073CF6`, access denied registering the
+`windows.accessControl.undocked` extension, elevated or not; the model reported `NotReady` and the
+smoke test could not reach a generation, which is why #5, #6 and #8 merged a day ahead of #7).
+`smoke.ps1 -Backend phi-silica -Port 5298` passed every step: the text-contract step read
+`text_mismatches=0 late_deltas=0` over every completed generation of the run and the JSON and SSE
+texts matched; the cut, disconnect and over-length steps behaved as before (early cut 590 ms against
+a 2,965 ms control; over-length verdict a generic error after 8.7 s with the preflight answering
+13,429 usable at once). (#7)
