@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "path": "rules/commit-discipline.md",
+      "hash": "a5bbb3799dd5ba2a47c6a436289a689ed0ddd23face29ababd0fe4ccecb7db6a",
+      "description": "Commits state what was verified, and only when asked",
+      "globs": [],
+      "dirs": [],
+      "prompt": [],
+      "priority": 95,
+      "enabled": true,
+      "include": []
+    },
+    {
+      "path": "rules/powershell-scripts.md",
+      "hash": "72cc161eccd475b894ec25036d72d41c3234e071c801ba96a8d079e4af12d614",
+      "description": "PowerShell script traps on the Copilot+ PC",
+      "globs": [
+        "scripts/**/*.ps1"
+      ],
+      "dirs": [],
+      "prompt": [],
+      "priority": 60,
+      "enabled": true,
+      "include": []
+    },
+    {
+      "path": "rules/reuse-first.md",
+      "hash": "bbf2760f7705e1a3a0574f2c088211e4ab9fd1f90562f8d67813f7d79fd56b20",
+      "description": "Reuse-first implementation in this bridge",
+      "globs": [],
+      "dirs": [],
+      "prompt": [],
+      "priority": 90,
+      "enabled": true,
+      "include": []
+    },
+    {
+      "path": "rules/self-improvement.md",
+      "hash": "f377b3c27cabe729fdceed3a45cef9c8178cc06851a97e08a29f06a431a314de",
+      "description": "Self-improvement: build the capability that makes the next goal cheaper",
+      "globs": [],
+      "dirs": [],
+      "prompt": [],
+      "priority": 40,
+      "enabled": true,
+      "include": []
+    },
+    {
+      "path": "rules/system-text-ceiling.md",
+      "hash": "1df2eda32f94a80720685b9b5567316c8535619c09d69d6fd90268b2d15d2b47",
+      "description": "System text size is a crash hazard, not a prompt-quality question",
+      "globs": [
+        "src/NpuBridge.Core/Tools/**",
+        "src/NpuBridge.Core/Prompting/PromptTemplate.cs"
+      ],
+      "dirs": [],
+      "prompt": [
+        "tool emulation",
+        "tool-schema",
+        "tool block",
+        "system prompt size"
+      ],
+      "priority": 60,
+      "enabled": true,
+      "include": []
+    },
+    {
+      "path": "rules/test-discipline.md",
+      "hash": "f490fb3ecadb9fe426a1c057824f72a5b1497559c5f773c53bbe8552f7e5a830",
+      "description": "Test discipline for the xunit suite",
+      "globs": [
+        "tests/**/*.cs"
+      ],
+      "dirs": [],
+      "prompt": [],
+      "priority": 60,
+      "enabled": true,
+      "include": []
+    }
+  ]
+}
