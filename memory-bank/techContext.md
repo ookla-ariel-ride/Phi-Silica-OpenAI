@@ -30,7 +30,11 @@ machine; the NPU is here.
   attestation format is excused by regex). When testing a rule, use random-looking secrets: the
   default stopword list excuses alphabet runs such as `AbCdEf…`.
 - The GitHub repository is `ookla-ariel-ride/npu-bridge` (renamed 2026-09-11 from
-  `Phi-Silica-OpenAI`, which redirects). The local folder keeps the old name.
+  `Phi-Silica-OpenAI`, which redirects). The local folder was renamed to match on 2026-09-12, after
+  the chunk 8 merge: it is now `C:\Users\jimsi\OneDrive\Documents\GitHub\npu-bridge`. Package
+  identity is registered against the build output path, so the registration made under the old
+  folder is stale. Re-run `.\scripts\identity.ps1 -Install` before the next `--backend phi-silica`
+  run; if the relaunch says "registered for <other folder>", that is this and nothing else.
 
 ## Runtime prerequisites on the machine
 - Windows App Runtime 2.4.0 (stable) and **2.4.1 experimental** (`Microsoft.WindowsAppRuntime.2-experimentalB`

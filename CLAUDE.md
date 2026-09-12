@@ -5,8 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `npu-bridge`: a .NET 10 Windows console app / Windows service that exposes the Copilot+ PC on-device
-language model as an OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/models`, `/healthz`;
-`/v1/completions` arrives in chunk 8) so agent tools (OpenCode, Hermes) can use the NPU model as a provider.
+language model as an OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/completions`,
+`/v1/models`, `/healthz`) so agent tools (OpenCode, Hermes) can use the NPU model as a provider.
 Two real backends behind one interface: Phi Silica (`Microsoft.Windows.AI.Text`, Windows App SDK)
 and Aion Instruct Preview (`AionInstructPreview.Text`, Microsoft's announced replacement), plus a
 fake backend for tests. Aion 1.0 Plan is a different model (14B, 32K context, native tool
@@ -50,15 +50,32 @@ on both shapes from a runtime with no native tool calling — an instruction blo
 the streamed reply buffered whole behind keep-alives, and a deliberately tolerant parser whose rule is
 that a false positive is worse than a miss; 866 tests, and the hardware probe called the tool 20 times
 out of 20 where PLAN predicted 60–80 %, on the easy single-tool case it asks). Issues #14, #15, #17,
-#19, #21 and #22 stay open for their remaining items. Next is chunk 8, the last one (concurrency
-scheduler and `/v1/completions`, issue #4). The repository is
-`ookla-ariel-ride/npu-bridge`; the local folder keeps its old name because package identity is
-registered against the build path.
+#19, #21 and #22 stay open for their remaining items.
+
+**All eight chunks are built and merged.** Chunk 8 (issue #4) merged 2026-09-12, D84 to D92: a
+`GenerationScheduler` (one worker, bounded `Channel<GenerationJob>`, `--queue-capacity` default 4,
+finally read) serializes the shared model handle, and what runs inside the scheduled closure is
+`ConversationSession.Acquire` as well as the generation — the cache lookup, `CreateContext` and the
+preflight all touch that handle, so guarding only `GenerateAsync` would have left the race the chunk
+exists to close (D84; the chunk's own brief said otherwise and PLAN §2.7 won). A queue-full request is
+429 with `Retry-After` and `rate_limit_error`/`queue_full`; `/healthz` reports real `queue_depth` and
+`queue_capacity`; `/debug/generate` goes through the scheduler too (D90, superseding D40).
+`POST /v1/completions` is real on both shapes (`text_completion`, `choices[].text`, the `chatcmpl-`
+id prefix kept deliberately, a multi-element `prompt` array refused 400, legacy-only parameters
+warned and ignored, D91). 932 tests pass, and `smoke.ps1 -Backend phi-silica` passed 28 PASS / 0 FAIL
+/ 0 SKIP / 5 INFO on the first attempt with no RPC flake: two concurrent requests really queued
+(`queue_depth` peaked at 1), `--queue-capacity 1` admitted one and rejected two. Chunk 6 is still the
+only one code-verified rather than hardware-verified. Issues #24 to #28 carry what chunk 8 knowingly
+left. The repository is
+`ookla-ariel-ride/npu-bridge`, and the local folder was renamed to match on 2026-09-12
+(`...\GitHub\npu-bridge`). Package identity is registered against the build output path, so that
+rename invalidated the existing registration: re-run `.\scripts\identity.ps1 -Install` before the
+next `--backend phi-silica` run.
 All four defects from the 2026-09-10 code review (#5 to #8) are fixed and merged (D62 to D65). The
 Insider flight to build 29661 broke Phi Silica and was rolled back to 29648; if it is offered again,
 expect the same (workload packages fail to register, model `NotReady`). An empty
 `Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'` listing is not proof of breakage on 29648;
-`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D83 so
+`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D92 so
 far); `docs/FUTURE.md` holds deferred work. Update both whenever a chunk changes a choice or defers
 something.
 
@@ -93,7 +110,7 @@ dotnet test --filter "DisplayName~Loading_backend"          # one test by name f
 dotnet run --project src/NpuBridge -- --backend fake --verbose   # run the exe (bin\Debug\...\win-arm64\NpuBridge.exe)
 .\scripts\identity.ps1 -Install                # sparse package identity for Phi Silica; installs the runtime dep; prints the PFN
 .\scripts\identity.ps1 -Status                 # is the package registered, which PFN
-.\scripts\smoke.ps1 -Backend phi-silica        # real NPU run: health, models, /debug/generate, chat (JSON and SSE), the cut, the cache hit, the overflow refusal and --truncate-history (on a second server), the D80 tokenizer boundary check, the D53/D55 measurements, the tool-call compliance probe (-ToolProbeRuns, default 5), teardown
+.\scripts\smoke.ps1 -Backend phi-silica        # real NPU run: health, models, /debug/generate, chat (JSON and SSE), the cut, the cache hit, the overflow refusal and --truncate-history (on a second server), the D80 tokenizer boundary check, the D53/D55 measurements, the tool-call compliance probe (-ToolProbeRuns, default 5), the chunk 8 concurrency steps (two requests really queue; --queue-capacity 1 admits one and 429s the rest) and /v1/completions on both shapes, teardown
 NpuBridge.exe task install|status|uninstall    # logon task that starts Phi Silica with identity (install/uninstall elevated)
 NpuBridge.exe service install|start|stop|uninstall   # Windows service for aion/fake (elevated)
 ```
@@ -115,7 +132,8 @@ backend advertises the capability) and made `POST /v1/chat/completions` real. Ch
 the first token, `stream_options.include_usage`) and added the client-side cut for `max_tokens`,
 `max_completion_tokens` and `stop` on both response shapes (D53). Chunk 5 made `--context-cache-size`
 (default 4, `0` disables) and `--truncate-history` real, and `--context-window-hint` now drives a
-context-pressure warning. See "Protocol rules" below.
+context-pressure warning. Chunk 8 finally made `--queue-capacity` (default 4) real and added
+`POST /v1/completions`. See "Protocol rules" below.
 
 ## Architecture (see docs/PLAN.md §2 for the full version)
 
@@ -135,9 +153,13 @@ Three projects, deliberately:
   `Phi3TokenCounter` over the embedded Phi-3.5-mini `tokenizer.model`, D80; `Microsoft.ML.Tokenizers`
   is Core's only package reference).
   the tool-call emulation (`Tools/`: `ToolCallParser`, `ToolCatalog`, `ToolSchemaRenderer`, plus
-  `Api/ToolCallReply`, D83).
-  Not built yet, so do not describe these as existing: the generation scheduler and `/v1/completions`
-  (chunk 8).
+  `Api/ToolCallReply`, D83), and chunk 8's concurrency and legacy endpoint (`Api/GenerationScheduler.cs`,
+  the one-worker bounded queue and `IHostedService`; `Api/SchedulerAdmission.cs`, which maps a scheduler
+  outcome to the wire — 429 with `Retry-After`, 503 `queue_shutting_down`; `Api/StreamingPipeline.cs`,
+  the SSE plumbing both streamed shapes now share; and `Api/CompletionsEndpoint.cs`,
+  `CompletionsStreamEndpoint.cs`, `CompletionRequest.cs`, `CompletionResponse.cs`, `CompletionChunk.cs`
+  for `/v1/completions`, D84 to D92).
+  Everything in `docs/PLAN.md` is now built; there is no "not built yet" list.
 - `src/NpuBridge` (net10.0-windows10.0.26100.0, ARM64 exe): `Program.cs`, config, service and task
   verbs, `PhiSilicaBackend`, `AionBackend` (behind a conditional SDK reference: when
   `nuget-local/` lacks the Aion nupkg the adapter is excluded and `--backend aion` explains why in
@@ -158,12 +180,19 @@ WinRT, so non-thread-safe state in a delta callback fails in the suite rather th
 created against disposed plus cached on every new generation path (`BridgeTestHost.AssertNoLeak`): a
 context is in the cache or disposed, never both, never neither.
 
-### Request flow (as of chunk 5)
+### Request flow (as of chunk 8)
 
 ```text
-HTTP → ChatRequestPreparer (shared by both shapes): body → validate DTO → backend readiness
+HTTP → ChatRequestPreparer (shared by both shapes, and by /v1/completions after the model-id check):
+       body → validate DTO → backend readiness
      → ignored-parameter warnings → placement → PromptTemplate (messages → system + transcript)
      → OutputLimits (max_tokens/stop) → PreparedChatRequest
+     → GenerationScheduler.ScheduleAsync: bounded queue (--queue-capacity), one worker
+         queue full      → 429 + Retry-After (depth x rolling mean), rate_limit_error/queue_full
+         cancelled queued→ dropped without touching the model (503 queue_shutting_down)
+       everything below runs INSIDE the scheduled closure, because Acquire touches the shared
+       model handle too (D84), and a --truncate-history retry keeps its slot rather than
+       re-queueing (D86)
      → ConversationSession.Acquire: prefix keys (ConversationKey) → ContextCache.CheckoutLongest
          hit  → the cached context, prompt = PromptTemplate.RenderTail(turns after the prefix)
          miss → backend.CreateContext(native system), prompt = the whole rendered transcript
@@ -180,9 +209,20 @@ HTTP → ChatRequestPreparer (shared by both shapes): body → validate DTO → 
        the new key) or Dispose in the finally (stream: cancel → drain → settle, D51)
 ```
 
-No scheduler (chunk 8) exists yet: nothing is queued, and two concurrent requests for one
-conversation each get their own context (the second misses). Tool-call emulation landed as D83 and
-adds a buffered branch to the streaming path when `tools` is present.
+Tool-call emulation (D83) adds a buffered branch to the streaming path when `tools` is present.
+`/v1/completions` wraps its `prompt` into one user message and joins this flow at the model-id check;
+its streamed shape has no role chunk, so its headers commit at the first cutter release (D91).
+
+The lease is published from inside the closure the instant `Acquire` hands it over, never read off the
+scheduled task's return value (D85): a streaming client that vanishes mid-frame can unwind before the
+task is unwrapped, and the `finally` would then see `null` and never release the context.
+
+Because `Acquire` is inside the closure, a second concurrent request for one conversation does not even
+attempt its own cache lookup until the first's whole attempt has run its course. Whether it then reuses
+the seed context (the first's `Keep` having already returned it) or creates a second that loses the key
+is a scheduling detail chunk 8 deliberately does not promise either way;
+`Two_concurrent_requests_for_one_conversation_never_share_a_context` was rewritten to pin the bound
+rather than the coin flip — at most one extra context beyond the seed, never two live at once.
 
 ### Backend contract facts that must not be "simplified" away
 
@@ -267,8 +307,9 @@ adds a buffered branch to the streaming path when `tools` is present.
 - **A context in the cache is never in use, and a context that failed is never in the cache (D72).**
   `Keep` only after the generation task has ended `Complete` with the client-visible text equal to
   the backend's text; everything else disposes. Chunk 7 buffers a reply for tool detection and still
-  obeys it. Chunk 8's scheduler may let the second concurrent request for one
-  conversation wait for the first's context instead of missing.
+  obeys it. Chunk 8's scheduler made the second concurrent request for one conversation wait for the
+  first's whole attempt before it even looks the context up, so which of the two survives in the cache
+  is now a scheduling detail rather than a promise (D84).
 - **The post-generation pipeline is shared now, so a third caller uses it rather than copying it
   (D81).** `GenerationOutcome.Classify(result, cancelledByCut)` is the one place failure, filtered and
   content are told apart, and both shapes agree only because neither decides for itself. Chunk 7's
@@ -369,13 +410,52 @@ Live today:
   does not declare its elements. Its tests are the main regression guard for the feature — add to them
   before changing it.
 
-Agreed design for chunks that have not landed. These rules are what each chunk must implement; none of
-it is current behaviour, so do not describe it as working:
+- **`POST /v1/completions` is the legacy shape over the identical pipeline (D91).** The `prompt` is
+  wrapped into one user message and joins the chat flow at the model-id check, so readiness, placement,
+  rendering, the cache, the scheduler, the cut and `GenerationOutcome` are all shared. The wire is
+  `object: "text_completion"` with `choices[].text`; `finish_reason` is `stop`, `length` or
+  `content_filter` and never `tool_calls`, because `tools` does not exist on this endpoint at all.
+  Four rulings PLAN left open: a multi-element `prompt` array is a 400 `invalid_request_error` (a
+  single-worker scheduler cannot serve OpenAI's several-choices batching, so it refuses rather than
+  silently answering the first element); the id keeps the `chatcmpl-` prefix rather than `cmpl-`,
+  since every checked consumer treats it as opaque; the legacy-only parameters `echo`, `best_of`,
+  `suffix`, `logprobs` and `logit_bias` are accepted and warned through the shared ignored-parameter
+  mechanism but never implemented (`echo: true` not prepending the prompt is the one a real client
+  notices); and the streamed shape commits its headers at the first *cutter release*, because it has
+  no role chunk to send ahead of the text.
+- **A queue-full request is 429 with `Retry-After`** (whole seconds, queue depth × rolling mean
+  generation time, floored at 1) and the OpenAI body's `type` is `rate_limit_error`, `code`
+  `queue_full`. `Retry-After` is written only while the response has not started; on an already-started
+  stream it is silent by necessity. A 429 carries no truncated-turns header.
 
-- **Chunk 8 (concurrency and `/v1/completions`)** will queue generations rather than letting two
-  concurrent requests each take their own context, and `--queue-capacity` will finally be read.
-  It also changes what an existing test can mean: `Two_concurrent_requests_for_one_conversation_never_share_a_context`
-  asserts two generations run at once, which one worker forbids by construction.
+Chunk 8's rules, now live (D84 to D92):
+
+- **The scheduler serializes the model handle, not just the generation (D84).** One worker reads a
+  bounded `Channel<GenerationJob>`; `ConversationSession.Acquire` runs inside the scheduled closure
+  because `CreateContext` and `GetUsablePromptLength` are calls on the one shared handle exactly as
+  `GenerateAsync` is. A `--truncate-history` retry keeps its slot instead of re-queueing behind newer
+  arrivals (D86), so `Retry-After`'s rolling average measures a whole attempt, not one generation.
+- **The lease is published from inside the closure (D85)**, never read off the scheduled task's return
+  value — otherwise a client that vanishes mid-frame unwinds before the task is unwrapped and the
+  `finally` never releases the context, defeating D43 and D51 at once.
+- **`queue_depth` is a live counter, not `Reader.Count` (D87).** It drops at whichever comes first of
+  the caller cancelling while queued or the worker dequeuing, so a client that enqueues, gives up and
+  retries cannot inflate `Retry-After` for a whole generation. The channel *slot* is still held until
+  drained, so a burst of aborted clients can still 429 a live one.
+- **A queued job that never ran is 503 `queue_shutting_down`; one that ran and threw its own
+  `OperationCanceledException` is a 502 through `GenerationFailure` (D88).** `ScheduleResultKind.Cancelled`
+  carries `Ran` to tell them apart, because the second is a backend contract violation and must not be
+  swallowed as a cheerful shutdown message.
+- **D52's first-frame boundary now has a queue wait inside it (D89).** A preflight refusal or a
+  queue-full rejection that used to be a clean 400/429 can surface as an SSE `data: {"error":...}`
+  event once the wait exceeds about a second. Accepted deliberately: holding the first keep-alive for
+  admission would reintroduce the "client sees nothing" failure D52 exists to prevent.
+- **Publish-before-arm is the scheduler's recurring bug shape (D92).** `ScheduleAsync` writes to the
+  channel before finishing the state that job needs, and the worker can dequeue, run and settle inside
+  that window; it produced the leaked cancellation registration and the stuck `_liveQueueDepth`. Arm
+  before the write, and use `Interlocked` on *both* sides — the two flags are a Dekker pair, and ARM64
+  permits the store-buffer reordering that plain volatile release/acquire does not close. Its
+  regression test is probabilistic (~60 % catch rate); issue #24 wants a deterministic one.
 
 ## Code navigation: use serena
 

@@ -23,7 +23,7 @@ wire shaping it feeds (`ToolCallReply`) in `Api/` beside the DTOs it builds;
 streaming lives in `Api/ChatCompletionsStreamEndpoint` beside the JSON shape, not in a separate folder. `AionBackend`
 compiles only when `nuget-local/` holds the Aion nupkg (`AionSdkAvailable`, D66); CI builds without it.
 
-## Request flow (as built through chunk 7, D81 to D83, 2026-09-11)
+## Request flow (as built through chunk 8, D84 to D92, 2026-09-12)
 `ChatRequestPreparer` does the shared part for both shapes, in order: parse the JSON body (malformed
 body → 400, no context created) → validate the DTO against what the deserializer can actually produce,
 not just what the type declares (400 on failure, no context created) → check the backend is `Ready`
@@ -32,7 +32,18 @@ choose the system-prompt placement → read `tools` into a `ToolCatalog` and ren
 block into the *system text* (null catalog when there are no usable tools, `tool_choice: "none"` or
 `--tool-emulation off`, which is the single switch phase two reads) → render the prompt
 (`PromptTemplate`) → compute the output limits (`max_tokens`/`stop`, D53). Then
-`ChatCompletionsEndpoint` (JSON) or `ChatCompletionsStreamEndpoint` (SSE) builds a
+`ChatCompletionsEndpoint` (JSON) or `ChatCompletionsStreamEndpoint` (SSE) hands the rest to
+`GenerationScheduler.ScheduleAsync`, which is where chunk 8 put the boundary: one worker reads a
+bounded `Channel<GenerationJob>` (`--queue-capacity`), a full queue is 429 with `Retry-After` and
+`rate_limit_error`/`queue_full`, and a job cancelled while still queued is dropped without touching
+the model. **Everything from here to the lease's settlement runs inside that scheduled closure**,
+because `Acquire`'s own calls — `CreateContext` and `GetUsablePromptLength` — are calls on the one
+shared `LanguageModel` handle exactly as `GenerateAsync` is, so guarding only the generation would
+leave the race the scheduler exists to close (D84). A `--truncate-history` retry stays in its slot
+rather than re-queueing behind newer arrivals (D86). The lease is published to the outer scope from
+*inside* the closure the moment `Acquire` returns it, never read off the scheduled task's return
+value: a streaming client that vanishes mid-frame can unwind before the task is unwrapped, and
+`finally` would then see `null` and never release the context (D85). Inside the closure it builds a
 `ConversationSession` and acquires a `ContextLease`: the transcript's prefix keys
 (`ConversationKey`, one per assistant turn) are looked up in `ContextCache`, longest first; a hit
 checks that context out and renders only the tail (`PromptTemplate.RenderTail`), a miss creates a
@@ -47,7 +58,13 @@ catalog is present, which both shapes call and neither decides for itself → se
 once on every path: `Keep` after a `Complete`, uncut generation puts the context back under the new
 key, anything else disposes it in the `finally` (the stream cancels → drains → settles, D51; D72)
 → shapes the OpenAI response → logs the outcome with `cache=`, `tail_turns=` and `truncated_turns=`. Two
-concurrent requests for one conversation never share a context: the second misses. What differs
+concurrent requests for one conversation never share a context, and since D84 the second does not even
+attempt its lookup until the first's whole attempt has run its course; whether it then reuses the seed
+context or creates one that loses the key is a scheduling detail chunk 8 deliberately does not promise,
+so the test pins the bound (at most one extra context, never two live at once) rather than the coin
+flip. `POST /v1/completions` joins this same flow at the model-id check, wrapping its `prompt` into one
+user message (D91); its streamed shape has no role chunk, so its headers commit at the first cutter
+release rather than the first delta. What differs
 between the shapes after the classifier is only what they write: `completion_tokens` is
 `TokensCovering` over the text the cutter released on the stream and over the content about to be
 written on the JSON shape (D80), so each assembles its own usage through `CompletionUsage.For`.
@@ -68,7 +85,28 @@ An exception out of any of that meets the same two catch clauses on both shapes,
 one filtered on `http.RequestAborted`, which logs `http=0` and hands back nothing because there is
 nobody to answer, then an unfiltered one that reports through `GenerationFailure` (D82). The pair is
 exhaustive on purpose — the JSON shape used to exclude `OperationCanceledException` from the second,
-so a cancellation that was not the client's matched no clause and became a bare 500.
+so a cancellation that was not the client's matched no clause and became a bare 500. `/debug/generate`
+is the one endpoint that still has the old filter, so a foreign OCE escapes it as a bare 500 (#25).
+
+`Api/SchedulerAdmission.cs` maps a scheduler outcome to the wire, and the distinction it has to make is
+D88's: `ScheduleResultKind.Cancelled` carries a `Ran` flag, because a job dropped while only queued cost
+zero model time and is honestly 503 `queue_shutting_down`, while a job that ran and threw
+`OperationCanceledException` for its own token is a backend contract violation and must go out as a 502
+through `GenerationFailure.FromException` rather than be swallowed as a cheerful shutdown message. An
+enqueue after shutdown answers `Cancelled` rather than `Rejected`, since `Rejected` promises a retry a
+stopped scheduler will never honour. `clientAlreadyGone` is checked first and wins over every other
+reason. `Retry-After` is written only while the response has not started; on an already-started stream
+it is silent by necessity. One consequence of the queue sitting inside D52's first-frame boundary: a
+preflight refusal or a queue-full rejection can now arrive as an SSE error event on an already-200'd
+response once the wait reaches about a second, which D89 accepts deliberately rather than engineering
+around — holding the first keep-alive for admission would reintroduce the "client sees nothing" failure
+D52 exists to prevent.
+
+`Api/StreamingPipeline.cs` holds the SSE plumbing both streamed endpoints share (`SseStream`, both delta
+waits, `FailAsync`, `ReportSchedulerOutcomeAsync`), extracted as a byte-identical move once
+`/v1/completions` would otherwise have made a third copy; the truncation `beforeHeaders` hook was
+deliberately left per-endpoint (D91). The JSON pair is still a ~60-line duplicate that the extraction
+did not cover (#26) — the same shape D56, D57 and D81 each answered in turn.
 
 ## Conventions the chunks established
 - **Validate what the deserializer can produce, not just what the type says.** `System.Text.Json` will
@@ -145,7 +183,7 @@ so a cancellation that was not the client's matched no clause and became a bare 
   runtime text that disagrees with the deltas counts `text_mismatches`. Both counters are in `/healthz`
   and the smoke test asserts they stay zero. The delta sink must never block: chunk 7's buffered path
   holds the reply in the cutter and simply writes no frame, rather than parking the sink, and chunk
-  8's queue has to keep that property.
+  8's queue kept that property.
 - A context whose generation ended in anything but `Complete` is disposed, never reused.
 
 ## Fake backend as the contract's executable spec
@@ -269,8 +307,10 @@ service/task verbs bind through the same code.
   `first_run_compile_likely` after 60 s; `package_identity` and `package_family_name`;
   `contexts_cached`, `context_cache_capacity`, `context_cache_hits`, `context_cache_misses` (D74);
   `first_keep_alive_ms` and `keep_alive_interval_ms` (D79, so the smoke script reads the D52 margin
-  off the server); `queue_depth`/`queue_capacity` (reported, nothing queues yet); backend
-  diagnostics passed through verbatim.
+  off the server); `queue_depth`/`queue_capacity`, real since chunk 8 — `queue_depth` is a live
+  counter rather than `Reader.Count`, dropping at whichever comes first of the caller cancelling while
+  queued or the worker dequeuing, so a client that enqueues and gives up cannot inflate it or
+  `Retry-After` for a whole generation (D87); backend diagnostics passed through verbatim.
 - `/v1/{**}` fallback: 405 with `Allow` for a wrong method on a known path, otherwise 404.
 - `/debug/generate`: raw prompt into the backend with timing. `/debug/tokenize`: the backend
   counter's count for a text and the counter's name, answered while the model is still loading (D80).

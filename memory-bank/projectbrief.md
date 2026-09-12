@@ -66,7 +66,9 @@ LoRA adapters, Microsoft Store publication. Tracked in `docs/FUTURE.md`.
 7. Tool-calling emulation. **Done** (2026-09-11, D83). The honest reporting goal 5 asks for is the
    smoke script's probe: 20/20 on one tool with one required string argument, and the many-tool case
    named as unmeasured rather than assumed (issue #21).
-8. Concurrency/queueing, `/v1/completions`, client docs.
+8. Concurrency/queueing, `/v1/completions`, client docs. **Done** (2026-09-12, D84 to D92). The
+   scheduler serializes the shared model handle rather than only the generation, because the cache
+   lookup and the preflight are calls on that handle too (D84).
 
 Between chunks 6 and 7 (all 2026-09-11): the OpenAI conformance pass (D77), D78 (issue #12 closed
 by evidence), the test hardening from the coverage audit (D79; issues #14 and #15 part-done), real
@@ -74,8 +76,10 @@ token counts (D80; issue #13 closed), one post-generation pipeline for both resp
 (D81; issue #9 closed), which was done before chunk 7 rather than during it so the buffered
 tool-detection path would be a caller of it and not a third copy, and the three low-severity notes
 from the 2026-09-10 review (D82; issue #10 closed), taken in the same window because two of them sat
-in the files D81 had just rewritten. Chunk 7 then landed the same day, leaving chunk 8 as the only
-one outstanding.
+in the files D81 had just rewritten. Chunk 7 then landed the same day, and chunk 8 the next, which
+completes the plan. **All eight chunks are built and merged as of 2026-09-12.** Remaining work is
+tracked as GitHub issues rather than chunks: #24 to #28 from chunk 8's own review, #14 to #16 from the
+coverage audit, #17, #19, #21, #22, and #2 and #11 for Aion.
 
 ## Repository
 `https://github.com/ookla-ariel-ride/npu-bridge` (renamed from `Phi-Silica-OpenAI` on 2026-09-11; the

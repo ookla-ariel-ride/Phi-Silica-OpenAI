@@ -1,144 +1,134 @@
 # Active Context: npu-bridge
 
-_Last updated: 2026-09-12. Chunk 7 (tool-call emulation, D83) merged late on 2026-09-11; chunk 8 is
-the only chunk left._
+_Last updated: 2026-09-12, after the chunk 8 merge (D84 to D92). **All eight chunks of `docs/PLAN.md`
+are built and merged; the plan is complete.** Work from here is GitHub issues, not chunks._
 
 ## Where we are
-Chunks 1 to 7 are merged on `main` (`8b97aa1`), the only branch, in sync with origin. 866 tests pass,
-the solution builds with no warnings, CI is green. Chunk 8 (issue #4: the generation scheduler,
-`/v1/completions`, `docs/CLIENTS.md`) is the whole remaining plan.
+`main` is at `2114c36`, the only branch, in sync with origin, tree clean. 932 tests pass, the solution
+builds with no warnings, CI is green. `smoke.ps1 -Backend phi-silica` passed 28 PASS / 0 FAIL / 0 SKIP
+/ 5 INFO on the first attempt, with no RPC flake.
 
-Chunk 6, the Aion Instruct Preview adapter, is merged but code-verified only: build 29648 never
-appends `WIN://SYSAPPID` for a main-package dynamic dependency, so the Qualcomm QNN provider cannot
-be image-mapped and no Aion generation has ever run here (D70; issue #2 open). The repository is
-`ookla-ariel-ride/npu-bridge`; the local folder is still named `Phi-Silica-OpenAI` because package
-identity is registered against the build path.
+Chunk 6, the Aion Instruct Preview adapter, is merged but code-verified only: build 29648 never appends
+`WIN://SYSAPPID` for a main-package dynamic dependency, so the Qualcomm QNN provider cannot be
+image-mapped and no Aion generation has ever run here (D70; issue #2 open). Do not re-investigate that
+blocker.
+
+**The local folder was renamed to `npu-bridge` on 2026-09-12, after the merge.** Package identity is
+registered with `Add-AppxPackage -ExternalLocation $BinDir`, so the registration made under the old
+`Phi-Silica-OpenAI` path is stale. Re-run `.\scripts\identity.ps1 -Install` before the next
+`--backend phi-silica` run. `identity.ps1 -Status` will not reveal this: it prints the WindowsApps
+`InstallLocation`, not the external location, so it looks healthy either way.
 
 Aion Instruct ships as a model swap behind the Phi Silica API (Microsoft's Phi Silica page,
 2026-07-24): standalone package early October 2026, Insider rollout in October under a Controlled
 Feature Rollout with a registry key, retail in November with Phi Silica removed, no LAF token.
 `PhiSilicaBackend` is therefore the production Aion path. Details in `techContext.md`.
 
-`scripts/smoke.ps1 -Backend phi-silica -ToolProbeRuns 20` passes every step on build 29648 with
-nothing skipped, for the first time in the project's life: the tool probe had been a SKIP placeholder
-since chunk 3. The run covers four teardown rows (the main server and three auxiliary ones), the D80
-tokenizer step (3581 / 3543 / 3581 tokens at the fox, JSON and CJK boundaries) and the chunk 7 probe
-(20/20 runs called the tool). `/healthz` is the readiness check, not the package list. The model
-runtime can fail its RPC channel on the first generation after a start (seen twice, 2026-09-11); the
-re-run is clean.
+## What the 2026-09-12 session built: chunk 8 (issue #4, D84 to D92)
+The concurrency scheduler, `/v1/completions` and the client docs — the last chunk.
+
+- **`Api/GenerationScheduler.cs`**: one worker reading a bounded `Channel<GenerationJob>`
+  (`--queue-capacity`, default 4, read for the first time). `IHostedService, IAsyncDisposable`.
+- **D84, the review's catch and the chunk's most important decision**: `ConversationSession.Acquire`
+  runs *inside* the scheduled closure, not just `GenerateAsync`. `CreateContext` and
+  `GetUsablePromptLength` are calls on the one shared `LanguageModel` handle exactly as the generation
+  is, so queueing only the generation would have shipped the scheduler with the very race it exists to
+  close. The task brief said to put the queue wait after the cache lookup and preflight; PLAN §2.7 says
+  otherwise and won. The author could not have found this — it implemented what it was told.
+- **D85**: the lease is published from inside the closure the moment `Acquire` hands it over, never read
+  off the scheduled task's return value. A streaming client that vanishes mid-frame can unwind before
+  the task is unwrapped, leaving `finally` with `null` and the context never released — D43 and D51
+  defeated at once. Cost a fix round and four of that round's five failing tests.
+- **D86**: a `--truncate-history` retry stays in its scheduled slot rather than re-entering the queue,
+  so a request already mid-flight cannot be 429'd at the worst possible moment. The cost is that
+  `Retry-After`'s rolling average measures a whole attempt, possibly several preflight rounds.
+- **D87**: `/healthz`'s `queue_depth` is a live counter, not `Reader.Count` — it drops at whichever
+  comes first of the caller cancelling while queued or the worker dequeuing. A client that enqueues,
+  gives up and retries used to leave every dead job counted for a whole generation, inflating
+  `Retry-After`. The channel *slot* is still held until drained, so a burst of aborted clients can
+  still 429 a live one; that half is unchanged and stated as still true.
+- **D88**: `ScheduleResultKind.Cancelled` carries `Ran`. A job dropped while only queued is HTTP 503
+  `queue_shutting_down` (zero model time); a job that ran and threw `OperationCanceledException` for
+  its own token is a backend contract violation (D82's rule) and goes out as a 502 through
+  `GenerationFailure.FromException`, not swallowed as a cheerful shutdown message. An enqueue after
+  shutdown answers `Cancelled`, not `Rejected`, because `Rejected` promises a retry a stopped
+  scheduler will never honour.
+- **D89**, an amendment to D52 rather than a new rule: the queue wait, cache lookup and preflight now
+  all happen before the streamed first-frame boundary, so a preflight refusal or a queue-full
+  rejection that used to be a clean 400/429 can surface as an SSE error event once the wait runs to
+  about a second. Accepted deliberately: holding the first keep-alive for admission would reintroduce
+  the "client sees nothing" failure D52 exists to prevent.
+- **D90**: `/debug/generate` goes through the scheduler too, superseding D40's deferral — unqueued it
+  created a context and generated on the shared handle exactly as the OpenAI endpoints do, the same
+  race arriving through a second door.
+- **D91**, `/v1/completions`: `prompt` wrapped into one user message, then the identical pipeline from
+  the model-id check onward. Four rulings PLAN left open — a multi-element `prompt` array is a 400
+  (a single-worker scheduler cannot serve OpenAI's several-choices batching); the id keeps `chatcmpl-`
+  rather than `cmpl-` since every checked consumer treats it as opaque; `echo`, `best_of`, `suffix`,
+  `logprobs` and `logit_bias` are accepted and warned but never implemented; and the streamed shape
+  commits headers at the first cutter release, having no role chunk to send first. The same entry
+  records `Api/StreamingPipeline.cs`, a byte-identical extraction of ~160 lines the two streamed
+  endpoints had duplicated without ever drifting.
+- **D92**, the bug shape to remember: `ScheduleAsync` published a job to the channel before finishing
+  the state that job needed, and the worker could dequeue, run and settle inside that window. It
+  produced two real bugs on the branch — a leaked cancellation registration (`4ee9268`) and a
+  `_liveQueueDepth` stuck permanently high (`cb40c5e`). Arm before the write, and use `Interlocked` on
+  *both* sides: the two flags are a Dekker-pair store/load, and ARM64 permits the store-buffer
+  reordering that plain volatile release/acquire does not close. Measured: 3 failures in 5 runs
+  without the fix, 8 clean runs with it. The entry also corrects its own earlier draft, which counted
+  a third bug of this shape; the third candidate is a plain data race, hence "twice."
+- The whole-branch review's catch, fixed in the final commit `2114c36`: the streamed shapes'
+  first-frame hook could stamp a *partial* truncated-turns count as permanent if a keep-alive landed
+  mid-truncation-loop, plus a sibling window in the status-driven retry path that the review's own
+  write-up had wrongly called safe.
 
 ## What the 2026-09-11 session built
-Everything below merged on 2026-09-11, in this order. The earlier entries are settled and their
-detail lives in `docs/DECISIONS.md`, `systemPatterns.md` and `progress.md`; the last three are what
-chunk 8 builds on.
-- Chunk 5 (D71 to D76): `ConversationKey`, `ContextCache`, `ConversationSession` and `ContextLease` —
-  the cache, the preflight-driven overflow check, the `--truncate-history` loop and the
-  `x-npu-bridge-truncated-turns` header. The review round fixed the exchange boundary, a preflight
-  that threw while holding a lease, and a JSON retry that inherited a cancelled token.
-- D77: the wire shapes follow OpenAI's schema (required-but-nullable fields written as explicit
-  nulls, `model` required and served-only, schema ranges enforced). D78: no suffix lookup for a
-  truncated conversation, because the test written first showed that the follow-up turn already hits;
-  issue #12 closed without a change.
-- D79: the smoke script's vacuous steps from the coverage audit, and issue #14's first six tests.
-  What it settled is written down as the smoke-script and test conventions in `systemPatterns.md`.
-- D80 (issue #13): measurement first, then real token counts. The runtime's tokenizer is
-  Phi-3.5-mini's and `GetUsablePromptLength` answers in UTF-8 bytes; every backend now names an
-  `ITokenCounter`, `usage` and the `max_tokens` budget are its tokens on Phi Silica, and
-  `OutputCutter` grew the whitespace-settlement rule, `StopRequested` and `TokensCovering`. The
-  measurements are in `techContext.md`.
-- D81 (issue #9): the post-generation pipeline is written once. `Api/GenerationPipeline.cs` holds
-  `DeltaSink` (a `ChannelWriter<string>` or a `CutWatcher` through one of two factories, never a
-  delegate, so the backend's callback cannot reach the response), `CutWatcher`, `CancelGuardedAsync`
-  and the raw-output log; `GenerationOutcome` beside `GenerationFailure` decides failure / filtered /
-  content as three ordered rules, with the cut's post-flush verdict a caller argument (D57). The
-  smaller items landed with it: the hand-built 502 goes through `GenerationFailure.FromException`,
-  `CompletionUsage.For`, `roleSent` gone, the chars-per-token ratio spelled only in
-  `CharEstimateTokenCounter`, and `TestWait.UntilAsync` / `Sse.Payloads` / `ChatBody.User` shared
-  from `BridgeTestHost.cs`. `FakeBackendOptions.StartDelay` is deleted and `StartGate` takes its
-  slot, which ends the last three wall-clock races. Nothing a client can observe changed. Codex's
-  catch: the rewritten first-delta wait preferred a stale timeout over a delta that had just landed,
-  which on a preflight-less backend would turn an over-length 400 into an SSE error event.
-- D82 (issue #10): the three low-severity notes from the 2026-09-10 review. `ChatCompletionsEndpoint`
-  now carries the streaming path's pair of catch clauses exactly — one filtered on `RequestAborted`
-  that returns nothing and logs `http=0`, then an unfiltered one through `GenerationFailure` — so a
-  cancellation that is not the client's is a 502 with the ordinary body instead of a bare 500 that
-  matched no clause; one test per clause, each checked to fail against the old
-  `when (ex is not OperationCanceledException)`. `SseStream.Started` is the response's `HasStarted`,
-  which is a simplification and not the fix the note asked for: `WriteAsync` starts the response
-  before it writes a byte, so the old flag was right about a failing write, and the two answers part
-  only when starting the response is itself what fails (D82 says so; do not re-file it).
-  `identity.ps1 -Install` adds before it removes, so the successful path has no window with nothing
-  registered; `Add-AppxPackage` updates a same-identity registration in place, so a re-run after a
-  rebuild removes nothing at all, and remove-then-add survives as a fallback for a refused in-place
-  update. The review's catch was in the test, not the code: see `systemPatterns.md` on why a
-  disconnect never reaches either clause. Two `identity.ps1` defects went out as #19.
-- Chunk 7 (D83, issue #3): tool-call emulation on both response shapes. `Tools/ToolCatalog` reads
-  the offered tools (nested and flat forms, order preserved), `Tools/ToolSchemaRenderer` writes the
-  instruction block in compact signature form (`--tool-schema compact|full`), and
-  `PromptTemplate.Render` appends it to the *system text*, so `ConversationKey` covers which tools
-  were offered and two requests offering different ones cannot share a context. `Tools/ToolCallParser`
-  reads the reply back through five strategies (fence, `tool_calls` wrapper, unwrapped single call,
-  bare array, a relaxed single-quote pass) and never throws: anything it cannot read is content,
-  because a false positive is worse than a miss when the client's answer to a call is to run it.
-  `Api/ToolCallReply` shapes the result for both endpoints and computes what the cache stores. An
-  assistant turn's `tool_calls` render back into the transcript in the same envelope the model is
-  asked to produce; tool results render as `[Tool result: name (id)]`. With tools present the stream
-  buffers the whole reply behind keep-alives, then sends one chunk carrying the array and the finish
-  chunk. Off by three paths that are one code path: no tools, `tool_choice: "none"`,
-  `--tool-emulation off`. Measured on the NPU: 20/20 runs called the tool on a single-argument tool.
+Settled; detail lives in `docs/DECISIONS.md`, `systemPatterns.md` and `progress.md`. Chunk 5 (D71 to
+D76: `ConversationKey`, `ContextCache`, `ConversationSession`, `ContextLease`, the preflight-driven
+overflow check, `--truncate-history`); D77 (OpenAI wire conformance); D78 (no suffix lookup); D79 (test
+and smoke hardening); D80 (real token counts — the runtime's tokenizer is Phi-3.5-mini's and
+`GetUsablePromptLength` answers in UTF-8 bytes); D81 (one post-generation pipeline for both shapes);
+D82 (the three 2026-09-10 review notes); chunk 7 / D83 (tool-call emulation, 20/20 on the NPU).
 
 ## Open threads
-- Chunk 8 (issue #4) is next and last: the generation scheduler with a bounded queue, 429 with
-  `Retry-After`, queued-cancel, `/v1/completions`, `docs/CLIENTS.md`. `--queue-capacity` is accepted
-  and range-checked today and read by nothing. The tool-buffered streaming path holds its context for
-  a whole generation, which is the longest wait the queue will have to explain, and the delta sink
-  must stay non-blocking (`systemPatterns.md`, the text contract).
-- Issues #14, #15, #16 (the 2026-09-11 coverage audit): #14's items 7 to 12 and its "move into
-  Core", "make injectable" and "delete or mark" sections; #15's items 4 to 9, the manual checklist
-  and the exe paths list (the "honours a system prompt" and chat-text steps are still vacuous); #16,
-  a CI run of the exe with the fake backend, blocked on an ARM64 runner. Progress is recorded on
-  the issues; #14's newest comment is the gap D81 opened, `DeltaSink` and `CutWatcher` now in Core
-  with no unit tests of their own while `GenerationOutcome`, hoisted beside them, got a test file.
-- Issue #17: `BackendCapabilities.Cancellation` is advertised by `PhiSilicaBackend` and read by
-  nobody. Report it on `/healthz`, read it in the fake, or drop it; split out of #9 because that was
-  a no-behaviour-change consolidation.
-- Issue #19: two `identity.ps1` defects from the D82 review, both unreachable while the manifest
-  stays at 0.1.0.0. `Get-RegisteredPackage` sorts `Version` as the string it is, so `0.9.0.0`
-  outranks `0.10.0.0` and a bump can leave two registrations; and the superseded removal is unguarded
-  under a `Stop` error preference, so if a bump replaces the registration rather than adding to it,
-  the removal fails "not found" and kills the script after the install succeeded. D82's reordering is
-  what made the first of those load-bearing. Doing the issue means bumping the manifest and measuring
-  what a bump actually leaves registered. Twice it was closed by a commit message that only mentioned
-  it (see `techContext.md` on GitHub's closing keywords); it is open again.
-- Issue #21: tool-call compliance on the hard case (10-plus tools, nested schemas, a 3K-token agent
-  system prompt) is unmeasured. The smoke probe's 20/20 is one tool with one required string
-  argument, the easy end; PLAN's 60–80 % expectation is about the other. Its answer decides whether
-  `--tool-schema full` or structured JSON output (2.4.x stable, Phi Silica only) is worth building.
-- Issue #22: an unwrapped zero-argument call (`{"name":"get_time"}`) reads as content, because
-  outside a `tool_calls` wrapper an object needs both `name` and `arguments` or a sentence quoting
-  `{"name":"Ada"}` becomes a call. Accepted in D83 rather than fixed; the wrapper is what the
-  instruction asks for and what the model produced 20 times out of 20.
-- Issue #11 tracks Aion 1.0 Plan: native tool calling would bypass chunk 7's emulation through a
-  `ToolCalling` capability, and a 32K context changes what the cache and `--context-window-hint` are
-  for. The model still has no SDK.
-- D80 leftovers (`docs/FUTURE.md`): the pressure warning still measures characters against the hint
-  × 4; Aion keeps chars/4 until a generation runs there; when Aion Instruct arrives behind the Phi
-  Silica API, run the smoke's tokenizer step before trusting the counter for that model.
-- Chunk 5 deferrals (`docs/FUTURE.md`, chunk 5 section): mixed raw-then-markers format on a hit
-  after a bare first message; the pressure warning cannot fire on Phi Silica at the default hint
-  (the owner kept 4096); the header is lost on a stream that truncates after a keep-alive.
+No chunk is outstanding. What remains is issues.
+
+- **From chunk 8 (#24 to #28):** #24, the publish-before-arm regression test is probabilistic (~60 %
+  catch rate) and a deterministic version needs only test-visibility, no production change. #25, a
+  foreign `OperationCanceledException` still escapes `/debug/generate` as a bare 500 — D82's fix never
+  applied to this one endpoint; a client abort while queued also reports 503 `queue_shutting_down`,
+  untrue but harmless. #26, five leftovers, the largest being the ~60-line byte-identical duplicate
+  between `ChatCompletionsEndpoint` and `CompletionsEndpoint`'s JSON closures that `StreamingPipeline`
+  did not cover — the D56/D57/D81 shape recurring. #27, three knowingly-untested paths, each attempted
+  and abandoned for a stated reason. #28, the drain wait is still unbounded and silent, and the queue
+  raised its stakes: a runtime that never completes after a cancel now parks the single worker and
+  everything behind it. A bounded timeout-then-dispose is explicitly the wrong fix (it reinstates the
+  use-after-dispose race D51 removed).
+- **Coverage (#14, #15, #16):** #14's items 7 to 12 and its "move into Core" / "make injectable" /
+  "delete or mark" sections; #15's items 4 to 9, the manual checklist and the exe paths list; #16, a CI
+  run of the exe with the fake backend, blocked on an ARM64 runner.
+- **#17:** `BackendCapabilities.Cancellation` is advertised and read by nobody. Report it on `/healthz`,
+  read it in the fake, or drop it — needs a choice first.
+- **#19:** two `identity.ps1` defects, both unreachable while the manifest stays at 0.1.0.0. Note that
+  the folder rename has made `-Install` newly relevant even though the version has not moved. It was
+  closed twice by accidental closing keywords in commit messages; check it is still open.
+- **#21:** tool-call compliance on the hard case (10-plus tools, nested schemas, a 3K-token agent
+  system prompt) is still unmeasured; the 20/20 is the easy end. Its answer decides whether
+  `--tool-schema full` or structured JSON output is worth building.
+- **#22:** an unwrapped zero-argument call reads as content. Accepted in D83, not a defect.
+- **#11:** Aion 1.0 Plan — native tool calling would bypass chunk 7's emulation; still no SDK.
+- **#2:** the Aion hardware half, blocked on the OS (D70).
+- Deferrals in `docs/FUTURE.md`: the chunk 8 section (the `chatcmpl-` id prefix on `/v1/completions`,
+  the legacy-only parameters, the stale-timeout guard's missing test); the D80 leftovers (the pressure
+  warning still measures characters; Aion keeps chars/4); the chunk 5 deferrals.
 - Aion's overflow status is unmeasured; the status-driven truncation path (D73) is exercised by the
   fake only and must be re-checked when any Aion generation runs.
-- The runtime RPC fault after a start leaves the bridge serving a dead model handle
-  (`docs/FUTURE.md`). A candidate `bug` issue: recreate the `LanguageModel` and drop the cache when a
-  generation fails with an RPC-class HRESULT, or at least turn `/healthz` to 503. Not filed yet; the
-  owner decides.
-- Do not re-investigate the Aion blocker on this machine (D70).
+- The runtime RPC fault after a start leaves the bridge serving a dead model handle. Not filed as an
+  issue yet; the owner decides whether it becomes one.
 
 ## How to resume
-1. Read `CLAUDE.md`, then `docs/SESSION-HANDOFF.md`, then `docs/DECISIONS.md` D80 to D83 and the
-   chunk 5 and chunk 7 sections of `docs/FUTURE.md`.
-2. `dotnet build; dotnet test` (866). `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298` should
-   pass every step (0 skipped, 5 informational). Do not build while a smoke server is running.
-3. Chunk 8 (issue #4). Read the issue and its comments before starting, D81 for the pipeline the
-   scheduler wraps, and D83 for what the buffered tool path already holds a context through.
+1. Read `CLAUDE.md`, then `docs/SESSION-HANDOFF.md`, then `docs/DECISIONS.md` D84 to D92.
+2. `dotnet build; dotnet test` (expect 932). Do not build while a smoke server is running.
+3. Before any `--backend phi-silica` run: `.\scripts\identity.ps1 -Install`, because of the folder
+   rename above.
+4. Pick an issue. There is no next chunk.
