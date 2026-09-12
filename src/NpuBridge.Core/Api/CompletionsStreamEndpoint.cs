@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Text.Json;
 using System.Threading.Channels;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
@@ -30,9 +29,6 @@ namespace NpuBridge.Api;
 /// </summary>
 internal sealed class CompletionsStreamEndpoint
 {
-    private const string DoneFrame = "data: [DONE]\n\n";
-    private const string KeepAliveFrame = ": keep-alive\n\n";
-
     // Never instantiated: the type exists so the streaming phase has an ILogger<T> category of its own.
     private CompletionsStreamEndpoint()
     {
@@ -163,7 +159,7 @@ internal sealed class CompletionsStreamEndpoint
             // scheduler ever touches the channel (D52).
             if (generation.IsCompleted)
             {
-                var immediateResult = await ReportSchedulerOutcomeAsync(
+                var immediateResult = await StreamingPipeline.ReportSchedulerOutcomeAsync(
                     generation, sse, http, logger, requestId, backendName, prepared, session, aborted)
                     .ConfigureAwait(false);
                 if (immediateResult.Handled)
@@ -174,7 +170,7 @@ internal sealed class CompletionsStreamEndpoint
 
             // Nothing has been written yet, on purpose: waiting here is what keeps the status line
             // available for a failure that arrives before the first token.
-            streamed = await WaitForFirstDeltaAsync(sse, channel.Reader, streaming, aborted)
+            streamed = await StreamingPipeline.WaitForFirstDeltaAsync(sse, channel.Reader, streaming, aborted)
                 .ConfigureAwait(false);
 
             GenerationResult result;
@@ -202,7 +198,7 @@ internal sealed class CompletionsStreamEndpoint
                     }
                 }
 
-                var schedulerOutcome = await ReportSchedulerOutcomeAsync(
+                var schedulerOutcome = await StreamingPipeline.ReportSchedulerOutcomeAsync(
                     generation, sse, http, logger, requestId, backendName, prepared, session, aborted)
                     .ConfigureAwait(false);
                 if (schedulerOutcome.Handled)
@@ -215,7 +211,7 @@ internal sealed class CompletionsStreamEndpoint
             }
             else
             {
-                var schedulerOutcome = await ReportSchedulerOutcomeAsync(
+                var schedulerOutcome = await StreamingPipeline.ReportSchedulerOutcomeAsync(
                     generation, sse, http, logger, requestId, backendName, prepared, session, aborted)
                     .ConfigureAwait(false);
                 if (schedulerOutcome.Handled)
@@ -259,7 +255,7 @@ internal sealed class CompletionsStreamEndpoint
                     httpStatus: sse.Started ? StatusCodes.Status200OK : failure.StatusCode,
                     cache: cacheLabel, tailTurns: tailTurns, truncatedTurns: truncatedTurns,
                     queueWaitMs: queueWaitMs);
-                return await FailAsync(sse, failure, logger, requestId, aborted).ConfigureAwait(false);
+                return await StreamingPipeline.FailAsync(sse, failure, logger, requestId, aborted).ConfigureAwait(false);
             }
 
             // The held tail: the generation ended without a stop string forming, so characters withheld
@@ -300,7 +296,7 @@ internal sealed class CompletionsStreamEndpoint
                     aborted).ConfigureAwait(false);
             }
 
-            await sse.WriteAsync(DoneFrame, aborted).ConfigureAwait(false);
+            await sse.WriteAsync(StreamingPipeline.DoneFrame, aborted).ConfigureAwait(false);
 
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, completionTokens,
                 result.Status.ToString(), finishReason, StatusCodes.Status200OK, totalMs,
@@ -313,7 +309,7 @@ internal sealed class CompletionsStreamEndpoint
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
                 status: ex is OperationCanceledException ? nameof(GenerationStatus.Cancelled) : ex.GetType().Name,
                 finish: "-", httpStatus: 0,
-                cache: CacheLabel(lease), tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns,
+                cache: StreamingPipeline.CacheLabel(lease), tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns,
                 queueWaitMs: queueWaitMs);
             return null;
         }
@@ -323,9 +319,9 @@ internal sealed class CompletionsStreamEndpoint
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
                 status: ex.GetType().Name, finish: "-",
                 httpStatus: sse.Started ? StatusCodes.Status200OK : failure.StatusCode,
-                cache: CacheLabel(lease), tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns,
+                cache: StreamingPipeline.CacheLabel(lease), tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns,
                 queueWaitMs: queueWaitMs);
-            return await FailAsync(sse, failure, logger, requestId, aborted).ConfigureAwait(false);
+            return await StreamingPipeline.FailAsync(sse, failure, logger, requestId, aborted).ConfigureAwait(false);
         }
         finally
         {
@@ -356,98 +352,6 @@ internal sealed class CompletionsStreamEndpoint
         }
     }
 
-    private static string CacheLabel(ContextLease? lease) => lease is null ? "-" : lease.CacheHit ? "hit" : "miss";
-
-    /// <summary>
-    /// Waits until either the first delta is queued (true) or the generation ended without producing one
-    /// (false), emitting <c>: keep-alive</c> comments meanwhile. See
-    /// <see cref="ChatCompletionsStreamEndpoint"/>'s copy of this helper for the full account of the two
-    /// intervals and why the channel always completes on its own.
-    /// </summary>
-    private static Task<bool> WaitForFirstDeltaAsync(
-        SseStream sse,
-        ChannelReader<string> reader,
-        StreamingOptions streaming,
-        CancellationToken cancellationToken) =>
-        WaitForDeltaAsync(
-            sse,
-            reader,
-            streaming,
-            streaming.FirstKeepAliveDelay > TimeSpan.Zero ? streaming.FirstKeepAliveDelay : streaming.KeepAliveInterval,
-            cancellationToken);
-
-    private static async Task<bool> WaitForDeltaAsync(
-        SseStream sse,
-        ChannelReader<string> reader,
-        StreamingOptions streaming,
-        TimeSpan firstDelay,
-        CancellationToken cancellationToken)
-    {
-        var wait = reader.WaitToReadAsync(CancellationToken.None).AsTask();
-        if (streaming.KeepAliveInterval <= TimeSpan.Zero)
-        {
-            return await wait.ConfigureAwait(false);
-        }
-
-        var next = firstDelay > TimeSpan.Zero ? firstDelay : streaming.KeepAliveInterval;
-
-        while (true)
-        {
-            try
-            {
-                return await wait.WaitAsync(next, cancellationToken).ConfigureAwait(false);
-            }
-            catch (TimeoutException)
-            {
-                if (wait.IsCompleted)
-                {
-                    return await wait.ConfigureAwait(false);
-                }
-            }
-
-            cancellationToken.ThrowIfCancellationRequested();
-
-            await sse.WriteAsync(KeepAliveFrame, cancellationToken).ConfigureAwait(false);
-
-            next = streaming.KeepAliveInterval;
-        }
-    }
-
-    /// <summary>
-    /// Reports a failure the only way still available. Before the first byte that is the ordinary status
-    /// and body, returned to the caller; after it, the status line is spent, so the same body goes out as
-    /// an SSE event followed by the done marker.
-    /// </summary>
-    private static async Task<IResult?> FailAsync(
-        SseStream sse,
-        GenerationFailure failure,
-        ILogger logger,
-        string requestId,
-        CancellationToken cancellationToken)
-    {
-        if (!sse.Started)
-        {
-            return failure.ToResult();
-        }
-
-        if (cancellationToken.IsCancellationRequested)
-        {
-            return null;
-        }
-
-        try
-        {
-            await sse.WriteAsync(failure.ToEventFrame(), cancellationToken).ConfigureAwait(false);
-            await sse.WriteAsync(DoneFrame, cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            logger.LogDebug(ex, "req={RequestId} could not write the stream's error event; the client is gone.", requestId);
-        }
-
-        return null;
-    }
-
     /// <summary>
     /// One content-bearing chunk. With <paramref name="nullUsage"/> (the request asked for usage) it
     /// carries <c>"usage": null</c>, as every chunk before the usage chunk must.
@@ -462,104 +366,5 @@ internal sealed class CompletionsStreamEndpoint
     {
         var chunk = new CompletionChunk(id, created, model, [new CompletionChunkChoice(text, 0, finishReason)]);
         return nullUsage ? chunk.WithNullUsage() : chunk;
-    }
-
-    /// <summary>
-    /// What awaiting the scheduled attempt meant, and whether the caller already has its answer. See
-    /// <see cref="ChatCompletionsStreamEndpoint"/>'s copy of this type for the full account.
-    /// </summary>
-    private readonly record struct SchedulerOutcomeReport(bool Handled, IResult? Response, ChatAttemptResult? Attempt, double QueueWaitMs);
-
-    private static async Task<SchedulerOutcomeReport> ReportSchedulerOutcomeAsync(
-        Task<ScheduleResult<ChatAttemptResult>> generation,
-        SseStream sse,
-        HttpContext http,
-        ILogger logger,
-        string requestId,
-        string backendName,
-        PreparedChatRequest prepared,
-        ConversationSession session,
-        CancellationToken aborted)
-    {
-        var scheduled = await generation.ConfigureAwait(false);
-        var queueWaitMs = scheduled.QueueWait.TotalMilliseconds;
-        var admission = SchedulerAdmission.Classify(scheduled, aborted.IsCancellationRequested);
-
-        if (admission == SchedulerOutcome.ClientGone)
-        {
-            ChatRequestMetrics.LogRequest(logger, requestId, backendName, prepared.PromptChars, ttftMs: 0, tokens: 0,
-                status: scheduled.Kind.ToString(), finish: "-", httpStatus: 0,
-                truncatedTurns: session.DroppedTurns, queueWaitMs: queueWaitMs);
-            return new SchedulerOutcomeReport(true, null, null, queueWaitMs);
-        }
-
-        if (admission != SchedulerOutcome.Completed)
-        {
-            var schedulerFailure = SchedulerAdmission.FailureFor(admission, scheduled.RetryAfterSeconds);
-            SchedulerAdmission.ApplyRetryAfter(http.Response, admission, scheduled.RetryAfterSeconds);
-
-            ChatRequestMetrics.LogRequest(logger, requestId, backendName, prepared.PromptChars, ttftMs: 0, tokens: 0,
-                status: admission.ToString(), finish: "-",
-                httpStatus: sse.Started ? StatusCodes.Status200OK : schedulerFailure.StatusCode,
-                truncatedTurns: session.DroppedTurns, queueWaitMs: queueWaitMs);
-            var response = await FailAsync(sse, schedulerFailure, logger, requestId, aborted).ConfigureAwait(false);
-            return new SchedulerOutcomeReport(true, response, null, queueWaitMs);
-        }
-
-        var attempt = scheduled.Result!;
-        if (attempt.Refusal is { } refused)
-        {
-            ChatRequestMetrics.LogRequest(logger, requestId, backendName, prepared.PromptChars, ttftMs: 0, tokens: 0,
-                status: GenerationStatus.PromptLargerThanContext.ToString(), finish: "-",
-                httpStatus: sse.Started ? StatusCodes.Status200OK : refused.StatusCode,
-                truncatedTurns: session.DroppedTurns, queueWaitMs: queueWaitMs);
-            var response = await FailAsync(sse, refused, logger, requestId, aborted).ConfigureAwait(false);
-            return new SchedulerOutcomeReport(true, response, null, queueWaitMs);
-        }
-
-        return new SchedulerOutcomeReport(false, null, attempt, queueWaitMs);
-    }
-
-    /// <summary>
-    /// The response, plus the SSE framing and the one-time header assignment. A private copy of
-    /// <see cref="ChatCompletionsStreamEndpoint"/>'s nested class of the same name and behaviour: both
-    /// are generic over nothing but a string frame, so there is nothing chat-shaped to reuse from, but
-    /// duplicating this one small class was judged lower-risk than extracting it out of a file task 2
-    /// already shipped and reviewed. See the task 3 report for the note this leaves in
-    /// <c>docs/FUTURE.md</c>.
-    /// </summary>
-    private sealed class SseStream
-    {
-        private readonly HttpResponse _response;
-        private readonly Action? _beforeHeaders;
-        private bool _headersPrepared;
-
-        public SseStream(HttpResponse response, Action? beforeHeaders = null)
-        {
-            _response = response;
-            _beforeHeaders = beforeHeaders;
-        }
-
-        public bool Started => _response.HasStarted;
-
-        public Task WriteChunkAsync(CompletionChunk chunk, CancellationToken cancellationToken) =>
-            WriteAsync($"data: {JsonSerializer.Serialize(chunk, JsonDefaults.Options)}\n\n", cancellationToken);
-
-        public async Task WriteAsync(string frame, CancellationToken cancellationToken)
-        {
-            if (!_headersPrepared)
-            {
-                _beforeHeaders?.Invoke();
-
-                _response.StatusCode = StatusCodes.Status200OK;
-                _response.ContentType = "text/event-stream";
-                _response.Headers.CacheControl = "no-cache";
-                _response.Headers["X-Accel-Buffering"] = "no";
-                _headersPrepared = true;
-            }
-
-            await _response.WriteAsync(frame, cancellationToken).ConfigureAwait(false);
-            await _response.Body.FlushAsync(cancellationToken).ConfigureAwait(false);
-        }
     }
 }
