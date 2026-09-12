@@ -179,7 +179,7 @@ public sealed partial class FakeBackend : ILanguageModelBackend
         {
             if (cancellationToken.IsCancellationRequested && ObservesCancellation())
             {
-                return new GenerationResult(text.ToString(), GenerationStatus.Cancelled, "fake: cancelled before token");
+                return CancelledOrThrow(text.ToString(), "fake: cancelled before token", cancellationToken);
             }
 
             if (_options.FailAfterTokens == emitted)
@@ -202,7 +202,7 @@ public sealed partial class FakeBackend : ILanguageModelBackend
                 }
                 catch (OperationCanceledException)
                 {
-                    return new GenerationResult(text.ToString(), GenerationStatus.Cancelled, "fake: cancelled during delay");
+                    return CancelledOrThrow(text.ToString(), "fake: cancelled during delay", cancellationToken);
                 }
             }
 
@@ -296,6 +296,23 @@ public sealed partial class FakeBackend : ILanguageModelBackend
         }
     }
 
+    /// <summary>
+    /// How this backend reports a cancellation it observed: as the <see cref="GenerationStatus.Cancelled"/>
+    /// status <see cref="ILanguageModelBackend"/> requires, or — with
+    /// <see cref="FakeBackendOptions.ThrowOnCancellation"/> — by letting an
+    /// <see cref="OperationCanceledException"/> escape, which is the adapter contract violation D82's
+    /// unfiltered catches exist for and the only way a test can reach the paths that handle one.
+    /// </summary>
+    private GenerationResult CancelledOrThrow(string text, string detail, CancellationToken cancellationToken)
+    {
+        if (_options.ThrowOnCancellation)
+        {
+            throw new OperationCanceledException(detail, cancellationToken);
+        }
+
+        return new GenerationResult(text, GenerationStatus.Cancelled, detail);
+    }
+
     private FakeContext Own(IModelContext context)
     {
         ArgumentNullException.ThrowIfNull(context);
@@ -373,6 +390,17 @@ public sealed class FakeBackendOptions
     /// after its caller has given up and check that the context is not disposed underneath it.
     /// </summary>
     public TaskCompletionSource? CancellationGate { get; set; }
+
+    /// <summary>
+    /// Report an observed cancellation by throwing <see cref="OperationCanceledException"/> instead of
+    /// returning <see cref="GenerationStatus.Cancelled"/> — an adapter breaking the
+    /// <see cref="ILanguageModelBackend"/> rule that the runtime's own cancellation is swallowed and
+    /// reported as a status. That violation is the one D82's unfiltered catch clauses exist for, and
+    /// since chunk 8 it also decides whether the scheduler reports a job that ran and threw or one it
+    /// never ran at all (<see cref="NpuBridge.Api.ScheduleResult{TResult}.Ran"/>), so it needs to be
+    /// reachable from a test rather than only reasoned about.
+    /// </summary>
+    public bool ThrowOnCancellation { get; set; }
 
     /// <summary>
     /// Invoke <c>onDelta</c> on a thread-pool thread like the WinRT Progress callback does (default),
