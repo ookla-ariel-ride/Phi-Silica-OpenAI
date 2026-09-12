@@ -65,6 +65,17 @@ internal static class FallbackEndpoint
 }
 
 /// <summary>Wire shape of <c>GET /healthz</c>. Property names become snake_case on the wire.</summary>
+/// <param name="QueueDepth">
+/// <see cref="GenerationScheduler.QueueDepth"/> as-is (chunk 8): jobs waiting for the worker right now,
+/// dequeued-and-running excluded. A job whose own request was cancelled while still queued completes
+/// its caller immediately but still occupies this count until the worker drains to it and drops it, so
+/// this can read one or two higher than "callers still waiting" for a moment after a client gives up.
+/// Reporting a count that excludes those would need the scheduler to track cancellation state per
+/// queued job without dequeuing it, which <see cref="System.Threading.Channels.Channel{T}"/> has no way
+/// to do short of adding bookkeeping to code that has already been through two adversarial review
+/// rounds for a health metric nobody polls faster than the queue itself drains; not done, recorded here
+/// as the ruling (task-2-brief.md's "controller ruling carried into this task").
+/// </param>
 public sealed record HealthResponse(
     string Status,
     string Backend,
@@ -94,7 +105,8 @@ internal static class HealthEndpoint
         IProcessIdentity identity,
         TimeProvider time,
         ContextCache cache,
-        StreamingOptions streaming)
+        StreamingOptions streaming,
+        GenerationScheduler scheduler)
     {
         var snapshot = lifecycle.Snapshot;
         var now = time.GetUtcNow();
@@ -117,7 +129,7 @@ internal static class HealthEndpoint
             FirstRunCompileLikely: snapshot.Kind == BackendStateKind.Loading && elapsed >= BackendLifecycle.FirstRunCompileThreshold,
             PackageIdentity: identity.HasPackageIdentity,
             PackageFamilyName: identity.PackageFamilyName,
-            QueueDepth: 0,
+            QueueDepth: scheduler.QueueDepth,
             QueueCapacity: options.QueueCapacity,
             ContextsCached: cache.Count,
             ContextCacheCapacity: cache.Capacity,

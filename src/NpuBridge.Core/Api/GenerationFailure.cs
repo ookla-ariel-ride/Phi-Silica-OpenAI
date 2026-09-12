@@ -68,6 +68,34 @@ internal sealed record GenerationFailure(int StatusCode, OpenAiErrorBody Body)
                 OpenAiError.Server,
                 code: "backend_error"));
     }
+
+    /// <summary>
+    /// The generation queue (chunk 8, <see cref="GenerationScheduler"/>) was already full when this
+    /// request tried to enqueue. <paramref name="retryAfterSeconds"/> is the scheduler's own estimate
+    /// (queue depth × rolling average generation time, floored at 1); the caller still has to copy it
+    /// onto the <c>Retry-After</c> header itself, since that is an HTTP header rather than part of the
+    /// OpenAI error envelope this type owns.
+    /// </summary>
+    public static GenerationFailure QueueFull(int retryAfterSeconds) =>
+        new(StatusCodes.Status429TooManyRequests,
+            OpenAiError.Body(
+                $"The generation queue is full. Retry after {retryAfterSeconds} second(s).",
+                OpenAiError.RateLimit,
+                code: "queue_full"));
+
+    /// <summary>
+    /// The scheduler will never run this job: either the enqueue itself landed after
+    /// <see cref="GenerationScheduler.StopAsync"/> began, or the job was still queued when shutdown
+    /// started and was dropped instead of run. Either way nothing is coming back to honour a
+    /// <c>Retry-After</c>, so this is 503 rather than <see cref="QueueFull"/>'s 429 (task-2-brief.md,
+    /// integration decision 4).
+    /// </summary>
+    public static GenerationFailure QueueShuttingDown() =>
+        new(StatusCodes.Status503ServiceUnavailable,
+            OpenAiError.Body(
+                "The generation queue is shutting down and will not run this request.",
+                OpenAiError.Server,
+                code: "queue_shutting_down"));
 }
 
 /// <summary>

@@ -48,8 +48,8 @@ public static class NpuBridgeServiceCollectionExtensions
             sp.GetRequiredService<ContextCache>()));
         services.AddHostedService(sp => sp.GetRequiredService<BackendLifecycle>());
 
-        // Chunk 8: serializes generation against the one model handle. Standalone here (task 1); no
-        // endpoint reads it yet (task 2).
+        // Chunk 8: serializes generation against the one model handle. Both response shapes of
+        // /v1/chat/completions and /debug/generate all queue through this one instance (task 2).
         services.AddSingleton(sp => new GenerationScheduler(
             options,
             sp.GetRequiredService<TimeProvider>(),

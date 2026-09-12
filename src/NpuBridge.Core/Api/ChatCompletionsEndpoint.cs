@@ -39,8 +39,9 @@ public static class ChatCompletionsEndpoints
 /// either hands a <c>stream: true</c> request to <see cref="ChatCompletionsStreamEndpoint"/> or runs
 /// the non-streaming phase two itself: a single generation on a context from
 /// <see cref="ConversationSession"/> — cached when the transcript extends one the cache holds, fresh
-/// otherwise — shaped into one OpenAI response. Tool emulation (chunk 7) and the request scheduler
-/// (chunk 8) are still deliberately absent: nothing is queued.
+/// otherwise — shaped into one OpenAI response. The context lookup and preflight happen here,
+/// unqueued; only the generation itself (chunk 8) is serialized behind
+/// <see cref="GenerationScheduler"/>, on both shapes identically.
 /// </summary>
 internal sealed class ChatCompletionsEndpoint
 {
@@ -57,6 +58,7 @@ internal sealed class ChatCompletionsEndpoint
         StreamingOptions streaming,
         IgnoredParameterLog ignoredLog,
         ContextCache cache,
+        GenerationScheduler scheduler,
         TimeProvider time,
         ILogger<ChatCompletionsEndpoint> logger,
         ILogger<ChatCompletionsStreamEndpoint> streamLogger)
@@ -83,7 +85,7 @@ internal sealed class ChatCompletionsEndpoint
         if (prepared.Request.Stream == true)
         {
             return await ChatCompletionsStreamEndpoint
-                .StreamAsync(http, prepared, options, streaming, cache, time, streamLogger)
+                .StreamAsync(http, prepared, options, streaming, cache, scheduler, time, streamLogger)
                 .ConfigureAwait(false) ?? Results.Empty;
         }
 
@@ -95,6 +97,13 @@ internal sealed class ChatCompletionsEndpoint
         var session = new ConversationSession(prepared, cache, options, logger);
 
         ContextLease? lease = null;
+
+        // How long the attempt that actually produced `result` waited behind the scheduler's one
+        // worker. Stays 0 for every log line written before a generation was ever scheduled; reassigned
+        // each time an attempt is scheduled, so a retry after --truncate-history reports its own wait
+        // rather than the attempt before it. Declared outside the try so both catch clauses, which run
+        // for a throw at any point including before scheduling, can still log the best value they have.
+        var queueWaitMs = 0.0;
         try
         {
             var stopwatch = Stopwatch.StartNew();
@@ -154,36 +163,86 @@ internal sealed class ChatCompletionsEndpoint
                 var watcher = limits.IsEmpty ? null : new CutWatcher(limits);
                 sink = DeltaSink.ToWatcher(stopwatch, watcher);
 
-                var generation = backend.GenerateAsync(
-                    lease.Context,
-                    lease.Prompt,
-                    prepared.Sampling,
-                    sink.OnDelta,
-                    generationCts.Token);
-
-                // Whichever comes first. When the cut has fired, cancel here -- on this thread, guarded
-                // -- and then wait for the generation to end as it would have anyway. The overshoot is a
-                // delta or two and costs nothing: the cut itself is applied to the final text below.
-                //
-                // "Has the cut fired" rather than "did the cut win the race": a generation that ends in
-                // the same instant the watcher trips is still cancelled, so the flag beside the cancel
-                // means the same thing here as on the stream, which cancels whenever a delta trips the
-                // cutter no matter what the generation has done since. Cancelling a finished generation
-                // is a no-op.
-                //
-                // Skipped when the request set no limits: there is no watcher, so nothing can ever
-                // complete the other half of the race, and awaiting the generation alone says the same.
-                if (watcher is not null)
+                // Chunk 8: serialized against the scheduler's one worker rather than run directly. The
+                // closure is everything that used to run inline here; ct is generationCts.Token, so a
+                // cancel this handler makes for the cut (below) and a client abort (linked into
+                // generationCts) are both the operation's own token, exactly as before the scheduler
+                // existed.
+                var scheduled = await scheduler.ScheduleAsync(async ct =>
                 {
-                    await Task.WhenAny(generation, watcher.Signal).ConfigureAwait(false);
-                    if (watcher.Signal.IsCompleted)
+                    var generation = backend.GenerateAsync(
+                        lease.Context,
+                        lease.Prompt,
+                        prepared.Sampling,
+                        sink.OnDelta,
+                        ct);
+
+                    // Whichever comes first. When the cut has fired, cancel here -- on this thread, guarded
+                    // -- and then wait for the generation to end as it would have anyway. The overshoot is a
+                    // delta or two and costs nothing: the cut itself is applied to the final text below.
+                    //
+                    // "Has the cut fired" rather than "did the cut win the race": a generation that ends in
+                    // the same instant the watcher trips is still cancelled, so the flag beside the cancel
+                    // means the same thing here as on the stream, which cancels whenever a delta trips the
+                    // cutter no matter what the generation has done since. Cancelling a finished generation
+                    // is a no-op.
+                    //
+                    // Skipped when the request set no limits: there is no watcher, so nothing can ever
+                    // complete the other half of the race, and awaiting the generation alone says the same.
+                    if (watcher is not null)
                     {
-                        cancelledByCut = true;
-                        await GenerationPipeline.CancelGuardedAsync(generationCts, logger, requestId, "at the cut").ConfigureAwait(false);
+                        await Task.WhenAny(generation, watcher.Signal).ConfigureAwait(false);
+                        if (watcher.Signal.IsCompleted)
+                        {
+                            cancelledByCut = true;
+                            await GenerationPipeline.CancelGuardedAsync(generationCts, logger, requestId, "at the cut").ConfigureAwait(false);
+                        }
                     }
+
+                    return await generation.ConfigureAwait(false);
+                }, generationCts.Token).ConfigureAwait(false);
+
+                queueWaitMs = scheduled.QueueWait.TotalMilliseconds;
+
+                // Queue-full and post-shutdown are both decided before the operation above ever ran, so
+                // neither touched the model and this attempt's context (already acquired, possibly
+                // freshly created on a miss) is disposed by the method's own finally rather than kept.
+                if (scheduled.Kind == ScheduleResultKind.Rejected)
+                {
+                    ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease.PromptChars, ttftMs: 0, tokens: 0,
+                        status: "queue_full", finish: "-", httpStatus: StatusCodes.Status429TooManyRequests,
+                        cache: lease.CacheHit ? "hit" : "miss", tailTurns: lease.TailTurns, truncatedTurns: session.DroppedTurns,
+                        queueWaitMs: queueWaitMs);
+                    http.Response.Headers.RetryAfter = scheduled.RetryAfterSeconds.ToString();
+                    return GenerationFailure.QueueFull(scheduled.RetryAfterSeconds).ToResult();
                 }
 
-                result = await generation.ConfigureAwait(false);
+                if (scheduled.Kind == ScheduleResultKind.Cancelled)
+                {
+                    if (http.RequestAborted.IsCancellationRequested)
+                    {
+                        // Dropped while queued because the client went away before its turn came, or the
+                        // scheduler was already shutting down at the same moment -- either way there is
+                        // nobody to send a body to, exactly like the same check further down for a
+                        // generation that did run.
+                        ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease.PromptChars, ttftMs: 0, tokens: 0,
+                            status: nameof(ScheduleResultKind.Cancelled), finish: "-", httpStatus: 0,
+                            cache: lease.CacheHit ? "hit" : "miss", tailTurns: lease.TailTurns, truncatedTurns: session.DroppedTurns,
+                            queueWaitMs: queueWaitMs);
+                        return Results.Empty;
+                    }
+
+                    // A post-shutdown enqueue, or a job dropped while queued because shutdown began
+                    // before the worker reached it: the scheduler is never coming back to honour a
+                    // Retry-After, so this is 503 rather than 429 (task-2-brief.md, integration decision 4).
+                    ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease.PromptChars, ttftMs: 0, tokens: 0,
+                        status: "queue_shutting_down", finish: "-", httpStatus: StatusCodes.Status503ServiceUnavailable,
+                        cache: lease.CacheHit ? "hit" : "miss", tailTurns: lease.TailTurns, truncatedTurns: session.DroppedTurns,
+                        queueWaitMs: queueWaitMs);
+                    return GenerationFailure.QueueShuttingDown().ToResult();
+                }
+
+                result = scheduled.Result!;
 
                 // 7a. A backend without a preflight can only say "too long" by failing the generation.
                 // With --truncate-history that is not the end: drop the oldest exchange and go round
@@ -216,7 +275,8 @@ internal sealed class ChatCompletionsEndpoint
                 // The client is gone; there is nobody to send a body to and this is not an error.
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
                     status: result.Status.ToString(), finish: "-", httpStatus: 0,
-                    cache: cacheLabel, tailTurns: lease.TailTurns, truncatedTurns: session.DroppedTurns);
+                    cache: cacheLabel, tailTurns: lease.TailTurns, truncatedTurns: session.DroppedTurns,
+                    queueWaitMs: queueWaitMs);
                 return Results.Empty;
             }
 
@@ -237,7 +297,8 @@ internal sealed class ChatCompletionsEndpoint
             {
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
                     status: result.Status.ToString(), finish: "-", httpStatus: failure.StatusCode,
-                    cache: cacheLabel, tailTurns: lease.TailTurns, truncatedTurns: session.DroppedTurns);
+                    cache: cacheLabel, tailTurns: lease.TailTurns, truncatedTurns: session.DroppedTurns,
+                    queueWaitMs: queueWaitMs);
                 return failure.ToResult();
             }
 
@@ -300,7 +361,8 @@ internal sealed class ChatCompletionsEndpoint
 
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, completionTokens,
                 result.Status.ToString(), finishReason, StatusCodes.Status200OK, totalMs,
-                cache: cacheLabel, tailTurns: lease.TailTurns, truncatedTurns: session.DroppedTurns);
+                cache: cacheLabel, tailTurns: lease.TailTurns, truncatedTurns: session.DroppedTurns,
+                queueWaitMs: queueWaitMs);
 
             return Results.Json(body, JsonDefaults.Options);
         }
@@ -312,7 +374,8 @@ internal sealed class ChatCompletionsEndpoint
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
                 status: ex is OperationCanceledException ? nameof(GenerationStatus.Cancelled) : ex.GetType().Name,
                 finish: "-", httpStatus: 0,
-                cache: lease is null ? "-" : lease.CacheHit ? "hit" : "miss", tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns);
+                cache: lease is null ? "-" : lease.CacheHit ? "hit" : "miss", tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns,
+                queueWaitMs: queueWaitMs);
             return Results.Empty;
         }
         // Unfiltered, so that the two clauses together really are exhaustive -- the same pair, in the
@@ -327,7 +390,8 @@ internal sealed class ChatCompletionsEndpoint
             var failure = GenerationFailure.FromException(ex);
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
                 status: ex.GetType().Name, finish: "-", httpStatus: failure.StatusCode,
-                cache: lease is null ? "-" : lease.CacheHit ? "hit" : "miss", tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns);
+                cache: lease is null ? "-" : lease.CacheHit ? "hit" : "miss", tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns,
+                queueWaitMs: queueWaitMs);
             return failure.ToResult();
         }
         finally
