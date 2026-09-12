@@ -13,10 +13,11 @@ the corrected write-up.
   changed on the branch.
 - `smoke.ps1 -Backend phi-silica` last passed clean on 2026-09-12 (28 PASS / 0 FAIL / 0 SKIP / 5 INFO)
   before the probe work. No smoke run since; the probe runs exercised the same server.
-- Two untracked files were sitting in the tree when this session started and were left untracked:
-  `docs/GROK-CLI-WINDOWS-ARM64.md` and `docs/OPENCODE-WINDOWS-ARM64.md`. They are client workaround
-  notes (x64 builds under emulation) written in an earlier session. Decide whether they belong in
-  `docs/` next to `CLIENTS.md`, and commit them on their own branch if so.
+- After the merge, two more commits landed on `main` the same evening: `da7f143` installs the
+  Sidequest plugin at project scope (a quartermaster resupply round, on the user's request; CLAUDE.md
+  says how the board and GitHub issues divide the work) and `f6b0747` commits the Windows ARM64
+  workaround notes for OpenCode and the Grok CLI beside `CLIENTS.md`, whose OpenCode callout now
+  points at the workaround. The tree is clean.
 
 ## What the afternoon's review still had open, and what was done with each
 
