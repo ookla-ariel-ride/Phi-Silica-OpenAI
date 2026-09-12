@@ -45,6 +45,14 @@ public sealed record ChatCompletionResponseMessage(
 {
     [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public string? Refusal { get; init; }
+
+    /// <summary>
+    /// The calls the model asked for, or null on an ordinary reply — omitted then, not written as a
+    /// null, because OpenAI omits it too and a client that branches on the key's presence would
+    /// otherwise see a tool call on every reply. <see cref="Content"/> is null alongside it, which is
+    /// why D77's explicit-null treatment of that field had to land before this chunk could.
+    /// </summary>
+    public IReadOnlyList<ChatCompletionToolCall>? ToolCalls { get; init; }
 }
 
 public sealed record CompletionUsage(

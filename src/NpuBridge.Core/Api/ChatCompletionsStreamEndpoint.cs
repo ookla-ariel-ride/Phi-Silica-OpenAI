@@ -87,6 +87,17 @@ internal sealed class ChatCompletionsStreamEndpoint
         // the loop below may run more than once and the answer that matters is the last attempt's.
         var streamed = false;
 
+        // Whether the assistant message has been opened. D81 removed this because it was always equal
+        // to `streamed` at its only read; chunk 7 breaks that equality, because a buffered reply sees
+        // deltas without writing anything, so the role chunk is deferred to the tail.
+        var roleSent = false;
+
+        // With tools offered, nothing goes out until the reply is whole: only a finished reply can be
+        // told from prose (PLAN §2.6 item 2). The cost is that the window in which a failure can still
+        // be an ordinary HTTP status now spans the entire generation rather than only the wait for the
+        // first token — which is why keep-alives have to cover the buffered drain too.
+        var buffering = prepared.Tools is not null;
+
         // Set when this handler cancels the generation because a limit fired while streaming, and read
         // when the status comes back. A fact recorded at the cancel, not inferred from the cutter
         // afterwards: the JSON path used to infer it from a different cutter state, and the two shapes
@@ -154,9 +165,26 @@ internal sealed class ChatCompletionsStreamEndpoint
                 streamed = await WaitForFirstDeltaAsync(sse, channel.Reader, streaming, aborted)
                     .ConfigureAwait(false);
 
+                if (streamed && buffering)
+                {
+                    // Buffered: every delta goes through the cutter and nothing goes out. The cutter
+                    // still decides the cut, so a tool-call reply is capped and stopped exactly as a
+                    // streamed one is; what it releases is accumulated rather than written, and read
+                    // from EmittedText in the tail.
+                    if (await DrainBufferedAsync(sse, channel.Reader, cutter, streaming, generationCts,
+                            logger, requestId, cancelledByCut, aborted).ConfigureAwait(false))
+                    {
+                        cancelledByCut = true;
+                    }
+
+                    result = await generation.ConfigureAwait(false);
+                    break;
+                }
+
                 if (streamed)
                 {
                     // The role chunk. OpenAI clients rely on it to open the assistant message.
+                    roleSent = true;
                     await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
                         new ChatCompletionDelta("assistant", string.Empty), finishReason: null), aborted).ConfigureAwait(false);
 
@@ -250,11 +278,13 @@ internal sealed class ChatCompletionsStreamEndpoint
                 return await FailAsync(sse, failure, logger, requestId, aborted).ConfigureAwait(false);
             }
 
-            if (!streamed)
+            if (!roleSent)
             {
-                // Not one delta arrived — an empty reply, or a filtered one — so the role chunk has not
-                // gone out yet. It still has to: a client builds the assistant message from it, and it
-                // has to precede the tail chunk below.
+                // The role chunk has not gone out yet: no delta arrived at all (an empty reply, or a
+                // filtered one), or this request buffered and nothing has been written. It still has
+                // to: a client builds the assistant message from it, and it must precede the chunks
+                // below.
+                roleSent = true;
                 await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
                     new ChatCompletionDelta("assistant", string.Empty), finishReason: null), aborted).ConfigureAwait(false);
             }
@@ -289,7 +319,36 @@ internal sealed class ChatCompletionsStreamEndpoint
                 lease.Keep(result.Text);
             }
 
-            if (tail.Length > 0)
+            // Tool calls (chunk 7), over the whole buffered reply rather than the held tail: while
+            // tools are present nothing has gone out, so the cutter holds everything the client is
+            // owed and the parse sees the reply entire. A filtered reply is not parsed, for the reason
+            // ToolCallReply gives.
+            var toolCalls = buffering
+                ? ToolCallReply.From(prepared.Tools, outcome, outcome.Filtered ? null : cutter.EmittedText)
+                : null;
+
+            if (toolCalls is not null)
+            {
+                // One chunk carrying the whole array, arguments included, then the finish chunk — the
+                // shape OpenAI produces when it sends arguments in one piece. There is nothing to
+                // stream: the bridge cannot know a reply is a call until the model has stopped.
+                finishReason = "tool_calls";
+                await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
+                    new ChatCompletionDelta(null, null, toolCalls), finishReason: null), aborted).ConfigureAwait(false);
+            }
+            else if (buffering)
+            {
+                // Ordinary content, held back until the parse could rule out a tool call. It goes out
+                // as one chunk; a client that concatenates deltas sees exactly what the non-streamed
+                // shape would have returned.
+                var buffered = outcome.Filtered ? string.Empty : cutter.EmittedText;
+                if (buffered.Length > 0)
+                {
+                    await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
+                        new ChatCompletionDelta(null, buffered), finishReason: null), aborted).ConfigureAwait(false);
+                }
+            }
+            else if (tail.Length > 0)
             {
                 await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
                     new ChatCompletionDelta(null, tail), finishReason: null), aborted).ConfigureAwait(false);
@@ -403,10 +462,28 @@ internal sealed class ChatCompletionsStreamEndpoint
     /// client-gone clause catches and answers with the silent http=0 log line. Both routes reach the
     /// caller's finally, so the context is disposed whichever happens.
     /// </summary>
-    private static async Task<bool> WaitForFirstDeltaAsync(
+    private static Task<bool> WaitForFirstDeltaAsync(
         SseStream sse,
         ChannelReader<string> reader,
         StreamingOptions streaming,
+        CancellationToken cancellationToken) =>
+        WaitForDeltaAsync(
+            sse,
+            reader,
+            streaming,
+            streaming.FirstKeepAliveDelay > TimeSpan.Zero ? streaming.FirstKeepAliveDelay : streaming.KeepAliveInterval,
+            cancellationToken);
+
+    /// <summary>
+    /// The same wait, with the first delay chosen by the caller. A buffered reply (chunk 7) waits here
+    /// repeatedly rather than once, and every wait after the first is on the ordinary interval: the
+    /// shorter first delay exists to get headers to a client quickly, and by then they are long gone.
+    /// </summary>
+    private static async Task<bool> WaitForDeltaAsync(
+        SseStream sse,
+        ChannelReader<string> reader,
+        StreamingOptions streaming,
+        TimeSpan firstDelay,
         CancellationToken cancellationToken)
     {
         var wait = reader.WaitToReadAsync(CancellationToken.None).AsTask();
@@ -415,9 +492,7 @@ internal sealed class ChatCompletionsStreamEndpoint
             return await wait.ConfigureAwait(false);
         }
 
-        var next = streaming.FirstKeepAliveDelay > TimeSpan.Zero
-            ? streaming.FirstKeepAliveDelay
-            : streaming.KeepAliveInterval;
+        var next = firstDelay > TimeSpan.Zero ? firstDelay : streaming.KeepAliveInterval;
 
         while (true)
         {
@@ -457,6 +532,61 @@ internal sealed class ChatCompletionsStreamEndpoint
             // The headers are out now, so every later comment is only about proxy idle timeouts.
             next = streaming.KeepAliveInterval;
         }
+    }
+
+    /// <summary>
+    /// Consumes the whole reply without writing any of it, emitting <c>: keep-alive</c> comments while
+    /// it waits. This is the buffering PLAN §2.6 item 2 requires: with tools offered, a reply cannot be
+    /// told from a tool call until the model has stopped, and a delta already written cannot be
+    /// recalled.
+    ///
+    /// Every delta still goes through the cutter, so <c>max_tokens</c> and <c>stop</c> behave exactly
+    /// as they do on a streamed reply and the model is still stopped at the cut; the difference is only
+    /// that what the cutter releases is accumulated in it rather than written out. The caller reads it
+    /// back from <c>EmittedText</c> once the flush has run.
+    /// </summary>
+    /// <param name="alreadyCancelled">Whether the caller has already cancelled at the cut on an earlier attempt.</param>
+    /// <returns>True when this drain cancelled the generation because the cut fired.</returns>
+    private static async Task<bool> DrainBufferedAsync(
+        SseStream sse,
+        ChannelReader<string> reader,
+        OutputCutter cutter,
+        StreamingOptions streaming,
+        CancellationTokenSource generationCts,
+        ILogger logger,
+        string requestId,
+        bool alreadyCancelled,
+        CancellationToken cancellationToken)
+    {
+        var cancelled = false;
+        var more = true;
+
+        while (more)
+        {
+            while (reader.TryRead(out var delta))
+            {
+                cutter.Accept(delta);
+
+                if (cutter.StopRequested && !alreadyCancelled && !cancelled)
+                {
+                    cancelled = true;
+                    await GenerationPipeline.CancelGuardedAsync(generationCts, logger, requestId, "at the cut")
+                        .ConfigureAwait(false);
+                }
+            }
+
+            if (cutter.IsCut)
+            {
+                // Settled: nothing further will ever be released, so there is nothing left to buffer.
+                // The caller's cancel-drain-settle runs unchanged.
+                break;
+            }
+
+            more = await WaitForDeltaAsync(sse, reader, streaming, streaming.KeepAliveInterval, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        return cancelled;
     }
 
     /// <summary>

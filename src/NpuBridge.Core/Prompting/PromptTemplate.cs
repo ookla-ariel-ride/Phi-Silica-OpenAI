@@ -56,18 +56,35 @@ public static class PromptTemplate
     /// instead. Both placements are required by the controller measuring which one this model
     /// actually obeys; this method makes the choice a parameter rather than a policy.
     /// </param>
-    public static RenderedPrompt Render(IReadOnlyList<ChatMessage> messages, bool nativeSystemPromptSupported)
+    /// <param name="toolInstructions">
+    /// The tool-calling block to append to the system section, or null when the request offered no
+    /// tools or emulation is off (chunk 7, PLAN §2.6 item 1). It goes into the system text rather than
+    /// beside it for two reasons: native placement then carries it into <c>CreateContext</c> like any
+    /// other system content, and <c>ConversationKey</c> hashes the system text, so two requests that
+    /// offer different tools cannot share a cached context — which they would otherwise do while
+    /// having been told about different tools.
+    ///
+    /// It is appended after the client's own system text, not before: the client's message says who
+    /// the model is, and the protocol instruction reads better last, nearest the reply it governs.
+    /// </param>
+    public static RenderedPrompt Render(
+        IReadOnlyList<ChatMessage> messages,
+        bool nativeSystemPromptSupported,
+        string? toolInstructions = null)
     {
         ArgumentNullException.ThrowIfNull(messages);
 
         // Rule: a bare single user message with no system/developer content and no history renders
-        // as its raw text, byte for byte, with no markers of any kind added.
-        if (messages.Count == 1 && string.Equals(messages[0].Role, "user", StringComparison.Ordinal))
+        // as its raw text, byte for byte, with no markers of any kind added. Tool instructions are
+        // system content, so a request carrying them is never that case.
+        if (messages.Count == 1
+            && string.Equals(messages[0].Role, "user", StringComparison.Ordinal)
+            && string.IsNullOrEmpty(toolInstructions))
         {
             return new RenderedPrompt(null, GetText(messages[0].Content), false);
         }
 
-        var systemText = BuildSystemText(messages);
+        var systemText = Combine(BuildSystemText(messages), toolInstructions);
         var turns = messages.Where(m => !IsSystemLike(m.Role)).ToList();
         var body = BuildBody(turns);
 
@@ -121,6 +138,22 @@ public static class PromptTemplate
     {
         ArgumentNullException.ThrowIfNull(message);
         return RenderTurnBody(message);
+    }
+
+    /// <summary>
+    /// The client's system text and the tool block as one system section, joined by a blank line like
+    /// two system messages. Either may be absent: with no tools this returns the system text
+    /// unchanged, including its null, so a request without tools renders exactly as it did before
+    /// chunk 7 and keys to the same context.
+    /// </summary>
+    private static string? Combine(string? systemText, string? toolInstructions)
+    {
+        if (string.IsNullOrEmpty(toolInstructions))
+        {
+            return systemText;
+        }
+
+        return string.IsNullOrEmpty(systemText) ? toolInstructions : systemText + "\n\n" + toolInstructions;
     }
 
     private static bool IsSystemLike(string? role) =>

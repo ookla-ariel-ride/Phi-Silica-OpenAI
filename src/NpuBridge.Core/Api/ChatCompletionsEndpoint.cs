@@ -241,8 +241,26 @@ internal sealed class ChatCompletionsEndpoint
                 return failure.ToResult();
             }
 
-            var content = outcome.Filtered ? string.Empty : cut.Text;
+            string? content = outcome.Filtered ? string.Empty : cut.Text;
             var finishReason = outcome.FinishReason(cut.FinishReason);
+
+            // 8a-i. Tool calls (chunk 7). Only when the request offered tools, and only over text the
+            // client would otherwise have been given: a filtered reply is not parsed, because parsing
+            // it would be the one place withheld text came back as arguments. A reply that parses to
+            // nothing is ordinary content, which is the common case and costs one scan.
+            var toolCalls = ToolCallReply.From(prepared.Tools, outcome, content);
+
+            // What the model produced for this client, whether it went out as content or was reshaped
+            // into tool_calls. Read before the content is cleared: the JSON the model wrote cost the
+            // tokens it cost, and a tool call reporting completion_tokens 0 would tell a client
+            // budgeting its context that the call was free.
+            var deliveredChars = content?.Length ?? 0;
+
+            if (toolCalls is not null)
+            {
+                content = null;
+                finishReason = "tool_calls";
+            }
 
             // 8b. Back into the cache -- the rule is GenerationOutcome's, and the finally disposes every
             // context it refuses (D11, D43).
@@ -259,13 +277,19 @@ internal sealed class ChatCompletionsEndpoint
             var promptTokens = lease.TranscriptTokens;
             // The tokens the model produced to reach the cut, in the tokenization of its own text: a
             // stop-truncated prefix can count more on its own than the model spent on it (D80).
-            var completionTokens = backend.TokenCounter.TokensCovering(result.Text, content.Length);
+            var completionTokens = backend.TokenCounter.TokensCovering(result.Text, deliveredChars);
 
             var body = new ChatCompletionResponse(
                 Id: requestId,
                 Created: time.GetUtcNow().ToUnixTimeSeconds(),
                 Model: backend.ModelId,
-                Choices: [new ChatCompletionChoice(0, new ChatCompletionResponseMessage("assistant", content), finishReason)],
+                Choices:
+                [
+                    new ChatCompletionChoice(
+                        0,
+                        new ChatCompletionResponseMessage("assistant", content) { ToolCalls = toolCalls },
+                        finishReason),
+                ],
                 Usage: CompletionUsage.For(promptTokens, completionTokens));
 
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, completionTokens,

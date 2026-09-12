@@ -52,7 +52,30 @@ public sealed record ChatCompletionChunkChoice(
 /// The incremental half of a <see cref="ChatCompletionResponseMessage"/>. The first chunk sets
 /// <see cref="Role"/> with an empty <see cref="Content"/>; content chunks set only
 /// <see cref="Content"/>; the finish chunk sets neither and serialises as <c>{}</c>.
+///
+/// A tool-call reply sets <see cref="ToolCalls"/> on one chunk carrying the whole array, arguments
+/// included, which is the shape OpenAI produces when it sends the arguments in one piece rather than
+/// streaming them across chunks. The bridge always sends them in one piece: it cannot know a reply is
+/// a tool call until the model has finished, so there is nothing to stream (PLAN §2.6 item 2).
 /// </summary>
 public sealed record ChatCompletionDelta(
     string? Role,
-    string? Content);
+    string? Content,
+    IReadOnlyList<ChatCompletionToolCall>? ToolCalls = null);
+
+/// <summary>
+/// One tool call on the wire. <see cref="Index"/> is required on the streaming shape, where a client
+/// assembles calls across chunks by it; it is harmless on the non-streaming one and is written there
+/// too rather than kept as a second nearly-identical type.
+/// </summary>
+public sealed record ChatCompletionToolCall(
+    int Index,
+    string Id,
+    ChatCompletionFunctionCall Function)
+{
+    [JsonPropertyName("type")]
+    public string ToolType { get; init; } = "function";
+}
+
+/// <summary><see cref="Arguments"/> is JSON <em>text</em>, per OpenAI's schema — never a nested object.</summary>
+public sealed record ChatCompletionFunctionCall(string Name, string Arguments);

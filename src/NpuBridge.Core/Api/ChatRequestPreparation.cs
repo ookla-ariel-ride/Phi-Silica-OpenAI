@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using NpuBridge.Backends;
 using NpuBridge.Configuration;
 using NpuBridge.Prompting;
+using NpuBridge.Tools;
 
 namespace NpuBridge.Api;
 
@@ -22,6 +23,12 @@ namespace NpuBridge.Api;
 /// <param name="Sampling">Already normalised: null when the backend cannot sample or the request set nothing.</param>
 /// <param name="Limits">The client-side cut: <c>max_tokens</c>/<c>max_completion_tokens</c> and <c>stop</c>.</param>
 /// <param name="PromptChars">Characters the model actually sees: the prompt, plus native system text.</param>
+/// <param name="Tools">
+/// The tools this request offered, or null when it offered none, <c>tool_choice</c> was <c>none</c>,
+/// or <c>--tool-emulation off</c>. Non-null is the single question phase two asks: it means the
+/// instruction block is in the system text and the reply must be buffered whole and parsed before
+/// anything is emitted, because nothing can tell a tool call from prose until the model has stopped.
+/// </param>
 internal sealed record PreparedChatRequest(
     string RequestId,
     string BackendName,
@@ -31,7 +38,9 @@ internal sealed record PreparedChatRequest(
     string? NativeSystem,
     SamplingOptions? Sampling,
     OutputLimits Limits,
-    int PromptChars);
+    int PromptChars,
+    ToolCatalog? Tools = null,
+    string? ToolInstructions = null);
 
 /// <summary>
 /// Outcome of preparation: either a <see cref="Prepared"/> request or a <see cref="Failure"/> that is
@@ -184,11 +193,30 @@ internal static class ChatRequestPreparer
 
         try
         {
+            // 5a. Tools. The catalog is null unless the request offered usable tools, emulation is on
+            // and tool_choice is not "none" -- and null is what phase two reads to mean "no buffering,
+            // no parse", so every one of those three switches turns the whole feature off by the same
+            // path. The instruction block goes into the system text, which is what puts it into the
+            // conversation key: two requests offering different tools must not share a context, having
+            // been told about different tools (D71's trap, named in CLAUDE.md).
+            var toolChoice = ToolChoice.From(request.ToolChoice);
+            var catalog = options.ToolEmulation ? ToolCatalog.From(request.Tools) : null;
+            var toolInstructions = catalog is null
+                ? null
+                : ToolSchemaRenderer.Render(catalog, options.ToolSchema, toolChoice);
+
+            // An empty block is "none": the renderer was asked to inject nothing, so there is nothing
+            // for the model to follow and nothing for phase two to parse.
+            if (string.IsNullOrEmpty(toolInstructions))
+            {
+                catalog = null;
+            }
+
             // 6. Rendering, inside the guard. It cannot throw today -- validation guarantees non-null
             // messages and known roles -- but D49 records exactly that reasoning failing once already,
             // and chunk 7 adds tool-call rendering to this call. A throw here has to come out as an
             // OpenAI-shaped error, not a 500.
-            var rendered = PromptTemplate.Render(request.Messages!, useNativeSystem);
+            var rendered = PromptTemplate.Render(request.Messages!, useNativeSystem, toolInstructions);
 
             if (options.SystemPromptPlacement == SystemPromptPlacement.Native
                 && !nativeSupported
@@ -227,7 +255,9 @@ internal static class ChatRequestPreparer
                 NativeSystem: nativeSystem,
                 Sampling: sampling is null || sampling.IsEmpty ? null : sampling,
                 Limits: OutputLimits.From(request, backend.TokenCounter),
-                PromptChars: promptChars));
+                PromptChars: promptChars,
+                Tools: catalog,
+                ToolInstructions: toolInstructions));
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

@@ -305,7 +305,7 @@ internal sealed class ConversationSession
         // The whole transcript as the model will hold it after this request, whichever path sends it.
         // Rendered even on a hit: it is what usage.prompt_tokens estimates from, and the pressure check
         // below is about the transcript, not about the tail.
-        var full = PromptTemplate.Render(Transcript(), _useNativeSystem);
+        var full = PromptTemplate.Render(Transcript(), _useNativeSystem, _prepared.ToolInstructions);
         var nativeSystem = _useNativeSystem ? full.SystemText : null;
         var transcriptChars = full.Prompt.Length + (nativeSystem?.Length ?? 0);
         LogPressure(transcriptChars);

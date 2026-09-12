@@ -1,0 +1,316 @@
+using System.Net;
+using System.Net.Http.Json;
+using System.Text.Json;
+using NpuBridge.Backends.Fake;
+using NpuBridge.Configuration;
+
+namespace NpuBridge.Tests;
+
+/// <summary>
+/// Tool-call emulation through the whole pipeline, on both response shapes (chunk 7, PLAN §2.6).
+/// The parser has its own adversarial suite; this is about the wiring around it — that the
+/// instruction reaches the model, that a reply which parses becomes <c>tool_calls</c> with
+/// <c>content: null</c> and <c>finish_reason: "tool_calls"</c>, that one that does not is ordinary
+/// content, and that the streamed shape holds everything back until it knows which.
+/// </summary>
+public class ToolCallEndpointTests
+{
+    private const string Path = "/v1/chat/completions";
+
+    private static readonly object[] Weather =
+    [
+        new
+        {
+            type = "function",
+            function = new
+            {
+                name = "get_weather",
+                description = "Get current weather",
+                parameters = new
+                {
+                    type = "object",
+                    properties = new { location = new { type = "string" } },
+                    required = new[] { "location" },
+                },
+            },
+        },
+    ];
+
+    private static object Body(bool stream, object? tools = null, object? toolChoice = null, string content = "weather in paris?") => new
+    {
+        model = "fake",
+        stream,
+        tools,
+        tool_choice = toolChoice,
+        messages = new[] { new { role = "user", content } },
+    };
+
+    private static async Task<JsonElement> PostAsync(BridgeTestHost host, object body)
+    {
+        var response = await host.Client.PostAsJsonAsync(Path, body);
+        var text = await response.Content.ReadAsStringAsync();
+        Assert.True(response.StatusCode == HttpStatusCode.OK, text);
+        using var document = JsonDocument.Parse(text);
+        return document.RootElement.Clone();
+    }
+
+    /// <summary>The reply the model is instructed to produce, in the fenced form the injection asks for.</summary>
+    private static readonly string FencedCall =
+        "```json\n" + """{"tool_calls":[{"name":"get_weather","arguments":{"location":"Paris"}}]}""" + "\n```";
+
+    // ---- the instruction reaches the model -------------------------------------------------------
+
+    [Fact]
+    public async Task The_tool_instruction_is_injected_into_the_system_text_the_backend_sees()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        await PostAsync(host, Body(stream: false, tools: Weather));
+
+        var call = Assert.Single(fake.Calls);
+        Assert.Contains("You can call tools. Available tools:", call.SystemPrompt ?? string.Empty, StringComparison.Ordinal);
+        Assert.Contains("get_weather(location: string)", call.SystemPrompt ?? string.Empty, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Three switches turn the feature off, and each must do it completely: no instruction reaches the
+    /// model, so nothing invites a call, and the reply is never parsed. They share one path — the
+    /// catalog is null — so this pins all three against that one behaviour.
+    /// </summary>
+    [Theory]
+    [InlineData(false, null, false)]          // no tools offered
+    [InlineData(true, "none", true)]          // tool_choice: none
+    [InlineData(true, null, false)]           // --tool-emulation off
+    public async Task Nothing_is_injected_when_emulation_is_off_or_unasked(bool offerTools, string? choice, bool emulation)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => [FencedCall] });
+        await using var host = await BridgeTestHost.StartAsync(fake,
+            options: new BridgeOptions { Backend = BackendKind.Fake, ToolEmulation = emulation });
+
+        var body = await PostAsync(host, Body(stream: false, tools: offerTools ? Weather : null, toolChoice: choice));
+
+        Assert.DoesNotContain("You can call tools", Assert.Single(fake.Calls).SystemPrompt ?? string.Empty, StringComparison.Ordinal);
+
+        // And the reply that would have parsed is handed back as content instead.
+        var message = body.GetProperty("choices")[0].GetProperty("message");
+        Assert.Equal(JsonValueKind.String, message.GetProperty("content").ValueKind);
+        Assert.False(message.TryGetProperty("tool_calls", out _));
+        Assert.Equal("stop", body.GetProperty("choices")[0].GetProperty("finish_reason").GetString());
+    }
+
+    // ---- the non-streaming shape -----------------------------------------------------------------
+
+    [Fact]
+    public async Task A_parsed_call_becomes_tool_calls_with_null_content_and_a_tool_calls_finish()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => [FencedCall] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var body = await PostAsync(host, Body(stream: false, tools: Weather));
+
+        var choice = body.GetProperty("choices")[0];
+        Assert.Equal("tool_calls", choice.GetProperty("finish_reason").GetString());
+
+        var message = choice.GetProperty("message");
+        Assert.Equal(JsonValueKind.Null, message.GetProperty("content").ValueKind);
+
+        var call = Assert.Single(message.GetProperty("tool_calls").EnumerateArray());
+        Assert.Equal("function", call.GetProperty("type").GetString());
+        Assert.StartsWith("call_", call.GetProperty("id").GetString(), StringComparison.Ordinal);
+        Assert.Equal("get_weather", call.GetProperty("function").GetProperty("name").GetString());
+
+        // Arguments are JSON *text*, per OpenAI's schema — never a nested object.
+        var arguments = call.GetProperty("function").GetProperty("arguments");
+        Assert.Equal(JsonValueKind.String, arguments.ValueKind);
+        Assert.Equal("Paris", JsonDocument.Parse(arguments.GetString()!).RootElement.GetProperty("location").GetString());
+    }
+
+    [Fact]
+    public async Task A_reply_that_is_not_a_call_stays_ordinary_content()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["It is ", "sunny in Paris."] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var body = await PostAsync(host, Body(stream: false, tools: Weather));
+
+        var choice = body.GetProperty("choices")[0];
+        Assert.Equal("stop", choice.GetProperty("finish_reason").GetString());
+        Assert.Equal("It is sunny in Paris.", choice.GetProperty("message").GetProperty("content").GetString());
+        Assert.False(choice.GetProperty("message").TryGetProperty("tool_calls", out _));
+    }
+
+    /// <summary>
+    /// A tool call costs the tokens the model spent writing it. Reporting zero would tell a client
+    /// budgeting its context that the call was free, which is exactly wrong: the JSON is usually longer
+    /// than the prose answer it replaced.
+    /// </summary>
+    [Fact]
+    public async Task A_tool_call_still_reports_the_completion_tokens_it_cost()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => [FencedCall] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var body = await PostAsync(host, Body(stream: false, tools: Weather));
+
+        Assert.True(body.GetProperty("usage").GetProperty("completion_tokens").GetInt32() > 0);
+    }
+
+    /// <summary>A tool nobody offered is surfaced, not filtered: the client decides what to do with it.</summary>
+    [Fact]
+    public async Task An_unknown_tool_name_is_surfaced_to_the_client()
+    {
+        var reply = """{"tool_calls":[{"name":"rm_rf","arguments":{}}]}""";
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => [reply] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var body = await PostAsync(host, Body(stream: false, tools: Weather));
+
+        var call = Assert.Single(body.GetProperty("choices")[0].GetProperty("message").GetProperty("tool_calls").EnumerateArray());
+        Assert.Equal("rm_rf", call.GetProperty("function").GetProperty("name").GetString());
+    }
+
+    // ---- the streaming shape ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task A_streamed_call_arrives_as_one_tool_calls_chunk_then_the_finish_chunk()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => FakeBackend.Tokenize(FencedCall) });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync(Path, Body(stream: true, tools: Weather));
+        var text = await response.Content.ReadAsStringAsync();
+        var chunks = Sse.Chunks(text);
+
+        Assert.Equal("assistant", chunks[0].GetProperty("choices")[0].GetProperty("delta").GetProperty("role").GetString());
+
+        var callChunk = Assert.Single(chunks, c =>
+            c.GetProperty("choices").GetArrayLength() > 0
+            && c.GetProperty("choices")[0].GetProperty("delta").TryGetProperty("tool_calls", out _));
+        var call = Assert.Single(callChunk.GetProperty("choices")[0].GetProperty("delta").GetProperty("tool_calls").EnumerateArray());
+        Assert.Equal(0, call.GetProperty("index").GetInt32());
+        Assert.Equal("get_weather", call.GetProperty("function").GetProperty("name").GetString());
+
+        Assert.Equal("tool_calls", chunks[^1].GetProperty("choices")[0].GetProperty("finish_reason").GetString());
+        Assert.EndsWith("data: [DONE]\n\n", text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The point of buffering: not one character of the reply goes out before the parse has decided
+    /// what it is. A client that saw the JSON arrive as content deltas and then also received
+    /// <c>tool_calls</c> would render the protocol to the user and call the tool.
+    /// </summary>
+    [Fact]
+    public async Task Nothing_of_a_buffered_reply_is_emitted_as_content_before_the_parse_decides()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => FakeBackend.Tokenize(FencedCall) });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync(Path, Body(stream: true, tools: Weather));
+        var text = await response.Content.ReadAsStringAsync();
+
+        Assert.DoesNotContain("tool_calls\\\":", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("```", text, StringComparison.Ordinal);
+        Assert.All(Sse.Chunks(text), chunk =>
+        {
+            if (chunk.GetProperty("choices").GetArrayLength() == 0)
+            {
+                return;
+            }
+
+            var delta = chunk.GetProperty("choices")[0].GetProperty("delta");
+            if (delta.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.String)
+            {
+                Assert.Equal(string.Empty, content.GetString());
+            }
+        });
+    }
+
+    /// <summary>
+    /// A buffered reply that is not a call still reaches the client whole, as one content chunk. A
+    /// client concatenating deltas sees exactly what the non-streamed shape returns.
+    /// </summary>
+    [Fact]
+    public async Task A_buffered_reply_that_is_not_a_call_is_delivered_as_content()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["It is ", "sunny in Paris."] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync(Path, Body(stream: true, tools: Weather));
+        var text = await response.Content.ReadAsStringAsync();
+
+        var content = string.Concat(Sse.Chunks(text)
+            .Where(c => c.GetProperty("choices").GetArrayLength() > 0)
+            .Select(c => c.GetProperty("choices")[0].GetProperty("delta"))
+            .Where(d => d.TryGetProperty("content", out var v) && v.ValueKind == JsonValueKind.String)
+            .Select(d => d.GetProperty("content").GetString()));
+
+        Assert.Equal("It is sunny in Paris.", content);
+        Assert.Equal("stop", Sse.Chunks(text)[^1].GetProperty("choices")[0].GetProperty("finish_reason").GetString());
+    }
+
+    /// <summary>
+    /// Both shapes must answer the same generation the same way — the drift D56 and D57 record, in the
+    /// one feature that decides its answer after the fact. The reply is fixed, so anything that differs
+    /// is the pipeline, not the model.
+    /// </summary>
+    [Fact]
+    public async Task Both_shapes_report_the_same_call_for_the_same_reply()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => FakeBackend.Tokenize(FencedCall) });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var json = await PostAsync(host, Body(stream: false, tools: Weather));
+        var streamText = await (await host.Client.PostAsJsonAsync(Path, Body(stream: true, tools: Weather))).Content.ReadAsStringAsync();
+
+        var jsonCall = json.GetProperty("choices")[0].GetProperty("message").GetProperty("tool_calls")[0];
+        var streamCall = Sse.Chunks(streamText)
+            .First(c => c.GetProperty("choices").GetArrayLength() > 0
+                && c.GetProperty("choices")[0].GetProperty("delta").TryGetProperty("tool_calls", out _))
+            .GetProperty("choices")[0].GetProperty("delta").GetProperty("tool_calls")[0];
+
+        Assert.Equal(jsonCall.GetProperty("function").GetProperty("name").GetString(),
+            streamCall.GetProperty("function").GetProperty("name").GetString());
+        Assert.Equal(jsonCall.GetProperty("function").GetProperty("arguments").GetString(),
+            streamCall.GetProperty("function").GetProperty("arguments").GetString());
+        Assert.Equal("tool_calls", json.GetProperty("choices")[0].GetProperty("finish_reason").GetString());
+        Assert.Equal("tool_calls", Sse.Chunks(streamText)[^1].GetProperty("choices")[0].GetProperty("finish_reason").GetString());
+    }
+
+    /// <summary>
+    /// Offering different tools must not share a cached context with a request that offered others:
+    /// the instruction is part of the system text, so the conversation key covers it (D71). Two
+    /// requests with the same messages and different tools therefore both miss.
+    /// </summary>
+    [Fact]
+    public async Task Requests_offering_different_tools_do_not_share_a_context()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        object[] other =
+        [
+            new { type = "function", function = new { name = "list_files", description = "List files" } },
+        ];
+
+        await PostAsync(host, Body(stream: false, tools: Weather));
+        await PostAsync(host, Body(stream: false, tools: other));
+
+        Assert.Equal(2, fake.ContextsCreated);
+        Assert.NotEqual(fake.Calls[0].SystemPrompt, fake.Calls[1].SystemPrompt);
+        host.AssertNoLeak();
+    }
+
+    [Fact]
+    public async Task A_tool_call_leaks_no_context_on_either_shape()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => FakeBackend.Tokenize(FencedCall) });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        await PostAsync(host, Body(stream: false, tools: Weather));
+        await (await host.Client.PostAsJsonAsync(Path, Body(stream: true, tools: Weather))).Content.ReadAsStringAsync();
+
+        await TestWait.UntilAsync(() => host.Requests.Completed == 2);
+        host.AssertNoLeak();
+    }
+}
