@@ -103,7 +103,8 @@ limit, a tool-call probe over N runs (`-ToolProbeRuns`, five by default), two co
 queueing behind one another, a full queue answering 429 on a server started with capacity 1,
 `/v1/completions` on both shapes, and at the end that the relaunched child process exited and the
 port is free. It starts and tears down four helper servers along the way, each with its own pass or
-fail row. Re-run `identity.ps1 -Install` whenever the build output folder or the manifest changes.
+fail row. Re-run `identity.ps1 -Install` whenever the build output folder or the manifest changes,
+which includes moving or renaming the clone.
 
 ## How a request travels
 
@@ -325,6 +326,12 @@ flowchart LR
     C --> M["Phi Silica runtime<br/>Microsoft.Windows.AI.Text on the NPU"]
 ```
 
+**Package identity is tied to the folder you built in.** The registration points at the build output
+path, so moving or renaming the clone breaks it and Phi Silica refuses to start, saying it is
+registered for another folder. Re-run `scripts/identity.ps1 -Install` and it works again. `-Status`
+will not warn you beforehand: it reports the registration as healthy either way, because the path it
+prints is the one inside `WindowsApps` rather than the build path that went stale.
+
 **Auto-start differs by backend.** A Windows service is launched by path and so cannot hold identity.
 Phi Silica uses a logon task (`NpuBridge.exe task install`, elevated); aion and fake use a service
 (`NpuBridge.exe service install`).
@@ -365,7 +372,8 @@ bridge clears it; the bridge does not yet recreate the model on its own.
 ```
 npu-bridge.slnx, Directory.Build.props, nuget.config   solution; shared build settings; the local NuGet source
 src/NpuBridge.Core/        logic, no WinRT references, tested without the NPU
-  Api/                     endpoints (JSON and SSE), OpenAI DTOs, validation, the cut, the conversation session and lease
+  Api/                     endpoints (chat and completions, JSON and SSE), OpenAI DTOs, validation, the cut,
+                           the conversation session and lease, the generation queue and its 429 mapping
   Backends/                ILanguageModelBackend, BackendLifecycle, ContextCache, DeltaAccumulator; Fake/ the fake backend
   Configuration/           options, binder, command line, environment variables
   Hosting/                 DI wiring, sc.exe and schtasks command builders, process identity

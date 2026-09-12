@@ -17,7 +17,8 @@ so those tools can run fully local, offline, and free.
 - **Honest.** When the model cannot do something (context overflow, unsupported parameter, tool call
   it did not follow), the response says so in OpenAI's error format rather than silently degrading.
 - **Observable.** `/healthz` answers "is the model loaded, why not, how long has it been loading",
-  whether the process has package identity, the context cache's count and hit/miss counters, the
+  whether the process has package identity, the context cache's count and hit/miss counters, how many
+  requests are waiting on the generation queue and how many it will hold, the
   streaming keep-alive timings, and the backend's own diagnostics (bootstrap outcome, ready state,
   the text-contract counters `text_mismatches` and `late_deltas`); every request logs backend,
   prompt size, cache hit or miss, time to first token, tokens/s and outcome; `--verbose` shows the
@@ -70,7 +71,23 @@ so those tools can run fully local, offline, and free.
   its newest turns. The reply is the one a replay would give, sooner. Context overflow returns
   HTTP 400 `context_length_exceeded`, decided by the backend's preflight before any generation where
   it has one (Phi Silica), and `--truncate-history` drops the oldest exchanges instead, saying how many
-  in `x-npu-bridge-truncated-turns`. `--queue-capacity` is accepted but does nothing until chunk 8.
+  in `x-npu-bridge-truncated-turns`.
+- Concurrent requests are serialized rather than raced (chunk 8, D84). One generation runs at a time
+  against the single model handle, the rest queue, and `--queue-capacity` (default 4) bounds the
+  queue: beyond it a request is refused with HTTP 429, a `Retry-After` in whole seconds and
+  `rate_limit_error`/`queue_full`, rather than being left to time out. A client that gives up while
+  queued costs nothing (its job is dropped without the model being touched) and stops counting
+  against `queue_depth` immediately (D87). `/healthz` reports `queue_depth` and `queue_capacity`.
+  The visible cost is that a queued streamed request may have started sending keep-alive comments
+  before the bridge knows whether it can serve it, so a refusal that would have been a clean 400 or
+  429 can arrive as an SSE error event once the wait runs past about a second (D89).
+- `POST /v1/completions` serves the legacy text-completion shape for clients that still speak it
+  (chunk 8, D91): `object: "text_completion"`, `choices[].text`, both streaming and not, and the same
+  pipeline underneath as chat. Three things a client should know: a multi-element `prompt` array is
+  refused with a 400 rather than silently answering only the first element; the `id` keeps the
+  `chatcmpl-` prefix rather than OpenAI's `cmpl-`; and `echo`, `best_of`, `suffix`, `logprobs` and
+  `logit_bias` are accepted with a warning and never implemented, `echo` being the one whose absence
+  a real client is most likely to notice. `tools` does not exist on this endpoint at all.
 - Token counts in `usage` are real on Phi Silica since D80 (2026-09-11): the Phi-3.5-mini tokenizer,
   adopted after the measurement the owner asked for agreed with the runtime's preflight. `max_tokens`
   is a budget in those tokens. Aion and the fake report `ceil(chars/4)`, documented as an estimate.
@@ -85,4 +102,11 @@ so those tools can run fully local, offline, and free.
   escape as a bare 500 with no body while the streaming shape answered 502 (issue #10).
 - The smoke script is the user-facing statement of what "works on hardware" means: since D79 it
   fails when a Phi Silica server is ready without identity, when the preflight answers nothing, or
-  when the relaunched child or the port outlives a stop.
+  when the relaunched child or the port outlives a stop. Chunk 8 added the claims a queue has to
+  make good on: that a second concurrent request genuinely waits rather than getting its own context,
+  and that a request past `--queue-capacity` is refused with 429 and a `Retry-After` rather than
+  hanging.
+- `docs/CLIENTS.md` is the client-facing half of this: base URL, the endpoint table, and the five
+  things that catch every client on the first try. Nothing in it has yet been driven end to end by a
+  real OpenCode or Hermes instance. The examples are correct against the bridge, and unverified
+  against those tools.

@@ -151,10 +151,12 @@ and the `WindowsWorkload.LanguageModel.*` packages as *staged only* (registered 
 dotnet build ; dotnet test
 .\scripts\identity.ps1 -Install|-Status|-Uninstall
 .\scripts\smoke.ps1 -Backend phi-silica|fake [-Port 5298] [-ToolProbeRuns 20] 6>&1 | Tee-Object -FilePath smoke.log
-NpuBridge.exe --backend fake --listen http://127.0.0.1:5299 --verbose
+NpuBridge.exe --backend fake --listen http://127.0.0.1:5299 --verbose [--queue-capacity 1]
 NpuBridge.exe task install|status|uninstall        # elevated for install/uninstall
 NpuBridge.exe service install|start|stop|uninstall # elevated; aion/fake only
 ```
+`--queue-capacity 1` is the quickest way to see chunk 8's 429 by hand: fire three requests at once and
+two come back `rate_limit_error`/`queue_full` with `Retry-After`.
 
 ## Repository file facts
 - `scripts/smoke.ps1` is CRLF in the working tree (`.gitattributes` `eol=crlf`), LF in the index;

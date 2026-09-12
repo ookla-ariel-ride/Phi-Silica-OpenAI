@@ -14,13 +14,20 @@ NpuBridge (exe, ARM64)          NpuBridge.Core (net10.0, no WinRT)          NpuB
                                    Tokenizers/ ITokenCounter, Phi3TokenCounter, CharEstimate
                                    Backends/   ContextCache; Api/ ConversationSession + ContextLease
                                    Tools/      ToolCatalog, ToolSchemaRenderer, ToolCallParser
+                                   Api/        GenerationScheduler (one worker, bounded queue),
+                                               SchedulerAdmission (429/503 mapping), StreamingPipeline
+                                               (SSE shared by both streamed shapes), Completion*
+                                               (/v1/completions, both shapes)
 ```
 Logic lives in Core so it is testable without the NPU; the exe holds only wiring, WinRT adapters and
 Windows-specific glue. Tests boot the real endpoint pipeline in-process. The cache landed beside the
 backends (`Backends/ContextCache`) with its key in `Prompting/` and the per-request session in `Api/`
 rather than in a `Context/` folder; `Tools/` holds only the tool-call emulation's own logic, with the
 wire shaping it feeds (`ToolCallReply`) in `Api/` beside the DTOs it builds;
-streaming lives in `Api/ChatCompletionsStreamEndpoint` beside the JSON shape, not in a separate folder. `AionBackend`
+streaming lives in `Api/ChatCompletionsStreamEndpoint` beside the JSON shape, not in a separate folder.
+Chunk 8's scheduler went into `Api/` rather than a `Scheduling/` folder of its own, because what it
+serializes is an endpoint concern: it wraps the endpoints' own closures, and `SchedulerAdmission` exists
+to turn its outcomes into the wire shapes that live next to it. `AionBackend`
 compiles only when `nuget-local/` holds the Aion nupkg (`AionSdkAvailable`, D66); CI builds without it.
 
 ## Request flow (as built through chunk 8, D84 to D92, 2026-09-12)
@@ -33,7 +40,7 @@ block into the *system text* (null catalog when there are no usable tools, `tool
 `--tool-emulation off`, which is the single switch phase two reads) → render the prompt
 (`PromptTemplate`) → compute the output limits (`max_tokens`/`stop`, D53). Then
 `ChatCompletionsEndpoint` (JSON) or `ChatCompletionsStreamEndpoint` (SSE) hands the rest to
-`GenerationScheduler.ScheduleAsync`, which is where chunk 8 put the boundary: one worker reads a
+`GenerationScheduler.ScheduleAsync`, which is where chunk 8 put the boundary. One worker reads a
 bounded `Channel<GenerationJob>` (`--queue-capacity`), a full queue is 429 with `Retry-After` and
 `rate_limit_error`/`queue_full`, and a job cancelled while still queued is dropped without touching
 the model. **Everything from here to the lease's settlement runs inside that scheduled closure**,
@@ -96,7 +103,7 @@ through `GenerationFailure.FromException` rather than be swallowed as a cheerful
 enqueue after shutdown answers `Cancelled` rather than `Rejected`, since `Rejected` promises a retry a
 stopped scheduler will never honour. `clientAlreadyGone` is checked first and wins over every other
 reason. `Retry-After` is written only while the response has not started; on an already-started stream
-it is silent by necessity. One consequence of the queue sitting inside D52's first-frame boundary: a
+it is silent by necessity. One consequence of the queue sitting inside D52's first-frame boundary. A
 preflight refusal or a queue-full rejection can now arrive as an SSE error event on an already-200'd
 response once the wait reaches about a second, which D89 accepts deliberately rather than engineering
 around — holding the first keep-alive for admission would reintroduce the "client sees nothing" failure
@@ -106,7 +113,7 @@ D52 exists to prevent.
 waits, `FailAsync`, `ReportSchedulerOutcomeAsync`), extracted as a byte-identical move once
 `/v1/completions` would otherwise have made a third copy; the truncation `beforeHeaders` hook was
 deliberately left per-endpoint (D91). The JSON pair is still a ~60-line duplicate that the extraction
-did not cover (#26) — the same shape D56, D57 and D81 each answered in turn.
+did not cover (#26), the same shape D56, D57 and D81 each answered in turn.
 
 ## Conventions the chunks established
 - **Validate what the deserializer can produce, not just what the type says.** `System.Text.Json` will
@@ -193,7 +200,7 @@ did not cover (#26) — the same shape D56, D57 and D81 each answered in turn.
 (`MaxPromptChars`), and full call recording (`Calls`, per-context `History`). Tests that pass against
 it should not pass vacuously on the NPU.
 
-## Test conventions (D43, D54, D79, D81, D82, D83)
+## Test conventions (D43, D54, D79, D81, D82, D83, D92)
 - Never assert on wall-clock timing. Order events with the fake's gates and assert on what had or had
   not happened when the gate opened. Which gate depends on where the hold must be: `StartGate` before
   the generation decides anything at all, the prompt-length verdict included; `FirstTokenGate` after
@@ -204,6 +211,13 @@ it should not pass vacuously on the NPU.
   `StartDelay` (D81). The keep-alive wait's timeout is `Task.WaitAsync`'s, read off the wall clock
   rather than the injected `TimeProvider`, so two keep-alive tests still lean on real time and pin
   less than their names suggest (`docs/FUTURE.md`); their summaries say so.
+- A race that only a race can expose gets an honest label. D92's publish-before-arm regression test
+  drives 500 sequential jobs and catches the bug about 60 % of the time; it was kept as a smoke
+  detector and filed as issue #24 rather than described as a guard. The deterministic version needs
+  the two flags made visible to the test project, which is a visibility change and no production
+  behaviour. Three other chunk 8 paths ship with no deterministic test at all, each attempted and
+  abandoned for a written reason rather than overlooked (issue #27). The rule is that an untested
+  path is named in an issue, not left for a reader to discover.
 - Shared helpers live in `BridgeTestHost.cs`, not in whichever class needed them first:
   `TestWait.UntilAsync` for a polled condition, `Sse.Payloads`/`Sse.Chunks` for an SSE body,
   `ChatBody.User` for the minimal request. Tests that are *about* the raw SSE framing still read raw
@@ -255,7 +269,8 @@ it should not pass vacuously on the NPU.
   never fail on a surprising number, but a body may call `Fail` for a contradiction of something the
   bridge guarantees (a placement run that cannot answer 200, `/healthz` without the keep-alive
   timings). The D52 "exceeded" branch is deliberately not a failure: the keep-alive timer starts
-  after the body parse, the cache lookup and the preflight, so it measures pre-generation latency.
+  after the body parse, the cache lookup and the preflight — and, since chunk 8, after the queue wait
+  as well (D89), so it measures pre-generation latency and has one more term in it than it used to.
 - Readiness means: `package_identity` true and `diagnostics.bootstrap == ok` on phi-silica, whoever
   started it; `package_identity` false on fake and aion when the script started them by path
   (`-NoStart` tests a server as found). The served model id is read off `/healthz`, never spelled
@@ -275,6 +290,13 @@ it should not pass vacuously on the NPU.
   How often the model chooses to call, and a call to a tool nobody offered, are reported instead:
   surfacing an unoffered name is what PLAN §2.6 item 3 requires, so failing on it would fail the
   probe for behaving as designed (D83).
+- Chunk 8's two concurrency steps are written to fail on the thing a queue can fake. The first proves
+  the second request *waited* rather than merely succeeding — `queue_depth` is sampled while both are
+  outstanding and must peak at 1, because two requests both returning 200 is exactly what the
+  pre-scheduler bridge did. The second runs an auxiliary server at `--queue-capacity 1` and requires
+  one admitted 200 and two 429s carrying `Retry-After`, `rate_limit_error` and `queue_full`, since a
+  queue that never refuses has not been shown to be bounded. The `/v1/completions` steps read
+  `choices[0].text`, not a chat shape's `.Content`, which would pass vacuously on an empty string.
 - Output goes through `Write-Host`; redirect with `6>&1`. Under package activation the child's
   console output is not in the log, so `/healthz` and the responses are the evidence. Do not
   `dotnet build` while a smoke server is up.
@@ -289,6 +311,11 @@ service/task verbs bind through the same code.
 - Identity comes from a sparse package (`packaging/AppxManifest.xml`, `scripts/identity.ps1`) and is
   granted only by package activation. `Program` relaunches itself through
   `IApplicationActivationManager` when started by path as `phi-silica`; arguments survive.
+- The registration is bound to the **build output path** by `Add-AppxPackage -ExternalLocation
+  $BinDir`, so moving or renaming the repository folder invalidates it and `-Install` must be re-run.
+  `-Status` cannot detect that: it prints the WindowsApps `InstallLocation`, which does not change.
+  Re-registering against a different external location is refused in place (`HRESULT 0x80073D0B`) and
+  falls back to remove-then-add, which is the only path on which D82's ordering does any work.
 - Auto-start: logon scheduled task (`task install`) for Phi Silica; Windows service (`service install`)
   for aion/fake. Both build `sc.exe`/`schtasks.exe` command lines in Core with CRT-correct quoting and
   refuse secrets on the command line.
@@ -311,10 +338,24 @@ service/task verbs bind through the same code.
   counter rather than `Reader.Count`, dropping at whichever comes first of the caller cancelling while
   queued or the worker dequeuing, so a client that enqueues and gives up cannot inflate it or
   `Retry-After` for a whole generation (D87); backend diagnostics passed through verbatim.
+- `/v1/completions`: the legacy `text_completion` shape over the same pipeline, both streaming and
+  not (D91). `choices[].text` rather than `.message`; `finish_reason` is only `stop`, `length` or
+  `content_filter`, since `tools` does not exist here; a multi-element `prompt` array is a 400 rather
+  than a silent answer from the first element; the id keeps the `chatcmpl-` prefix; `echo`,
+  `best_of`, `suffix`, `logprobs` and `logit_bias` are accepted, warned and never implemented. The
+  streamed shape commits its headers at the first cutter release, having no role chunk to send ahead.
+- A queue-full rejection is 429, `rate_limit_error`/`queue_full`, with `Retry-After` in whole seconds,
+  written only while the response has not started, so an already-streaming rejection is silent about
+  it. A queued job dropped at shutdown is 503 `queue_shutting_down`; a job that ran and threw its own
+  `OperationCanceledException` is a 502, because that is a backend contract violation rather than a
+  shutdown (D88).
 - `/v1/{**}` fallback: 405 with `Allow` for a wrong method on a known path, otherwise 404.
-- `/debug/generate`: raw prompt into the backend with timing. `/debug/tokenize`: the backend
+- `/debug/generate`: raw prompt into the backend with timing, through the scheduler since D90 so it
+  cannot bypass the queue and race the shared handle. `/debug/tokenize`: the backend
   counter's count for a text and the counter's name, answered while the model is still loading (D80).
-  Both are loopback-only and diagnostic; the smoke script leans on them.
+  Both are loopback-only and diagnostic; the smoke script leans on them. `/debug/generate` still
+  carries the pre-D82 catch filter, so a foreign `OperationCanceledException` escapes it as a bare
+  500 (issue #25).
 
 ## Review loop
 Each chunk: build + tests green → adversarial review (in-session subagent, then Codex) → fix in-scope
@@ -328,3 +369,22 @@ chunks (D77 to D82) follows the same loop on its own branch; a partial pass over
 #14 and #15) leaves the issue open with a comment saying what landed, what each test pins and does
 not, and what remains. The smoke run is repeated on the final code of a branch that touched the
 script or the exe, and a first-generation RPC fault is re-run once before it counts as a failure.
+
+Two things chunk 8 taught the loop itself.
+
+**The review earns its cost when the brief is wrong, not when the code is.** Chunk 8's task brief
+instructed the implementer to put the queue wait after the cache lookup and preflight, contradicting
+PLAN §2.7. Following it would have shipped a scheduler that serialized generation while
+`CreateContext` and `GetUsablePromptLength` still raced — the bug the chunk existed to fix, surviving
+the chunk. The implementer could not have caught this: it built exactly what it was told, and a
+self-review would have checked the code against the same wrong brief. Only a reviewer that had not
+written the code, reading against the spec rather than the instruction, could find it (D84). This is
+why an implementer never dispatches its own reviewer, and why the session driving the work makes the
+ruling when a review and a brief disagree.
+
+**The state-doc pass belongs to the merge, not to whatever comes after it.** The session that merged
+chunk 8 crashed in the gap between filing its issues and updating the documents, and the repository
+spent a day telling every reader that chunk 8 was the next thing to build — `CLAUDE.md`, `PLAN.md`,
+the handoff and this folder all describing a state that no longer existed. Recovering it took a
+transcript search, a commit survey and a full re-verification. The loop already said "in the same
+session"; the cost of the gap is now measured.

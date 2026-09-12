@@ -7,7 +7,7 @@ are built and merged; the plan is complete.** Work from here is GitHub issues, n
 `main` is on the chunk 8 merge (`2114c36`) plus the state-doc pass, the only branch, in sync with
 origin, tree clean. 932 tests pass, the solution builds with no warnings, CI is green.
 `smoke.ps1 -Backend phi-silica` passed at the merge (28 PASS / 0 FAIL / 0 SKIP / 5 INFO, first
-attempt, no RPC flake) and again on 2026-09-12 after the folder rename and identity re-register —
+attempt, no RPC flake) and again on 2026-09-12 after the folder rename and identity re-register:
 all steps passed, 0 skipped, 5 informational, no FAIL or WARN rows, `identity=True`, `queue_depth`
 peaking at 1 under two concurrent requests, `--queue-capacity 1` admitting one of three and 429ing
 two, `/v1/completions` answering on both shapes, and D80's tokenizer boundaries unchanged
@@ -19,12 +19,12 @@ image-mapped and no Aion generation has ever run here (D70; issue #2 open). Do n
 blocker.
 
 **The local folder was renamed to `npu-bridge` on 2026-09-12, after the merge**, and identity has been
-re-registered for it — the smoke run above confirms `identity=True`. Keep the mechanism in mind if it
+re-registered for it. The smoke run above confirms `identity=True`. Keep the mechanism in mind if it
 is renamed again: `identity.ps1` registers with `Add-AppxPackage -ExternalLocation $BinDir`, so a
 rename leaves the registration pointing nowhere, and `-Status` cannot reveal it (it prints the
 WindowsApps `InstallLocation`, not the external location). The re-register also showed that
 `Add-AppxPackage` **refuses** an in-place update when the external location changed
-(`HRESULT 0x80073D0B`) and D82's remove-then-add fallback is what carries it — the first time that
+(`HRESULT 0x80073D0B`) and D82's remove-then-add fallback is what carries it, the first time that
 branch has fired, and a qualifier on the settled note that a re-run "removes nothing".
 
 Aion Instruct ships as a model swap behind the Phi Silica API (Microsoft's Phi Silica page,
@@ -33,7 +33,7 @@ Feature Rollout with a registry key, retail in November with Phi Silica removed,
 `PhiSilicaBackend` is therefore the production Aion path. Details in `techContext.md`.
 
 ## What the 2026-09-12 session built: chunk 8 (issue #4, D84 to D92)
-The concurrency scheduler, `/v1/completions` and the client docs — the last chunk.
+The concurrency scheduler, `/v1/completions` and the client docs, the last chunk.
 
 - **`Api/GenerationScheduler.cs`**: one worker reading a bounded `Channel<GenerationJob>`
   (`--queue-capacity`, default 4, read for the first time). `IHostedService, IAsyncDisposable`.
@@ -42,7 +42,7 @@ The concurrency scheduler, `/v1/completions` and the client docs — the last ch
   `GetUsablePromptLength` are calls on the one shared `LanguageModel` handle exactly as the generation
   is, so queueing only the generation would have shipped the scheduler with the very race it exists to
   close. The task brief said to put the queue wait after the cache lookup and preflight; PLAN §2.7 says
-  otherwise and won. The author could not have found this — it implemented what it was told.
+  otherwise and won. The author could not have found this: it implemented what it was told.
 - **D85**: the lease is published from inside the closure the moment `Acquire` hands it over, never read
   off the scheduled task's return value. A streaming client that vanishes mid-frame can unwind before
   the task is unwrapped, leaving `finally` with `null` and the context never released — D43 and D51
@@ -50,7 +50,7 @@ The concurrency scheduler, `/v1/completions` and the client docs — the last ch
 - **D86**: a `--truncate-history` retry stays in its scheduled slot rather than re-entering the queue,
   so a request already mid-flight cannot be 429'd at the worst possible moment. The cost is that
   `Retry-After`'s rolling average measures a whole attempt, possibly several preflight rounds.
-- **D87**: `/healthz`'s `queue_depth` is a live counter, not `Reader.Count` — it drops at whichever
+- **D87**: `/healthz`'s `queue_depth` is a live counter, not `Reader.Count`: it drops at whichever
   comes first of the caller cancelling while queued or the worker dequeuing. A client that enqueues,
   gives up and retries used to leave every dead job counted for a whole generation, inflating
   `Retry-After`. The channel *slot* is still held until drained, so a burst of aborted clients can
@@ -66,11 +66,11 @@ The concurrency scheduler, `/v1/completions` and the client docs — the last ch
   rejection that used to be a clean 400/429 can surface as an SSE error event once the wait runs to
   about a second. Accepted deliberately: holding the first keep-alive for admission would reintroduce
   the "client sees nothing" failure D52 exists to prevent.
-- **D90**: `/debug/generate` goes through the scheduler too, superseding D40's deferral — unqueued it
+- **D90**: `/debug/generate` goes through the scheduler too, superseding D40's deferral, because unqueued it
   created a context and generated on the shared handle exactly as the OpenAI endpoints do, the same
   race arriving through a second door.
 - **D91**, `/v1/completions`: `prompt` wrapped into one user message, then the identical pipeline from
-  the model-id check onward. Four rulings PLAN left open — a multi-element `prompt` array is a 400
+  the model-id check onward. Four rulings PLAN left open. A multi-element `prompt` array is a 400
   (a single-worker scheduler cannot serve OpenAI's several-choices batching); the id keeps `chatcmpl-`
   rather than `cmpl-` since every checked consumer treats it as opaque; `echo`, `best_of`, `suffix`,
   `logprobs` and `logit_bias` are accepted and warned but never implemented; and the streamed shape
@@ -79,7 +79,7 @@ The concurrency scheduler, `/v1/completions` and the client docs — the last ch
   endpoints had duplicated without ever drifting.
 - **D92**, the bug shape to remember: `ScheduleAsync` published a job to the channel before finishing
   the state that job needed, and the worker could dequeue, run and settle inside that window. It
-  produced two real bugs on the branch — a leaked cancellation registration (`4ee9268`) and a
+  produced two real bugs on the branch: a leaked cancellation registration (`4ee9268`) and a
   `_liveQueueDepth` stuck permanently high (`cb40c5e`). Arm before the write, and use `Interlocked` on
   *both* sides: the two flags are a Dekker-pair store/load, and ARM64 permits the store-buffer
   reordering that plain volatile release/acquire does not close. Measured: 3 failures in 5 runs
@@ -103,11 +103,11 @@ No chunk is outstanding. What remains is issues.
 
 - **From chunk 8 (#24 to #28):** #24, the publish-before-arm regression test is probabilistic (~60 %
   catch rate) and a deterministic version needs only test-visibility, no production change. #25, a
-  foreign `OperationCanceledException` still escapes `/debug/generate` as a bare 500 — D82's fix never
+  foreign `OperationCanceledException` still escapes `/debug/generate` as a bare 500, since D82's fix never
   applied to this one endpoint; a client abort while queued also reports 503 `queue_shutting_down`,
   untrue but harmless. #26, five leftovers, the largest being the ~60-line byte-identical duplicate
   between `ChatCompletionsEndpoint` and `CompletionsEndpoint`'s JSON closures that `StreamingPipeline`
-  did not cover — the D56/D57/D81 shape recurring. #27, three knowingly-untested paths, each attempted
+  did not cover, the D56/D57/D81 shape recurring. #27, three knowingly-untested paths, each attempted
   and abandoned for a stated reason. #28, the drain wait is still unbounded and silent, and the queue
   raised its stakes: a runtime that never completes after a cancel now parks the single worker and
   everything behind it. A bounded timeout-then-dispose is explicitly the wrong fix (it reinstates the
@@ -116,7 +116,7 @@ No chunk is outstanding. What remains is issues.
   "delete or mark" sections; #15's items 4 to 9, the manual checklist and the exe paths list; #16, a CI
   run of the exe with the fake backend, blocked on an ARM64 runner.
 - **#17:** `BackendCapabilities.Cancellation` is advertised and read by nobody. Report it on `/healthz`,
-  read it in the fake, or drop it — needs a choice first.
+  read it in the fake, or drop it, which needs a choice first.
 - **#19:** two `identity.ps1` defects, both unreachable while the manifest stays at 0.1.0.0. Note that
   the folder rename has made `-Install` newly relevant even though the version has not moved. It was
   closed twice by accidental closing keywords in commit messages; check it is still open.
