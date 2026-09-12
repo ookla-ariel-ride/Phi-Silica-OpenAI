@@ -48,6 +48,14 @@ public static class NpuBridgeServiceCollectionExtensions
             sp.GetRequiredService<ContextCache>()));
         services.AddHostedService(sp => sp.GetRequiredService<BackendLifecycle>());
 
+        // Chunk 8: serializes generation against the one model handle. Standalone here (task 1); no
+        // endpoint reads it yet (task 2).
+        services.AddSingleton(sp => new GenerationScheduler(
+            options,
+            sp.GetRequiredService<TimeProvider>(),
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<GenerationScheduler>>()));
+        services.AddHostedService(sp => sp.GetRequiredService<GenerationScheduler>());
+
         services.Configure<JsonOptions>(o =>
         {
             o.SerializerOptions.PropertyNamingPolicy = JsonDefaults.Options.PropertyNamingPolicy;
