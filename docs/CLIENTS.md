@@ -106,9 +106,10 @@ than wait for a 429.
 
 ## OpenCode
 
-> **Not usable on this machine as of 2026-09-12.** OpenCode does not yet run properly on Windows
-> ARM64, which is the only platform the Phi Silica backend exists on. Nothing in this section has
-> been exercised against a running OpenCode instance, and it cannot be until that changes. The
+> **Unverified on this machine as of 2026-09-12.** OpenCode's native ARM64 build (1.18.30) refuses
+> every command, and Windows ARM64 is the only platform the Phi Silica backend exists on.
+> `docs/OPENCODE-WINDOWS-ARM64.md` has the workaround (the x64 build under emulation, or pinning
+> 1.18.29), which makes OpenCode start; nothing in this section has yet been exercised against it. The
 > verified client on this machine is Hermes, below.
 
 OpenCode is one of the two agent tools this bridge exists to serve, and the one where tool calling
@@ -323,6 +324,7 @@ against Phi Silica on this machine (`.superpowers/sdd/chunk-8-plan/task-4-report
 The **Hermes** section was verified against a running Hermes Agent v0.21.2 on 2026-09-12 (issue #21):
 its identity, its config path, the `OPENAI_BASE_URL`/`HERMES_HOME` overrides, the four-row toolset
 table and the `` `4` `` answer are all measured, not documented-and-assumed. The COMException
-behaviour behind the 502 rows is issue #29. The **OpenCode** section remains unverified and cannot
-be verified here, because OpenCode does not yet run on Windows ARM64; treat it as a starting point
-to check against OpenCode's current documentation rather than a working integration.
+behaviour behind the 502 rows is issue #29. The **OpenCode** section remains unverified: its ARM64
+build does not start here without the workaround in `docs/OPENCODE-WINDOWS-ARM64.md`, and no run
+against the bridge has been made since; treat it as a starting point to check against OpenCode's
+current documentation rather than a working integration.

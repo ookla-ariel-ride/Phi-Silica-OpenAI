@@ -408,7 +408,8 @@ src/NpuBridge/             the ARM64 exe: Program.cs, PackageActivation, Supervi
 tests/NpuBridge.Tests/     xunit against the fake backend through TestServer
 packaging/                 AppxManifest.xml for the sparse package; BuildTools.proj
 scripts/                   identity.ps1 (package identity), smoke.ps1 (the hardware run)
-docs/                      PLAN.md, DECISIONS.md, FUTURE.md, SESSION-HANDOFF.md, CLIENTS.md
+docs/                      PLAN.md, DECISIONS.md, FUTURE.md, SESSION-HANDOFF.md, CLIENTS.md, and the
+                           Windows ARM64 workaround notes for OpenCode and the Grok CLI
 memory-bank/               project notes kept for the next session
 nuget-local/               where the Aion SDK nupkg goes (gitignored; the adapter compiles only when it is present)
 .githooks/, .github/       the gitleaks pre-commit hook; the build-and-test and secret-scan workflows
