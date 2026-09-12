@@ -25,9 +25,14 @@ namespace NpuBridge.Api;
 ///   <item>The worker never starts a job's body until the previous job's body has completed, including
 ///   one still running after its own token was cancelled — D51 one level up. Awaiting a cancelled
 ///   operation to the end is the drain; only then does the loop move to the next job.</item>
-///   <item>A job cancelled while still queued (never dequeued) completes as
-///   <see cref="ScheduleResultKind.Cancelled"/> without ever invoking its body: the model is never
-///   touched for work nobody is waiting for.</item>
+///   <item>A job cancelled while still queued completes its caller as
+///   <see cref="ScheduleResultKind.Cancelled"/> the instant its token fires, without ever invoking its
+///   body: the model is never touched for work nobody is waiting for, and the caller does not wait for
+///   the worker to drain to its position first. The queue slot itself is freed only when the worker
+///   reaches it (deferred; see the fix report).</item>
+///   <item>An enqueue attempt after the scheduler has started shutting down is
+///   <see cref="ScheduleResultKind.Cancelled"/>, not <see cref="ScheduleResultKind.Rejected"/>: a
+///   stopped scheduler is never coming back to honour a <c>Retry-After</c>.</item>
 ///   <item>A queue-full rejection carries a <c>Retry-After</c>, already computed as whole seconds:
 ///   queue depth times the rolling average generation duration, floored at 1. With no generation yet
 ///   completed the average is 0, so a cold-start rejection floors to 1 second — PLAN §2.7 does not
@@ -39,6 +44,14 @@ namespace NpuBridge.Api;
 /// </remarks>
 public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
 {
+    /// <summary>
+    /// How long <see cref="DisposeAsync"/> waits for the worker to drain before giving up and returning
+    /// anyway. Mirrors <c>BackendLifecycle.DisposeGracePeriod</c>: disposal must have the same escape
+    /// hatch <see cref="StopAsync"/> has, or the two disagree about whether shutdown can hang forever on
+    /// a generation that ignores cancellation (fix-round-1 finding 1).
+    /// </summary>
+    public static readonly TimeSpan DisposeGracePeriod = TimeSpan.FromSeconds(15);
+
     private readonly Channel<IQueuedJob> _queue;
     private readonly TimeProvider _time;
     private readonly ILogger<GenerationScheduler> _logger;
@@ -109,29 +122,66 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
         _disposed = true;
         await _shutdown.CancelAsync().ConfigureAwait(false);
         _queue.Writer.TryComplete();
-        await _worker.ConfigureAwait(false);
+
+        // Same escape hatch as StopAsync, on its own bounded clock rather than the host's: the two
+        // must not disagree about whether disposal can be made to wait forever behind a generation
+        // that never observes cancellation (fix-round-1 finding 1).
+        var finished = await Task.WhenAny(_worker, Task.Delay(DisposeGracePeriod)).ConfigureAwait(false);
+        if (finished != _worker)
+        {
+            _logger.LogWarning("Generation scheduler did not drain within {Grace}s of disposal; a job may still be running.",
+                DisposeGracePeriod.TotalSeconds);
+        }
+
         _shutdown.Dispose();
     }
 
     /// <summary>
-    /// Enqueues one generation. Returns immediately with <see cref="ScheduleResultKind.Rejected"/> when
-    /// the queue is already full — never blocks, never throws for that case. Otherwise the returned
-    /// task completes once the worker has run <paramref name="operation"/>, or has dropped it, uncalled,
-    /// because <paramref name="cancellationToken"/> fired while it was still queued.
+    /// Enqueues one generation. Returns immediately — never blocks — with
+    /// <see cref="ScheduleResultKind.Rejected"/> when the queue is already full, or with
+    /// <see cref="ScheduleResultKind.Cancelled"/> when the scheduler is already shutting down (a
+    /// stopped scheduler answers "this will never run" rather than "try again in N seconds", since
+    /// nothing will be here to honour a <c>Retry-After</c>). Otherwise the returned task completes once
+    /// the worker has run <paramref name="operation"/>, or has dropped it, uncalled, because
+    /// <paramref name="cancellationToken"/> fired — either while the job was still queued (completed
+    /// immediately, without waiting for the worker to drain to its position) or, if the operation itself
+    /// throws <see cref="OperationCanceledException"/> for that same token, while it was running.
     /// <see cref="ScheduleResult{TResult}.QueueWait"/> on every non-rejected outcome is how long the job
-    /// actually waited, for the caller's <c>queue_wait_ms</c> log field; a rejected job never queued at
-    /// all, so its <see cref="ScheduleResult{TResult}.RetryAfterSeconds"/> is what matters instead.
+    /// actually waited, for the caller's <c>queue_wait_ms</c> log field; a rejected or already-cancelled
+    /// job never queued at all, so its <see cref="ScheduleResult{TResult}.RetryAfterSeconds"/> (rejected
+    /// only) is what matters instead.
     /// </summary>
+    /// <remarks>
+    /// The returned task can also fault: <paramref name="operation"/> throwing anything other than an
+    /// <see cref="OperationCanceledException"/> for its own token is not translated into a
+    /// <see cref="ScheduleResultKind"/> — the caller sees that exception rethrown from its own
+    /// <c>await</c>, exactly as if it had called <paramref name="operation"/> directly. Only
+    /// cancellation and queue state are the scheduler's to interpret.
+    /// </remarks>
     public Task<ScheduleResult<TResult>> ScheduleAsync<TResult>(
         Func<CancellationToken, Task<TResult>> operation,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(operation);
 
-        var job = new QueuedJob<TResult>(operation, _time.GetUtcNow(), cancellationToken);
+        var job = new QueuedJob<TResult>(operation, _time.GetUtcNow(), _time, cancellationToken);
         if (_queue.Writer.TryWrite(job))
         {
+            // Controller ruling, fix-round-1 finding 3: complete the caller the moment its own token
+            // fires rather than leaving it to wait for the worker to drain to this job's position in
+            // the queue. The worker's own Drop/RunAsync completions already use TrySetResult, so
+            // whichever of the two gets there first wins and the other is a no-op. The queue slot
+            // itself is not freed early -- that half is deferred (see the fix report).
+            job.ArmCancellationCompletion();
             return job.Completion.Task;
+        }
+
+        if (_shutdown.IsCancellationRequested)
+        {
+            // Controller ruling, review finding 8: the scheduler is going away, not merely busy, so
+            // the true answer is Cancelled -- Task 2 turns this into a 503, not a 429 with a
+            // Retry-After aimed at a process that will not be here to honour it.
+            return Task.FromResult(ScheduleResult.Cancelled<TResult>(TimeSpan.Zero));
         }
 
         var retryAfter = ComputeRetryAfterSeconds();
@@ -160,6 +210,12 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
         {
             while (_queue.Reader.TryRead(out var job))
             {
+                // From here on this job is the worker's to decide about; ArmCancellationCompletion's
+                // registration steps back once it sees this (fix-round-1 finding 3's carve-out), so a
+                // cancel that arrives after this point is the running job's own to answer for -- D51 --
+                // rather than something this loop preempts out from under it.
+                job.MarkDequeued();
+
                 var queueWait = _time.GetUtcNow() - job.EnqueuedAt;
 
                 // Shutdown or the request's own cancellation: either way this job was never dequeued
@@ -194,6 +250,14 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
 
         bool IsCancellationRequested { get; }
 
+        /// <summary>
+        /// Marks that the worker now owns this job's fate. Called exactly once, the moment it is
+        /// dequeued, whether it is about to be run or dropped -- from this point on, a cancellation of
+        /// its own token is the worker's (via <see cref="Drop"/> or <see cref="RunAsync"/>) to answer,
+        /// not the standing registration's.
+        /// </summary>
+        void MarkDequeued();
+
         /// <summary>Completes the job as cancelled without ever invoking its operation.</summary>
         void Drop(TimeSpan queueWait);
 
@@ -204,12 +268,16 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
     private sealed class QueuedJob<TResult> : IQueuedJob
     {
         private readonly Func<CancellationToken, Task<TResult>> _operation;
+        private readonly TimeProvider _time;
         private readonly CancellationToken _cancellationToken;
+        private CancellationTokenRegistration _cancellationRegistration;
+        private int _dequeued;
 
-        public QueuedJob(Func<CancellationToken, Task<TResult>> operation, DateTimeOffset enqueuedAt, CancellationToken cancellationToken)
+        public QueuedJob(Func<CancellationToken, Task<TResult>> operation, DateTimeOffset enqueuedAt, TimeProvider time, CancellationToken cancellationToken)
         {
             _operation = operation;
             EnqueuedAt = enqueuedAt;
+            _time = time;
             _cancellationToken = cancellationToken;
         }
 
@@ -220,8 +288,49 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
 
         public bool IsCancellationRequested => _cancellationToken.IsCancellationRequested;
 
-        public void Drop(TimeSpan queueWait) =>
+        public void MarkDequeued() => Volatile.Write(ref _dequeued, 1);
+
+        /// <summary>
+        /// Completes <see cref="Completion"/> as <see cref="ScheduleResultKind.Cancelled"/> the instant
+        /// <see cref="_cancellationToken"/> fires, instead of leaving the caller to wait for the worker
+        /// to drain to this job's position in the queue (fix-round-1 finding 3) -- but only while the
+        /// job is still genuinely queued. Once <see cref="MarkDequeued"/> has run, a later cancel is the
+        /// worker's own to answer: D51 requires an already-running operation be awaited to whatever end
+        /// it reaches (which may be a normal <see cref="ScheduleResultKind.Completed"/>, if the
+        /// operation itself chooses to ignore its token), not preempted by this callback the instant the
+        /// token fires. Races harmlessly with <see cref="Drop"/> and <see cref="RunAsync"/> in every
+        /// case: all three use <c>TrySetResult</c>, so only the first to arrive matters.
+        /// <see cref="CancellationToken.UnsafeRegister"/> is used (not <c>Register</c>) because this
+        /// callback captures no ambient context worth flowing, matching the reviewer's suggestion.
+        /// </summary>
+        public void ArmCancellationCompletion()
+        {
+            _cancellationRegistration = _cancellationToken.UnsafeRegister(static state =>
+            {
+                var job = (QueuedJob<TResult>)state!;
+                if (Volatile.Read(ref job._dequeued) != 0)
+                {
+                    // The worker already owns this job (running, or about to decide to drop it via its
+                    // own IsCancellationRequested check); Drop/RunAsync's own completion and dispose is
+                    // what settles it, not this callback.
+                    return;
+                }
+
+                var queueWait = job._time.GetUtcNow() - job.EnqueuedAt;
+                job.Completion.TrySetResult(ScheduleResult.Cancelled<TResult>(queueWait));
+
+                // Safe to dispose the registration from inside its own callback: it is already
+                // running, so this only stops it from being disposed again later and releases the
+                // token's reference to it.
+                job._cancellationRegistration.Dispose();
+            }, this);
+        }
+
+        public void Drop(TimeSpan queueWait)
+        {
             Completion.TrySetResult(ScheduleResult.Cancelled<TResult>(queueWait));
+            _cancellationRegistration.Dispose();
+        }
 
         public async Task RunAsync(TimeSpan queueWait)
         {
@@ -237,6 +346,10 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
             catch (Exception ex)
             {
                 Completion.TrySetException(ex);
+            }
+            finally
+            {
+                _cancellationRegistration.Dispose();
             }
         }
     }

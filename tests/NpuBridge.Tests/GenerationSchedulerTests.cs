@@ -274,6 +274,52 @@ public class GenerationSchedulerTests
         }
     }
 
+    /// <summary>
+    /// Fix-round-1 finding 3 (controller ruling: fix the caller half now, defer the slot half). Before
+    /// the fix, a queued job's own token was only polled when the worker dequeued it, so its caller's
+    /// task stayed pending for as long as whatever was running ahead of it took -- an aborted client
+    /// behind a 60s generation waited the full 60s for nothing. This test would hang without the fix:
+    /// A's gate is never released before <c>taskB</c> is awaited, so the only way this test can pass is
+    /// if B's cancellation is observed independently of the worker ever reaching B.
+    /// </summary>
+    [Fact]
+    public async Task A_job_cancelled_while_queued_completes_its_caller_immediately_not_after_the_running_job_drains()
+    {
+        var scheduler = NewScheduler();
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            var gateA = new TaskCompletionSource();
+            var startedA = new TaskCompletionSource();
+            var taskA = scheduler.ScheduleAsync<string>(async ct =>
+            {
+                startedA.TrySetResult();
+                await gateA.Task.WaitAsync(ct).ConfigureAwait(false);
+                return "a";
+            }, CancellationToken.None);
+            await startedA.Task; // A is running and will not finish until gateA is released -- which it is not, below.
+
+            using var ctsB = new CancellationTokenSource();
+            var taskB = scheduler.ScheduleAsync<string>(_ => Task.FromResult("b"), ctsB.Token);
+            await TestWait.UntilAsync(() => scheduler.QueueDepth == 1); // B confirmed queued behind A.
+
+            ctsB.Cancel();
+
+            // A is still running, gateA is still open: if B's caller had to wait for the worker to
+            // drain to its position, this would hang forever instead of completing.
+            var resultB = await taskB;
+            Assert.Equal(ScheduleResultKind.Cancelled, resultB.Kind);
+
+            gateA.SetResult();
+            var resultA = await taskA;
+            Assert.Equal(ScheduleResultKind.Completed, resultA.Kind);
+        }
+        finally
+        {
+            await scheduler.DisposeAsync();
+        }
+    }
+
     [Fact]
     public async Task A_job_cancelled_while_running_is_awaited_to_completion_before_the_next_job_starts()
     {
@@ -453,5 +499,55 @@ public class GenerationSchedulerTests
         {
             await scheduler.DisposeAsync();
         }
+    }
+
+    /// <summary>
+    /// Fix-round-1 finding 2: <c>catch (Exception ex) { Completion.TrySetException(ex); }</c> is the
+    /// only thing standing between "a job body threw" and a faulted, unobserved worker task that wedges
+    /// every subsequent <see cref="GenerationScheduler.ScheduleAsync{TResult}"/> forever. This pins that
+    /// the exception is rethrown to the exact caller that is waiting for it, and that the worker survives
+    /// to run the very next job.
+    /// </summary>
+    [Fact]
+    public async Task A_job_that_throws_faults_its_own_caller_without_wedging_the_worker()
+    {
+        var scheduler = NewScheduler();
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            var boom = new InvalidOperationException("boom");
+            var taskA = scheduler.ScheduleAsync<string>(_ => throw boom, CancellationToken.None);
+
+            var observed = await Assert.ThrowsAsync<InvalidOperationException>(() => taskA);
+            Assert.Same(boom, observed);
+
+            var taskB = scheduler.ScheduleAsync<string>(_ => Task.FromResult("b"), CancellationToken.None);
+            var resultB = await taskB;
+
+            Assert.Equal(ScheduleResultKind.Completed, resultB.Kind);
+            Assert.Equal("b", resultB.Result);
+            Assert.Equal(0, scheduler.QueueDepth);
+        }
+        finally
+        {
+            await scheduler.DisposeAsync();
+        }
+    }
+
+    /// <summary>Controller ruling, review finding 8: a stopped scheduler is never coming back to honour a Retry-After, so the truer answer to a post-shutdown enqueue is Cancelled, not Rejected.</summary>
+    [Fact]
+    public async Task Enqueue_after_shutdown_is_cancelled_not_rejected()
+    {
+        var scheduler = NewScheduler();
+        await scheduler.StartAsync(CancellationToken.None);
+        await scheduler.StopAsync(CancellationToken.None); // nothing queued: drains immediately.
+
+        var result = await scheduler.ScheduleAsync<string>(_ => Task.FromResult("x"), CancellationToken.None);
+
+        Assert.Equal(ScheduleResultKind.Cancelled, result.Kind);
+        Assert.Equal(TimeSpan.Zero, result.QueueWait);
+        Assert.Equal(0, result.RetryAfterSeconds);
+
+        await scheduler.DisposeAsync();
     }
 }
