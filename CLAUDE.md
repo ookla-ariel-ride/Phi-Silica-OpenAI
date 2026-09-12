@@ -422,3 +422,33 @@ defects and cleanups from reviews are issues labelled `bug` or `tech-debt`. Read
 starting the work, put context a later session will need into the issue rather than only into chat,
 and close it from the merge commit (`closes #N`). `docs/FUTURE.md` stays the long-form record of why
 something was deferred; the issue is the work item.
+
+## Delegate to subagents
+
+Run the work in subagents and keep this session for the decisions. What to hand off: a `dotnet build`
+plus `dotnet test` pass, a `scripts/smoke.ps1` run, a survey of the code a chunk is about to touch,
+each task's implementation, and every review. What not to hand off: the rulings. When a review
+contradicts the plan, or two requirements disagree, the session driving the work decides and records
+why — a subagent that decides for itself leaves no trace of the choice.
+
+- **Every review is a separate agent that did not write the code.** This is what the working method's
+  "adversarial review" means in practice, and it earns its cost: chunk 8's review found that the
+  brief's own ordering instruction contradicted PLAN §2.7 and would have shipped the scheduler
+  serializing generation while `CreateContext` still raced. The author could not have found that,
+  having implemented exactly what it was told.
+- **An implementer never spawns its own reviewer.** It reviews the code it just argued itself into.
+  The review that counts is the one dispatched after the report.
+- **Never run two implementers at once on one branch**, and never build while a smoke server holds the
+  exe — that applies across agents as well as within one.
+- **Hand work over as files, not pasted prose.** A brief, a report and a diff on disk keep long tool
+  output out of this session's context and survive a compaction; the same text pasted into a prompt is
+  re-read on every later turn.
+- **Name the model on every dispatch.** Omitting it inherits this session's, which is usually the
+  expensive one.
+- **A subagent's report is a claim, not evidence.** Require the command and its actual output, and
+  treat "all tests pass" without a summary line the way `CLAUDE.md` already treats an NPU claim without
+  a smoke run. Reports have been wrong; the ones with pasted output have not.
+- Resume the same implementer for the first fix rounds — its context is intact and it knows why it made
+  the choice being questioned. Switch to a fresh agent on a stronger model only when a finding survives
+  three rounds, which usually means it cannot see its own problem.
+
