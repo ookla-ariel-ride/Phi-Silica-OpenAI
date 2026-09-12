@@ -237,7 +237,12 @@ rest of both issues stays open, as does the CI job.
   exactly the use-after-dispose D51 removed, and a timeout would reinstate it under a different name.
   If the wait ever has to be bounded, the context has to be leaked deliberately (handed to a reaper
   that disposes it when the operation finally ends) rather than disposed on time. Unobserved so far:
-  the fake always completes, and neither runtime has been seen to hang after a cancel.
+  the fake always completes, and neither runtime has been seen to hang after a cancel. **The stakes
+  went up in chunk 8.** The consequence used to be one parked request and one parked context; with the
+  scheduler behind it, a generation that never completes after its cancel parks the single worker as
+  well, and with the worker every request queued behind it, until the drain grace period at shutdown.
+  Issue #4 asked for the warning itself and it was not implemented in chunk 8; it is now an issue of
+  its own.
 - **Keep-alive covers only the wait for the first token.** Once deltas start flowing the comments stop,
   so a long stall *between* tokens (a model that pauses mid-generation, or a machine under load) can
   still trip a proxy's idle timeout even though the request is healthy. A keep-alive driven by "time
@@ -410,14 +415,22 @@ said it was.
 - **Untested generation paths** flagged by the Codex review: a backend-originated `Cancelled` status
   with a client still connected, an unknown status value, a context-creation failure, and a throwing
   `Dispose`. None confirmed as production defects; all worth a fake-backend fault case.
-- **Nothing serializes concurrent requests against the single model handle (chunk 8 owns the fix).**
+- ~~**Nothing serializes concurrent requests against the single model handle (chunk 8 owns the fix).**
   Chunk 3 opens a generation endpoint that Kestrel will happily enter on several threads at once, while
   the request scheduler (one worker, bounded queue, PLAN section 2.7) is chunk 8. Between the two,
   context creation and generation on one shared `LanguageModel` are unguarded, and the smoke suite is
   strictly single-threaded, so two simultaneous requests against a real NPU are entirely untested. This
   is deliberate scope rather than an oversight, but it is a real gap in what has been verified: any
   claim that the endpoint works is a claim about one request at a time. Chunk 8 should include a
-  concurrent smoke step as well as unit coverage of the queue.
+  concurrent smoke step as well as unit coverage of the queue.~~ Closed in chunk 8, both halves.
+  `GenerationScheduler` runs one job at a time off a bounded queue, and `ConversationSession.Acquire`
+  runs inside the scheduled closure rather than ahead of it, so `CreateContext` and
+  `GetUsablePromptLength` are queued alongside `GenerateAsync` instead of racing a live generation
+  from a request thread (D84 — the chunk's own brief had it wrong, and a review caught it). The
+  verification half is closed too: `smoke.ps1` sends two requests at once on the real NPU and watches
+  the live `queue_depth`, and a second step runs a server at `--queue-capacity 1` to see the queue-full
+  429. Still true and deliberately so: one worker means a second request waits rather than running,
+  which is the trade PLAN section 2.7 chose.
 - **`RenderedPrompt.SystemInPrompt` is unused by production code.** No caller reads it; the endpoint
   re-derives the same fact from its own `useNativeSystem` plus `rendered.SystemText`, and only
   `PromptTemplateTests` asserts on the flag. Two ways to say one thing, which is how they drift. Either
@@ -467,7 +480,12 @@ said it was.
 - **Slimmer package graph.** The `Microsoft.WindowsAppSDK` metapackage copies WinUI, WebView2 and
   OnnxRuntime binaries into the output. `Microsoft.WindowsAppSDK.AI` + `.Foundation`/`.Runtime` would
   be smaller; deferred because CsWinRT projection setup is fiddly and the metapackage is known to work.
-- **`/debug/generate` through the scheduler** once chunk 8 exists, so it cannot bypass the queue.
+- ~~**`/debug/generate` through the scheduler** once chunk 8 exists, so it cannot bypass the queue.~~
+  Done in chunk 8 (D90, superseding D40's deferral): it enqueues like the OpenAI endpoints and creates
+  no context until its turn, so a job dropped while queued never touches the model. Two imprecisions
+  on that endpoint were left and are issues of their own: a client abort while queued is reported as
+  503 `queue_shutting_down`, and an `OperationCanceledException` for a token other than the request's
+  still escapes as a bare 500 rather than the 502 D82 gave the OpenAI shapes.
 - **Automated cancel assertion on the NPU.** The smoke test proves a client disconnect is survived and
   drained; it cannot observe the adapter's `Cancelled` status from an aborted HTTP request. A future
   streaming smoke step (chunk 4) can assert the truncated stream instead.
@@ -513,8 +531,11 @@ said it was.
   for the current user. A service under `LocalSystem` would not see it even if activation-by-path
   worked; any future service+identity experiment must run as the registering user (`sc create ... obj=`).
   Moot while D24 stands, recorded so the failure is not misdiagnosed later.
-- **`healthz` queue counters** are hard-coded to 0 until the scheduler (chunk 8) exists; the cache
-  counters are real since chunk 5.
+- ~~**`healthz` queue counters** are hard-coded to 0 until the scheduler (chunk 8) exists; the cache
+  counters are real since chunk 5.~~ Real since chunk 8. `queue_depth` is the scheduler's live count
+  of jobs still waiting for the worker, which deliberately stops counting a job whose own caller
+  cancelled it rather than waiting for the worker to drain to it (D87); `queue_capacity` is
+  `--queue-capacity`.
 - **Sparse-package `PackageDependency` set** in `packaging/AppxManifest.xml` mirrors the Aion sample
   (WAR 2 + WAR 1.8). Whether Phi Silica additionally needs `Microsoft.WindowsAppRuntime.CBS.*` in a
   hand-written manifest is unknown until chunk 2 tries it; the Windows App SDK build targets inject
