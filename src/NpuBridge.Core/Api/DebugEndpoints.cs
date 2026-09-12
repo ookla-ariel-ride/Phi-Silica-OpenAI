@@ -42,10 +42,12 @@ public sealed record DebugGenerateResponse(
     string ContextId);
 
 /// <summary>
-/// <c>POST /debug/generate</c>: one prompt straight into the backend, bypassing message flattening, the
-/// context cache and the scheduler. Exists so the adapter can be exercised on real hardware before the
-/// OpenAI endpoints land, and afterwards to debug what the model does with a literal prompt.
-/// Loopback callers only: it is not part of the OpenAI surface and it sidesteps the request queue.
+/// <c>POST /debug/generate</c>: one prompt straight into the backend, bypassing message flattening and
+/// the context cache. Exists so the adapter can be exercised on real hardware before the OpenAI
+/// endpoints land, and afterwards to debug what the model does with a literal prompt. Loopback callers
+/// only: it is not part of the OpenAI surface. Chunk 8 (D40's deferral, superseded) put it behind the
+/// same <see cref="GenerationScheduler"/> as everything else: its context is not created until the
+/// job's turn, so it queues behind an ordinary chat request rather than jumping ahead of it.
 /// </summary>
 public static class DebugEndpoints
 {
@@ -82,6 +84,7 @@ public static class DebugEndpoints
     private static async Task<IResult> GenerateAsync(
         DebugGenerateRequest? request,
         BackendLifecycle lifecycle,
+        GenerationScheduler scheduler,
         HttpContext http)
     {
         // Fail closed: an unknown remote address is not a loopback address.
@@ -106,57 +109,86 @@ public static class DebugEndpoints
 
         var backend = lifecycle.Backend;
         var sampling = new SamplingOptions(request.Temperature, request.TopP, request.TopK);
-        var stopwatch = Stopwatch.StartNew();
-        long firstTokenTicks = 0;
-        var callbacks = 0;
 
-        IModelContext? context = null;
-        try
+        // Chunk 8, task-2-brief.md integration decision 5: this endpoint used to create its context
+        // outside any queueing (D40's deferral, and the docs/FUTURE.md chunk 2 entry it names -- both
+        // superseded now). The context must not exist until the job's turn, so creation moves inside
+        // the scheduled closure along with the generation it was always paired with; the whole
+        // try/catch/finally that used to run inline now runs only once the scheduler's one worker
+        // reaches this job, and its result is the IResult this method already returned.
+        var scheduled = await scheduler.ScheduleAsync(async ct =>
         {
-            context = backend.CreateContext(request.System);
-            var usable = backend.GetUsablePromptLength(context, request.Prompt);
+            var stopwatch = Stopwatch.StartNew();
+            long firstTokenTicks = 0;
+            var callbacks = 0;
 
-            var result = await backend.GenerateAsync(
-                context,
-                request.Prompt,
-                sampling.IsEmpty ? null : sampling,
-                _ =>
-                {
-                    if (Interlocked.Increment(ref callbacks) == 1)
+            IModelContext? context = null;
+            try
+            {
+                context = backend.CreateContext(request.System);
+                var usable = backend.GetUsablePromptLength(context, request.Prompt);
+
+                var result = await backend.GenerateAsync(
+                    context,
+                    request.Prompt,
+                    sampling.IsEmpty ? null : sampling,
+                    _ =>
                     {
-                        Interlocked.Exchange(ref firstTokenTicks, stopwatch.ElapsedTicks);
-                    }
-                },
-                http.RequestAborted);
+                        if (Interlocked.Increment(ref callbacks) == 1)
+                        {
+                            Interlocked.Exchange(ref firstTokenTicks, stopwatch.ElapsedTicks);
+                        }
+                    },
+                    ct);
 
-            stopwatch.Stop();
-            var totalMs = stopwatch.Elapsed.TotalMilliseconds;
-            var ttftMs = callbacks == 0 ? totalMs : firstTokenTicks * 1000.0 / Stopwatch.Frequency;
-            var decodeMs = totalMs - ttftMs;
-            double? cps = callbacks > 1 && decodeMs > 0 ? (callbacks - 1) * 1000.0 / decodeMs : null;
+                stopwatch.Stop();
+                var totalMs = stopwatch.Elapsed.TotalMilliseconds;
+                var ttftMs = callbacks == 0 ? totalMs : firstTokenTicks * 1000.0 / Stopwatch.Frequency;
+                var decodeMs = totalMs - ttftMs;
+                double? cps = callbacks > 1 && decodeMs > 0 ? (callbacks - 1) * 1000.0 / decodeMs : null;
 
-            var body = new DebugGenerateResponse(
-                result.Text,
-                result.Status.ToString(),
-                result.Detail,
-                callbacks,
-                result.Text.Length,
-                request.Prompt.Length,
-                usable,
-                Math.Round(ttftMs, 1),
-                Math.Round(totalMs, 1),
-                cps is null ? null : Math.Round(cps.Value, 2),
-                context.Id);
+                var body = new DebugGenerateResponse(
+                    result.Text,
+                    result.Status.ToString(),
+                    result.Detail,
+                    callbacks,
+                    result.Text.Length,
+                    request.Prompt.Length,
+                    usable,
+                    Math.Round(ttftMs, 1),
+                    Math.Round(totalMs, 1),
+                    cps is null ? null : Math.Round(cps.Value, 2),
+                    context.Id);
 
-            return Results.Json(body, JsonDefaults.Options);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+                return (IResult)Results.Json(body, JsonDefaults.Options);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                return OpenAiError.Result(StatusCodes.Status502BadGateway, $"Backend threw: {ex.GetType().Name}: {ex.Message}", OpenAiError.Server, code: "backend_error");
+            }
+            finally
+            {
+                context?.Dispose();
+            }
+        }, http.RequestAborted).ConfigureAwait(false);
+
+        return scheduled.Kind switch
         {
-            return OpenAiError.Result(StatusCodes.Status502BadGateway, $"Backend threw: {ex.GetType().Name}: {ex.Message}", OpenAiError.Server, code: "backend_error");
-        }
-        finally
-        {
-            context?.Dispose();
-        }
+            ScheduleResultKind.Completed => scheduled.Result!,
+            ScheduleResultKind.Rejected => QueueFullResult(http, scheduled.RetryAfterSeconds),
+
+            // Cancelled: dropped while queued, or a post-shutdown enqueue -- either way nothing ran, so
+            // there is no partial result to report and no context to dispose. This diagnostic endpoint
+            // has no streamed shape and no client to spare a status line for, so unlike the two OpenAI
+            // endpoints this does not special-case an aborted caller separately (task-2-brief.md,
+            // integration decision 4: never 429, since the scheduler is not coming back either way).
+            _ => GenerationFailure.QueueShuttingDown().ToResult(),
+        };
+    }
+
+    private static IResult QueueFullResult(HttpContext http, int retryAfterSeconds)
+    {
+        http.Response.Headers.RetryAfter = retryAfterSeconds.ToString();
+        return GenerationFailure.QueueFull(retryAfterSeconds).ToResult();
     }
 }
