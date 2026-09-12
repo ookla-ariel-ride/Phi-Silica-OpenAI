@@ -82,8 +82,6 @@ internal sealed class ChatCompletionsStreamEndpoint
         // stop string can straddle two deltas, and a delta already written cannot be recalled.
         var cutter = new OutputCutter(prepared.Limits);
 
-        // Whether a delta ever arrived. Declared out here only so the retry loop can reassign it; every
-        // read is inside the loop.
         var streamed = false;
 
         // Whether the assistant message has been opened, which is a different question: a keep-alive
@@ -102,233 +100,263 @@ internal sealed class ChatCompletionsStreamEndpoint
         // Set when this handler cancels the generation because a limit fired while streaming, and read
         // when the status comes back. A fact recorded at the cancel, not inferred from the cutter
         // afterwards: the JSON path used to infer it from a different cutter state, and the two shapes
-        // answered a backend's unprompted Cancelled differently (D62).
+        // answered a backend's unprompted Cancelled differently (D62). Written by the reader loop below
+        // (on this thread) and read inside the scheduled closure once GenerateAsync returns for the
+        // attempt the cancel targeted -- the cancellation token that return is causally downstream of
+        // carries the happens-before this needs.
         var cancelledByCut = false;
 
-        // How long the attempt that actually produced `result` waited behind the scheduler's one
-        // worker (chunk 8). Stays 0 for every log line written before a generation was ever scheduled;
-        // declared outside the try so both catch clauses can still log the best value they have.
         var queueWaitMs = 0.0;
 
+        // The current attempt's lease, assigned from *inside* the scheduled closure the instant Acquire
+        // hands one over rather than from the value that closure returns. The difference is the whole
+        // reason this variable is written where it is: the reader loop below can unwind -- a client that
+        // vanishes mid-frame is the ordinary case -- long before the scheduled task is ever unwrapped,
+        // and a lease this scope only learns about from a returned value is a lease it does not have
+        // when that value never arrives. The finally's Dispose then saw null and the context was never
+        // released, which is both D43 and D51 gone at once. Reassigned on a --truncate-history retry,
+        // whose previous lease the closure has already disposed; Dispose is idempotent, so a stale
+        // reference here settles to a no-op rather than a double release.
         ContextLease? lease = null;
 
-        // The scheduled generation, not the generation itself: chunk 8 serializes the actual
-        // backend.GenerateAsync call (inside GenerateAsync, run by the scheduler's one worker) behind
-        // GenerationScheduler.ScheduleAsync, so what this method awaits and drains is the schedule's
-        // own outcome. Unwrapped to a GenerationResult only where `result` is actually needed, by
-        // AwaitScheduledAsync, which is also where a job dropped without ever running gets its channel
-        // closed so a reader parked on it is not left waiting forever.
-        Task<ScheduleResult<GenerationResult>>? generation = null;
+        // The one channel for the whole request, not one per attempt (chunk 8 fix round 1, controller
+        // ruling): Acquire() -- the cache lookup and the preflight -- now runs inside the scheduled
+        // closure alongside the generation, for the same reason the JSON shape's does (CreateContext
+        // and GetUsablePromptLength are calls on the one shared model handle). A retry
+        // (--truncate-history on a backend with no preflight, after a generation that produced zero
+        // deltas) continues on this same scheduled slot and this same channel rather than re-entering
+        // the queue: nothing is ever written to the channel by an attempt that fails with zero deltas,
+        // so leaving it open across attempts costs nothing, and only the final attempt (success, or a
+        // terminal failure) completes it.
+        var channel = Channel.CreateUnbounded<string>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            AllowSynchronousContinuations = false,
+        });
 
-        // Linked, not the request's own token: this cancels the generation for reasons of the handler's
-        // own (a write that failed, an exception on the way out) without pretending the client aborted.
-        // Cancelling it is the first half of the cancel-drain-dispose exit in the finally.
-        using var generationCts = CancellationTokenSource.CreateLinkedTokenSource(aborted);
+        var sink = DeltaSink.ToChannel(stopwatch, channel.Writer);
+
+        // The current attempt's own cancellation source, for the reader loop below to reach when the
+        // cut fires. Reassigned by the closure at the start of each attempt (retries only reach a
+        // second assignment; the ordinary case assigns once) and read by the reader loop only once a
+        // delta has actually arrived on the channel -- which happens-after the sink above observed that
+        // delta, which happens-after GenerateAsync was called with the token from *this* assignment, so
+        // the channel's own synchronization is what makes the read safe without a lock.
+        //
+        // Disposed by this method's finally, after the drain, and deliberately not by a `using` inside
+        // the closure: the finally cancels through this same reference on its way out, and a source the
+        // closure had already disposed made CancelAsync throw on every ordinary request -- caught and
+        // logged by CancelGuardedAsync, so the only visible damage was a Debug line per request claiming
+        // the cancel had failed, which is exactly the kind of routine noise that trains a reader to
+        // ignore the line that one day means something.
+        CancellationTokenSource? currentGenerationCts = null;
+
+        // The scheduled attempt, not the generation itself: chunk 8 serializes Acquire and the
+        // generation together behind GenerationScheduler.ScheduleAsync, so what this method starts
+        // (without awaiting) and drains in the finally is the schedule's own outcome. Unwrapped only
+        // where it is actually needed, by ReportSchedulerOutcomeAsync below, which is also where a job
+        // dropped without ever running gets this channel closed so a reader parked on it is not left
+        // waiting forever.
+        Task<ScheduleResult<ChatAttemptResult>>? generation = null;
 
         try
         {
-            GenerationResult result;
-            DeltaSink sink;
-            while (true)
+            // See ChatCompletionsEndpoint (the JSON shape) for the fuller account of why Acquire moved
+            // in here. ApplyTruncationHeader runs from the worker thread once per attempt, safe for the
+            // same reason it is there: the caller is suspended on this ScheduleAsync call and touches
+            // neither the response nor session again until it resumes.
+            generation = scheduler.ScheduleAsync(async ct =>
             {
-                // The context: checked out of the cache when the transcript extends a cached prefix,
-                // created fresh otherwise, and refused here -- before a byte has gone out -- when a
-                // backend with a preflight says the prompt does not fit (D55). Settled in the finally.
-                // Streaming makes this easier to get wrong because the response outlives the generation
-                // call, so the try starts before it.
-                var acquisition = session.Acquire();
-                if (acquisition.Failure is { } refused)
+                while (true)
                 {
-                    ChatRequestMetrics.LogRequest(logger, requestId, backendName, prepared.PromptChars, ttftMs: 0, tokens: 0,
-                        status: GenerationStatus.PromptLargerThanContext.ToString(), finish: "-",
-                        httpStatus: sse.Started ? StatusCodes.Status200OK : refused.StatusCode,
-                        truncatedTurns: session.DroppedTurns);
-                    return await FailAsync(sse, refused, logger, requestId, aborted).ConfigureAwait(false);
-                }
-
-                lease = acquisition.Lease!;
-
-                // Before the first frame, while the headers are still ours. On a retry after a
-                // keep-alive the response has started and the session logs that the header is lost.
-                session.ApplyTruncationHeader(http.Response);
-
-                // The hand-off. The backend raises its progress callback on a thread-pool thread (the
-                // fake does this on purpose, mirroring WinRT's Progress), so the callback may not touch
-                // the HTTP response: it only writes into this channel. AllowSynchronousContinuations is
-                // false so that a TryWrite cannot run the reader's continuation inline on the callback
-                // thread, which would smuggle response writes back onto it. One reader — this task —
-                // drains it. Fresh per attempt: a completed channel cannot be reopened.
-                var channel = Channel.CreateUnbounded<string>(new UnboundedChannelOptions
-                {
-                    SingleReader = true,
-                    SingleWriter = false,
-                    AllowSynchronousContinuations = false,
-                });
-
-                sink = DeltaSink.ToChannel(stopwatch, channel.Writer);
-
-                // Started, not awaited: the reader loop below runs concurrently with it, exactly as
-                // before chunk 8 -- the difference is that GenerateAsync itself now only runs once the
-                // scheduler's one worker reaches this job, so a queue wait is invisible to the reader
-                // loop, which just sees no delta yet and keeps emitting keep-alives (Global Constraint
-                // 5, integration decisions 1 and 2 in task-2-brief.md).
-                generation = scheduler.ScheduleAsync(
-                    ct => GenerateAsync(prepared, lease, sink, channel.Writer, ct),
-                    generationCts.Token);
-
-                // The channel is completed inside GenerateAsync's own finally, but only when the
-                // scheduler actually invokes it -- a job dropped while still queued (shutdown mid-wait,
-                // most plausibly, since a queued client abort is caught by the reader loop's own token
-                // instead) never runs it at all, and a reader parked on WaitToReadAsync would then wait
-                // forever for a delta that is never coming, even with the client still connected. This
-                // is the backstop: whatever `generation` ends with, make sure the channel is completed
-                // once it does. A no-op on every path where GenerateAsync's own Complete() already ran.
-                _ = generation.ContinueWith(
-                    static (_, state) => ((ChannelWriter<string>)state!).TryComplete(),
-                    channel.Writer,
-                    CancellationToken.None,
-                    TaskContinuationOptions.ExecuteSynchronously,
-                    TaskScheduler.Default);
-
-                // Rejection and a post-shutdown enqueue are both decided synchronously, before the
-                // scheduler ever touches the channel -- so this checks the returned task without an
-                // await, the one way left to answer with an ordinary HTTP status rather than opening
-                // the stream (D52, integration decision 1). A task that is not already complete here is
-                // genuinely queued, and reaching its turn -- however long that takes -- is what the
-                // reader loop below waits out with keep-alives.
-                if (generation.IsCompleted)
-                {
-                    var immediate = generation.GetAwaiter().GetResult();
-                    if (immediate.Kind != ScheduleResultKind.Completed)
+                    var acquisition = session.Acquire();
+                    if (acquisition.Failure is { } refused)
                     {
-                        queueWaitMs = immediate.QueueWait.TotalMilliseconds;
-
-                        if (immediate.Kind == ScheduleResultKind.Rejected)
-                        {
-                            ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease.PromptChars, ttftMs: 0, tokens: 0,
-                                status: "queue_full", finish: "-", httpStatus: StatusCodes.Status429TooManyRequests,
-                                cache: lease.CacheHit ? "hit" : "miss", tailTurns: lease.TailTurns, truncatedTurns: session.DroppedTurns,
-                                queueWaitMs: queueWaitMs);
-                            http.Response.Headers.RetryAfter = immediate.RetryAfterSeconds.ToString();
-                            return GenerationFailure.QueueFull(immediate.RetryAfterSeconds).ToResult();
-                        }
-
-                        // Kind == Cancelled: a post-shutdown enqueue, or dropped while queued before this
-                        // check ever ran (both are decided at TryWrite time -- see GenerationScheduler).
-                        // Nothing touched the model, so nothing here needs draining.
-                        if (aborted.IsCancellationRequested)
-                        {
-                            // The client was already gone before its turn came; there is nobody to send
-                            // a body to and this is not an error, exactly like the same check further
-                            // down for a generation that did run.
-                            ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease.PromptChars, ttftMs: 0, tokens: 0,
-                                status: nameof(ScheduleResultKind.Cancelled), finish: "-", httpStatus: 0,
-                                cache: lease.CacheHit ? "hit" : "miss", tailTurns: lease.TailTurns, truncatedTurns: session.DroppedTurns,
-                                queueWaitMs: queueWaitMs);
-                            return null;
-                        }
-
-                        // The scheduler itself is shutting down: it is never coming back to honour a
-                        // Retry-After, so this is 503 rather than 429 (task-2-brief.md, integration
-                        // decision 4).
-                        ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease.PromptChars, ttftMs: 0, tokens: 0,
-                            status: "queue_shutting_down", finish: "-", httpStatus: StatusCodes.Status503ServiceUnavailable,
-                            cache: lease.CacheHit ? "hit" : "miss", tailTurns: lease.TailTurns, truncatedTurns: session.DroppedTurns,
-                            queueWaitMs: queueWaitMs);
-                        return GenerationFailure.QueueShuttingDown().ToResult();
+                        channel.Writer.TryComplete();
+                        return ChatAttemptResult.Refused(refused);
                     }
 
-                    // Kind == Completed, decided synchronously: never observed in practice (the worker
-                    // always runs the operation on its own Task), so this falls through to the ordinary
-                    // path below rather than assuming the case away.
-                }
+                    var attemptLease = acquisition.Lease!;
 
-                // Nothing has been written yet, on purpose. Waiting here — rather than opening with the
-                // role chunk — is what keeps the status line available for a failure that arrives before
-                // the first token. The first keep-alive comment is what ends that window, about a second in.
-                streamed = await WaitForFirstDeltaAsync(sse, channel.Reader, streaming, aborted)
+                    // Published to the caller's scope before anything can throw, so its finally always
+                    // has this context to settle -- including on the paths where what this closure
+                    // returns never reaches the code that would otherwise have read it.
+                    lease = attemptLease;
+
+                    try
+                    {
+                        session.ApplyTruncationHeader(http.Response);
+
+                        // Not a `using`: the caller's finally owns this source's lifetime, because the
+                        // caller's finally is what cancels through it on the way out.
+                        var generationCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        Interlocked.Exchange(ref currentGenerationCts, generationCts)?.Dispose();
+
+                        var result = await prepared.Backend.GenerateAsync(
+                            attemptLease.Context,
+                            attemptLease.Prompt,
+                            prepared.Sampling,
+                            sink.OnDelta,
+                            generationCts.Token).ConfigureAwait(false);
+
+                        // Not one delta, and the backend says the prompt was too long. On a backend
+                        // without a preflight this is the only way it can say so; with
+                        // --truncate-history the answer is to drop the oldest exchange and go round
+                        // again on a fresh context (this one ended in a non-Complete status and is
+                        // disposed, D11) -- on the same scheduled slot, per the fix report. A backend
+                        // with a preflight never reaches this unless it reports the status the preflight
+                        // did not predict.
+                        if (result.Status == GenerationStatus.PromptLargerThanContext && session.TryDropOldestExchange())
+                        {
+                            attemptLease.Dispose();
+                            continue;
+                        }
+
+                        channel.Writer.TryComplete();
+                        var totalMs = stopwatch.Elapsed.TotalMilliseconds;
+                        var ttftMs = sink.TtftMs(totalMs);
+                        return ChatAttemptResult.Generated(result, cancelledByCut, ttftMs, totalMs);
+                    }
+                    catch
+                    {
+                        // Guarded, as on the JSON shape: nothing outside this closure exists yet to
+                        // dispose attemptLease if anything above throws, and the channel must still be
+                        // completed so the reader loop is not left waiting forever.
+                        channel.Writer.TryComplete();
+                        attemptLease.Dispose();
+                        throw;
+                    }
+                }
+            }, aborted);
+
+            // The channel is completed by the closure itself on every path it returns through, but not
+            // if the job is dropped without ever running (shutdown mid-wait, most plausibly, since a
+            // queued client abort is caught by the reader loop's own token instead): this is the
+            // backstop for that one case, a harmless no-op everywhere else.
+            _ = generation.ContinueWith(
+                static (_, state) => ((ChannelWriter<string>)state!).TryComplete(),
+                channel.Writer,
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+
+            // Rejection and a post-shutdown enqueue are both decided synchronously, before the
+            // scheduler ever touches the channel -- so this checks the returned task without an await,
+            // the one way left to answer with an ordinary HTTP status rather than opening the stream
+            // (D52, integration decision 1). Since Acquire moved inside the closure there is now only
+            // ever one ScheduleAsync call for the whole request (fix round 1, Finding 2's root cause --
+            // a retry used to mean a second call, reachable after a keep-alive had already committed
+            // the response), so this check and the one after the reader loop below are the only two
+            // places a scheduler-level failure can be discovered, not one per retry.
+            if (generation.IsCompleted)
+            {
+                var immediateResult = await ReportSchedulerOutcomeAsync(
+                    generation, sse, http, logger, requestId, backendName, prepared, session, aborted)
                     .ConfigureAwait(false);
-
-                if (streamed && buffering)
+                if (immediateResult.Handled)
                 {
-                    // Buffered: every delta goes through the cutter and nothing goes out. The cutter
-                    // still decides the cut, so a tool-call reply is capped and stopped exactly as a
-                    // streamed one is; what it releases is accumulated rather than written, and read
-                    // from EmittedText in the tail.
-                    if (await DrainBufferedAsync(sse, channel.Reader, cutter, streaming, generationCts,
-                            logger, requestId, aborted).ConfigureAwait(false))
+                    return immediateResult.Response;
+                }
+            }
+
+            // Nothing has been written yet, on purpose. Waiting here — rather than opening with the
+            // role chunk — is what keeps the status line available for a failure that arrives before
+            // the first token. The first keep-alive comment is what ends that window, about a second in.
+            streamed = await WaitForFirstDeltaAsync(sse, channel.Reader, streaming, aborted)
+                .ConfigureAwait(false);
+
+            GenerationResult result;
+            if (streamed && buffering)
+            {
+                // Buffered: every delta goes through the cutter and nothing goes out. The cutter
+                // still decides the cut, so a tool-call reply is capped and stopped exactly as a
+                // streamed one is; what it releases is accumulated rather than written, and read
+                // from EmittedText in the tail.
+                if (await DrainBufferedAsync(sse, channel.Reader, cutter, streaming,
+                        () => currentGenerationCts!, logger, requestId, aborted).ConfigureAwait(false))
+                {
+                    cancelledByCut = true;
+                }
+
+                var schedulerOutcome = await ReportSchedulerOutcomeAsync(
+                    generation, sse, http, logger, requestId, backendName, prepared, session, aborted)
+                    .ConfigureAwait(false);
+                if (schedulerOutcome.Handled)
+                {
+                    return schedulerOutcome.Response;
+                }
+
+                result = schedulerOutcome.Attempt!.Result!;
+                queueWaitMs = schedulerOutcome.QueueWaitMs;
+            }
+            else if (streamed)
+            {
+                // The role chunk. OpenAI clients rely on it to open the assistant message.
+                roleSent = true;
+                await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
+                    new ChatCompletionDelta("assistant", string.Empty), finishReason: null), aborted).ConfigureAwait(false);
+
+                // Deliberately not cancelled by `aborted`: the loop must end when the channel completes,
+                // so that `generation` is always reached and always drained below.
+                await foreach (var delta in channel.Reader.ReadAllAsync(CancellationToken.None).ConfigureAwait(false))
+                {
+                    // What the cutter releases, not the delta: with stop strings configured this lags
+                    // the backend by up to Holdback characters, and on the delta that trips a limit it
+                    // is the truncated prefix.
+                    var release = cutter.Accept(delta);
+                    if (release.Length > 0)
                     {
+                        await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
+                            new ChatCompletionDelta(null, release), finishReason: null), aborted).ConfigureAwait(false);
+                    }
+
+                    if (cutter.StopRequested && !cancelledByCut)
+                    {
+                        // Stop the model. On a settled cut nothing more will be emitted; on a token
+                        // budget the cutter may know the budget is passed before it can place the cut
+                        // (D80), and then the deltas already in flight keep coming through it so the
+                        // flush below decides over everything the model produced.
                         cancelledByCut = true;
+                        await GenerationPipeline.CancelGuardedAsync(currentGenerationCts!, logger, requestId, "at the cut").ConfigureAwait(false);
                     }
 
-                    (result, queueWaitMs) = await AwaitScheduledAsync(generation).ConfigureAwait(false);
-                    break;
-                }
-
-                if (streamed)
-                {
-                    // The role chunk. OpenAI clients rely on it to open the assistant message.
-                    roleSent = true;
-                    await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
-                        new ChatCompletionDelta("assistant", string.Empty), finishReason: null), aborted).ConfigureAwait(false);
-
-                    // Deliberately not cancelled by `aborted`: the loop must end when the channel completes,
-                    // so that `generation` is always reached and always drained below.
-                    await foreach (var delta in channel.Reader.ReadAllAsync(CancellationToken.None).ConfigureAwait(false))
+                    if (cutter.IsCut)
                     {
-                        // What the cutter releases, not the delta: with stop strings configured this lags
-                        // the backend by up to Holdback characters, and on the delta that trips a limit it
-                        // is the truncated prefix.
-                        var release = cutter.Accept(delta);
-                        if (release.Length > 0)
-                        {
-                            await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
-                                new ChatCompletionDelta(null, release), finishReason: null), aborted).ConfigureAwait(false);
-                        }
-
-                        if (cutter.StopRequested && !cancelledByCut)
-                        {
-                            // Stop the model. On a settled cut nothing more will be emitted; on a token
-                            // budget the cutter may know the budget is passed before it can place the cut
-                            // (D80), and then the deltas already in flight keep coming through it so the
-                            // flush below decides over everything the model produced.
-                            cancelledByCut = true;
-                            await GenerationPipeline.CancelGuardedAsync(generationCts, logger, requestId, "at the cut").ConfigureAwait(false);
-                        }
-
-                        if (cutter.IsCut)
-                        {
-                            // Stop consuming. Whatever is still queued is discarded; the finally's
-                            // cancel-drain-settle then runs unchanged, so the context is still disposed
-                            // exactly once and only after the generation task has ended.
-                            break;
-                        }
+                        // Stop consuming. Whatever is still queued is discarded; the finally's
+                        // cancel-drain-settle then runs unchanged, so the context is still disposed
+                        // exactly once and only after the generation task has ended.
+                        break;
                     }
-
-                    (result, queueWaitMs) = await AwaitScheduledAsync(generation).ConfigureAwait(false);
-                    break;
                 }
 
-                (result, queueWaitMs) = await AwaitScheduledAsync(generation).ConfigureAwait(false);
-
-                // Not one delta, and the backend says the prompt was too long. On a backend without a
-                // preflight this is the only way it can say so; with --truncate-history the answer is
-                // to drop the oldest exchange and go round again on a fresh context. This one ended in a
-                // non-Complete status and is disposed (D11). The stream is unaffected: nothing but
-                // keep-alive comments can have gone out, and those open no message.
-                if (result.Status == GenerationStatus.PromptLargerThanContext && session.TryDropOldestExchange())
+                var schedulerOutcome = await ReportSchedulerOutcomeAsync(
+                    generation, sse, http, logger, requestId, backendName, prepared, session, aborted)
+                    .ConfigureAwait(false);
+                if (schedulerOutcome.Handled)
                 {
-                    lease.Dispose();
-                    lease = null;
-                    generation = null;
-                    continue;
+                    return schedulerOutcome.Response;
                 }
 
-                break;
+                result = schedulerOutcome.Attempt!.Result!;
+                queueWaitMs = schedulerOutcome.QueueWaitMs;
+            }
+            else
+            {
+                var schedulerOutcome = await ReportSchedulerOutcomeAsync(
+                    generation, sse, http, logger, requestId, backendName, prepared, session, aborted)
+                    .ConfigureAwait(false);
+                if (schedulerOutcome.Handled)
+                {
+                    return schedulerOutcome.Response;
+                }
+
+                result = schedulerOutcome.Attempt!.Result!;
+                queueWaitMs = schedulerOutcome.QueueWaitMs;
             }
 
             stopwatch.Stop();
-            var cacheLabel = lease.CacheHit ? "hit" : "miss";
+            var cacheLabel = lease!.CacheHit ? "hit" : "miss";
             var tailTurns = lease.TailTurns;
             var promptChars = lease.PromptChars;
             var truncatedTurns = session.DroppedTurns;
@@ -529,7 +557,19 @@ internal sealed class ChatCompletionsStreamEndpoint
             // between a failure and the disposal below: letting a throw escape would skip both the drain
             // and Dispose(), leaking exactly the handle D43 guarantees is released -- worse than the D51
             // defect, which disposed too early rather than never.
-            await GenerationPipeline.CancelGuardedAsync(generationCts, logger, requestId, "on the way out").ConfigureAwait(false);
+            //
+            // currentGenerationCts is null only if the scheduled job never ran at all (Rejected, or
+            // Cancelled before its turn), which skips the call entirely. Otherwise it is live and this
+            // scope owns it: the closure deliberately does not `using` it, because a source disposed
+            // there makes this cancel throw on every ordinary request and turns CancelGuardedAsync's
+            // Debug line into noise on the happy path. Cancelling an already-finished generation's
+            // source is a no-op; the case this exists to serve is the one in between, a write that
+            // failed while an attempt was still genuinely in flight.
+            var generationCts = Volatile.Read(ref currentGenerationCts);
+            if (generationCts is not null)
+            {
+                await GenerationPipeline.CancelGuardedAsync(generationCts, logger, requestId, "on the way out").ConfigureAwait(false);
+            }
 
             if (generation is not null)
             {
@@ -547,6 +587,11 @@ internal sealed class ChatCompletionsStreamEndpoint
             }
 
             lease?.Dispose();
+
+            // After the drain, never before: until the generation task has ended, the token this source
+            // owns is still the one that task is generating under. Read again rather than reused, in
+            // case a retry replaced it between the cancel above and here.
+            Volatile.Read(ref currentGenerationCts)?.Dispose();
         }
     }
 
@@ -670,7 +715,7 @@ internal sealed class ChatCompletionsStreamEndpoint
         ChannelReader<string> reader,
         OutputCutter cutter,
         StreamingOptions streaming,
-        CancellationTokenSource generationCts,
+        Func<CancellationTokenSource> currentGenerationCts,
         ILogger logger,
         string requestId,
         CancellationToken cancellationToken)
@@ -694,7 +739,11 @@ internal sealed class ChatCompletionsStreamEndpoint
                 if (cutter.StopRequested && !cancelled)
                 {
                     cancelled = true;
-                    await GenerationPipeline.CancelGuardedAsync(generationCts, logger, requestId, "at the cut")
+                    // A function, not a captured value (chunk 8 fix round 1): the scheduled closure may
+                    // reassign its own cancellation source across a --truncate-history retry, so this
+                    // reads whichever one is current at the moment the cut actually fires rather than
+                    // whichever one existed when the drain started.
+                    await GenerationPipeline.CancelGuardedAsync(currentGenerationCts(), logger, requestId, "at the cut")
                         .ConfigureAwait(false);
                 }
             }
@@ -792,60 +841,86 @@ internal sealed class ChatCompletionsStreamEndpoint
     }
 
     /// <summary>
-    /// Unwraps a scheduled generation (chunk 8) into the <see cref="GenerationResult"/> the rest of this
-    /// method already knows how to report, plus how long that attempt waited behind the scheduler's one
-    /// worker. <see cref="ScheduleResultKind.Completed"/> is the ordinary case: the operation ran to
-    /// whatever end the backend chose, exactly as it would have without a scheduler. The other kind
-    /// reachable here is <see cref="ScheduleResultKind.Cancelled"/> — a job dropped while still queued
-    /// after this method had already started waiting on it (most plausibly the scheduler shutting down
-    /// mid-wait; a queued client abort is caught by the reader loop's own token instead) — which never
-    /// ran <see cref="GenerateAsync"/> at all, so there is no real result to report. It is folded into
-    /// the ordinary <see cref="GenerationStatus.Cancelled"/> shape instead of a bespoke one, so it flows
-    /// through the same <see cref="GenerationOutcome"/>/<see cref="GenerationFailure"/> mapping as any
-    /// other unprompted cancellation: an SSE error event if the stream had already started sending
-    /// keep-alives by then, which by this point in a queue wait it very plausibly has (the synchronous
-    /// case, decided before the reader loop ever starts, is what still answers with the queue's own 503
-    /// instead).
+    /// What awaiting the scheduled attempt meant, and whether the caller already has its answer.
+    /// <see cref="Handled"/> true means the caller should <c>return</c> <see cref="Response"/> (possibly
+    /// null, for the ordinary silent "client is gone" outcome) without looking at
+    /// <see cref="Attempt"/> or <see cref="QueueWaitMs"/> any further; false means the schedule reached
+    /// <see cref="ScheduleResultKind.Completed"/> and <see cref="Attempt"/> is the real
+    /// <see cref="ChatAttemptResult"/> to keep going with.
     /// </summary>
-    private static async Task<(GenerationResult Result, double QueueWaitMs)> AwaitScheduledAsync(
-        Task<ScheduleResult<GenerationResult>> scheduled)
-    {
-        var outcome = await scheduled.ConfigureAwait(false);
-        var queueWaitMs = outcome.QueueWait.TotalMilliseconds;
-
-        if (outcome.Kind == ScheduleResultKind.Completed)
-        {
-            return (outcome.Result!, queueWaitMs);
-        }
-
-        return (new GenerationResult(string.Empty, GenerationStatus.Cancelled, "scheduler: dropped while queued"), queueWaitMs);
-    }
+    private readonly record struct SchedulerOutcomeReport(bool Handled, IResult? Response, ChatAttemptResult? Attempt, double QueueWaitMs);
 
     /// <summary>
-    /// Runs the generation and, whatever happens, closes the channel so the reader loop ends. A throw
-    /// is deliberately not passed to <c>Complete</c>: the reader finishes normally, drains what was
-    /// already queued, and the exception surfaces where the task is awaited.
+    /// Awaits the scheduled attempt and reports whatever it means for the client: a real
+    /// <see cref="ChatAttemptResult"/> to keep going with (<see cref="SchedulerOutcomeReport.Handled"/>
+    /// false), the ordinary silent "client is gone" outcome, or one of the scheduler-level failures
+    /// (queue full, shutting down, or a backend that threw <see cref="OperationCanceledException"/>
+    /// instead of reporting a status -- fix round 1, Finding 1) via
+    /// <see cref="SchedulerAdmission"/>, so this shape and the JSON one cannot describe the same
+    /// condition differently (Finding 4). Every failure here goes through <see cref="FailAsync"/>,
+    /// which is what makes it safe to call this after the reader loop has already been running for a
+    /// while: by then <paramref name="sse"/> may well have already started (a queue wait or a preflight
+    /// refusal discovered only once the closure finally ran can each have sent a keep-alive first,
+    /// task-2-brief.md's controller ruling accepts this explicitly), and <c>FailAsync</c> is what
+    /// decides between an ordinary status and an SSE error event. Called once before the reader loop
+    /// starts (a synchronous Rejected/Cancelled never reaches <see cref="ScheduleResultKind.Completed"/>
+    /// so <c>Handled</c> is always true there in practice) and once after it ends -- never more than
+    /// twice, since Acquire moving inside the closure means there is only ever one scheduled attempt
+    /// per request now (Finding 2's fix).
     /// </summary>
-    private static async Task<GenerationResult> GenerateAsync(
+    private static async Task<SchedulerOutcomeReport> ReportSchedulerOutcomeAsync(
+        Task<ScheduleResult<ChatAttemptResult>> generation,
+        SseStream sse,
+        HttpContext http,
+        ILogger logger,
+        string requestId,
+        string backendName,
         PreparedChatRequest prepared,
-        ContextLease lease,
-        DeltaSink sink,
-        ChannelWriter<string> writer,
-        CancellationToken cancellationToken)
+        ConversationSession session,
+        CancellationToken aborted)
     {
-        try
+        var scheduled = await generation.ConfigureAwait(false);
+        var queueWaitMs = scheduled.QueueWait.TotalMilliseconds;
+        var admission = SchedulerAdmission.Classify(scheduled, aborted.IsCancellationRequested);
+
+        if (admission == SchedulerOutcome.ClientGone)
         {
-            return await prepared.Backend.GenerateAsync(
-                lease.Context,
-                lease.Prompt,
-                prepared.Sampling,
-                sink.OnDelta,
-                cancellationToken).ConfigureAwait(false);
+            ChatRequestMetrics.LogRequest(logger, requestId, backendName, prepared.PromptChars, ttftMs: 0, tokens: 0,
+                status: scheduled.Kind.ToString(), finish: "-", httpStatus: 0,
+                truncatedTurns: session.DroppedTurns, queueWaitMs: queueWaitMs);
+            return new SchedulerOutcomeReport(true, null, null, queueWaitMs);
         }
-        finally
+
+        if (admission != SchedulerOutcome.Completed)
         {
-            writer.Complete();
+            var schedulerFailure = SchedulerAdmission.FailureFor(admission, scheduled.RetryAfterSeconds);
+
+            // Only meaningful (and only safe to set -- headers are read-only once the response has
+            // started) before the first byte, which the shared helper is what knows; FailAsync below is
+            // what still tells the client the queue was full once the stream has already started, via
+            // the ordinary error envelope's message rather than the header.
+            SchedulerAdmission.ApplyRetryAfter(http.Response, admission, scheduled.RetryAfterSeconds);
+
+            ChatRequestMetrics.LogRequest(logger, requestId, backendName, prepared.PromptChars, ttftMs: 0, tokens: 0,
+                status: admission.ToString(), finish: "-",
+                httpStatus: sse.Started ? StatusCodes.Status200OK : schedulerFailure.StatusCode,
+                truncatedTurns: session.DroppedTurns, queueWaitMs: queueWaitMs);
+            var response = await FailAsync(sse, schedulerFailure, logger, requestId, aborted).ConfigureAwait(false);
+            return new SchedulerOutcomeReport(true, response, null, queueWaitMs);
         }
+
+        var attempt = scheduled.Result!;
+        if (attempt.Refusal is { } refused)
+        {
+            ChatRequestMetrics.LogRequest(logger, requestId, backendName, prepared.PromptChars, ttftMs: 0, tokens: 0,
+                status: GenerationStatus.PromptLargerThanContext.ToString(), finish: "-",
+                httpStatus: sse.Started ? StatusCodes.Status200OK : refused.StatusCode,
+                truncatedTurns: session.DroppedTurns, queueWaitMs: queueWaitMs);
+            var response = await FailAsync(sse, refused, logger, requestId, aborted).ConfigureAwait(false);
+            return new SchedulerOutcomeReport(true, response, null, queueWaitMs);
+        }
+
+        return new SchedulerOutcomeReport(false, null, attempt, queueWaitMs);
     }
 
     /// <summary>

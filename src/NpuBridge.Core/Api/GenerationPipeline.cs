@@ -7,6 +7,37 @@ using NpuBridge.Configuration;
 namespace NpuBridge.Api;
 
 /// <summary>
+/// What one scheduled attempt at a chat generation produced (chunk 8 fix round 1, controller ruling):
+/// either a generation — successful or not, <see cref="Result"/>'s status decides that — or a preflight
+/// refusal issued before a token was generated, after every truncation round <c>--truncate-history</c>
+/// allowed. <see cref="ConversationSession.Acquire"/>'s two calls on the one shared model handle
+/// (<c>CreateContext</c>, <c>GetUsablePromptLength</c>) moved inside the scheduled closure alongside
+/// <c>GenerateAsync</c> itself, so this is what both response shapes' closures return instead of a bare
+/// <see cref="GenerationResult"/>.
+///
+/// Deliberately <em>not</em> carrying the <see cref="ContextLease"/>: a lease the caller learns about
+/// only from a value the closure returns is a lease the caller does not have when the closure's value
+/// never reaches it. That is exactly what happened on the streaming shape — a client that disconnected
+/// mid-stream unwound the reader loop before the scheduled task was ever unwrapped, so the
+/// <c>finally</c>'s <c>lease?.Dispose()</c> saw null and the context was never released (D43 and D51
+/// both). Each shape therefore publishes the attempt's lease to its own outer variable the instant
+/// <c>Acquire</c> hands it over, from inside the closure, and that variable is the single thing the
+/// <c>finally</c> settles however the method leaves.
+/// </summary>
+internal sealed record ChatAttemptResult(
+    GenerationResult? Result,
+    GenerationFailure? Refusal,
+    bool CancelledByCut,
+    double TtftMs,
+    double TotalMs)
+{
+    public static ChatAttemptResult Refused(GenerationFailure failure) => new(null, failure, false, 0, 0);
+
+    public static ChatAttemptResult Generated(GenerationResult result, bool cancelledByCut, double ttftMs, double totalMs) =>
+        new(result, null, cancelledByCut, ttftMs, totalMs);
+}
+
+/// <summary>
 /// The parts of phase two that are the same whichever shape the reply takes. Both
 /// <see cref="ChatCompletionsEndpoint"/> and <see cref="ChatCompletionsStreamEndpoint"/> drive one
 /// generation, time its first delta, may cancel it early, and then report what came back; only the
