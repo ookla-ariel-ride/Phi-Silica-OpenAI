@@ -4,20 +4,28 @@ _Last updated: 2026-09-12, after the chunk 8 merge (D84 to D92). **All eight chu
 are built and merged; the plan is complete.** Work from here is GitHub issues, not chunks._
 
 ## Where we are
-`main` is at `2114c36`, the only branch, in sync with origin, tree clean. 932 tests pass, the solution
-builds with no warnings, CI is green. `smoke.ps1 -Backend phi-silica` passed 28 PASS / 0 FAIL / 0 SKIP
-/ 5 INFO on the first attempt, with no RPC flake.
+`main` is on the chunk 8 merge (`2114c36`) plus the state-doc pass, the only branch, in sync with
+origin, tree clean. 932 tests pass, the solution builds with no warnings, CI is green.
+`smoke.ps1 -Backend phi-silica` passed at the merge (28 PASS / 0 FAIL / 0 SKIP / 5 INFO, first
+attempt, no RPC flake) and again on 2026-09-12 after the folder rename and identity re-register —
+all steps passed, 0 skipped, 5 informational, no FAIL or WARN rows, `identity=True`, `queue_depth`
+peaking at 1 under two concurrent requests, `--queue-capacity 1` admitting one of three and 429ing
+two, `/v1/completions` answering on both shapes, and D80's tokenizer boundaries unchanged
+(3581 / 3543 / 3581).
 
 Chunk 6, the Aion Instruct Preview adapter, is merged but code-verified only: build 29648 never appends
 `WIN://SYSAPPID` for a main-package dynamic dependency, so the Qualcomm QNN provider cannot be
 image-mapped and no Aion generation has ever run here (D70; issue #2 open). Do not re-investigate that
 blocker.
 
-**The local folder was renamed to `npu-bridge` on 2026-09-12, after the merge.** Package identity is
-registered with `Add-AppxPackage -ExternalLocation $BinDir`, so the registration made under the old
-`Phi-Silica-OpenAI` path is stale. Re-run `.\scripts\identity.ps1 -Install` before the next
-`--backend phi-silica` run. `identity.ps1 -Status` will not reveal this: it prints the WindowsApps
-`InstallLocation`, not the external location, so it looks healthy either way.
+**The local folder was renamed to `npu-bridge` on 2026-09-12, after the merge**, and identity has been
+re-registered for it — the smoke run above confirms `identity=True`. Keep the mechanism in mind if it
+is renamed again: `identity.ps1` registers with `Add-AppxPackage -ExternalLocation $BinDir`, so a
+rename leaves the registration pointing nowhere, and `-Status` cannot reveal it (it prints the
+WindowsApps `InstallLocation`, not the external location). The re-register also showed that
+`Add-AppxPackage` **refuses** an in-place update when the external location changed
+(`HRESULT 0x80073D0B`) and D82's remove-then-add fallback is what carries it — the first time that
+branch has fired, and a qualifier on the settled note that a re-run "removes nothing".
 
 Aion Instruct ships as a model swap behind the Phi Silica API (Microsoft's Phi Silica page,
 2026-07-24): standalone package early October 2026, Insider rollout in October under a Controlled

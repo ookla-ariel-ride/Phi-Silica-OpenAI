@@ -35,6 +35,14 @@ machine; the NPU is here.
   identity is registered against the build output path, so the registration made under the old
   folder is stale. Re-run `.\scripts\identity.ps1 -Install` before the next `--backend phi-silica`
   run; if the relaunch says "registered for <other folder>", that is this and nothing else.
+  Done 2026-09-12, and the run is worth recording because it exercised a path nothing had before:
+  `Add-AppxPackage` **refused** the in-place update with `0x80073D0B`, "already installed with a
+  different external location", and D82's remove-then-add fallback took over and succeeded. So the
+  settled note that "`Add-AppxPackage` updates a same-identity registration in place, so a re-run
+  removes nothing" holds only while the external location is unchanged — a rebuild. A folder rename
+  is the case that refuses, and the fallback D82 kept as defensive is the reason `-Install` still
+  worked. `identity.ps1 -Status` cannot show any of this: it prints the WindowsApps
+  `InstallLocation`, not the external location, so a stale registration looks healthy.
 
 ## Runtime prerequisites on the machine
 - Windows App Runtime 2.4.0 (stable) and **2.4.1 experimental** (`Microsoft.WindowsAppRuntime.2-experimentalB`

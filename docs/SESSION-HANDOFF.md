@@ -16,11 +16,21 @@ why — the detail is in `docs/DECISIONS.md` D84 to D92, which the crashed sessi
   fast-forward of `feat/chunk-8-scheduler`, 38 commits, `84f6bf3..2114c36`; the branch is deleted.
 - **All eight chunks are merged.** Chunk 6 remains the only one code-verified rather than
   hardware-verified (D70; issue #2 open). Work from here is GitHub issues, not chunks.
-- 932 tests pass, 0 skipped. `smoke.ps1 -Backend phi-silica` passed 28 PASS / 0 FAIL / 0 SKIP / 5 INFO
-  on the first attempt, with no RPC flake — two concurrent requests really queued (`queue_depth`
-  peaked at 1 while both were in flight, and the second's session did not start until the first's had
-  ended), `--queue-capacity 1` admitted one request and rejected two with 429, `Retry-After: 1` and
-  `rate_limit_error`/`queue_full`, and `/v1/completions` answered on both shapes.
+- 932 tests pass, 0 skipped — re-run and confirmed on 2026-09-12 after the merge.
+- `smoke.ps1 -Backend phi-silica` passed at the chunk 8 merge (28 PASS / 0 FAIL / 0 SKIP / 5 INFO,
+  first attempt, no RPC flake) **and again on 2026-09-12 after the folder rename and the identity
+  re-register**: `All steps passed (0 skipped, 5 informational)`, no FAIL and no WARN rows, no RPC
+  flake. The rows that matter:
+  - `identity=True`, `bootstrap: ok`, `ready_state: Ready`, `text_mismatches: 0`, `late_deltas: 0`,
+    `package_family_name: NpuBridge_jtas4mnxdyzpe` — so the re-registration took.
+  - Two concurrent requests: both completed, `queue_depth` peaked at 1 while both were outstanding,
+    proving the second waited on the scheduler rather than taking its own context (D84).
+  - `--queue-capacity 1`, three concurrent requests: 1 admitted (200), 2 rejected (429,
+    `Retry-After=1s`, `error.type=rate_limit_error`, `error.code=queue_full`).
+  - `/v1/completions` on both shapes: `id=chatcmpl-…` (D91's kept prefix, visible on the wire),
+    `text='PONG'`, and the streamed shape 4 chunks, ttft 306.6 ms, total 473.9 ms.
+  - Tokenizer boundaries unchanged from D80: 3581 / 3543 / 3581 phi-3 tokens for the fox, JSON and
+    CJK texts, spread 38 tokens.
 - Open issues: #2, #11, #14, #15, #16, #17, #19, #21, #22, and #24 to #28 filed by chunk 8. #4 is
   closed by this chunk. #19 was closed twice by the closing-keyword accident described below and has
   been reopened both times; check it is still open.
@@ -31,12 +41,20 @@ why — the detail is in `docs/DECISIONS.md` D84 to D92, which the crashed sessi
 registers the sparse package with `Add-AppxPackage -ExternalLocation $BinDir`, so the registration
 made under the old `Phi-Silica-OpenAI` path no longer points anywhere real.
 
-- Re-run `.\scripts\identity.ps1 -Install` before the next `--backend phi-silica` run.
+- **Done on 2026-09-12**: `.\scripts\identity.ps1 -Install` was re-run and succeeded. If you rename
+  the folder again, this is the step.
 - `identity.ps1 -Status` will **not** tell you this. It prints the WindowsApps `InstallLocation`,
   which is the sparse package's own location and unchanged; the external location is what broke, and
   the script does not print it. The symptom is the relaunch failing with "registered for
   \<other folder\>".
-- The build output does exist at the new path, so `-Install` has something to bind to.
+- That re-run exercised a path nothing had before, which settles a question the chunk-7 handoff had
+  left as an assumption. `Add-AppxPackage` **refused** the in-place update —
+  `HRESULT 0x80073D0B`, "already installed with a different external location" — and D82's
+  remove-then-add fallback took over and succeeded. So "a re-run after a rebuild removes nothing,
+  because `Add-AppxPackage` updates a same-identity registration in place" is true only while the
+  external location is unchanged. A folder rename is the case that refuses, and the fallback D82 kept
+  as merely defensive is the only reason `-Install` still worked. It also means issue #19's unguarded
+  superseded-removal is on a live path, not a hypothetical one.
 
 ## What chunk 8 did
 
@@ -136,7 +154,9 @@ There is no next chunk. In rough order of value:
   `StreamingPipeline` move was byte-identical, and that was checked rather than assumed.
 - **`identity.ps1 -Status` does not show the external location**, so it reports a folder-renamed
   registration as healthy. Discovered by reading `Add-AppxPackage -ExternalLocation $BinDir` at
-  `scripts/identity.ps1:254,265`, not from the status output.
+  `scripts/identity.ps1:254,265`, not from the status output. The re-register then proved it: the
+  in-place update was refused with `0x80073D0B` and the remove-then-add fallback carried it. A
+  defensive branch nobody had seen fire is not the same as a branch that cannot fire.
 
 ## Things learned earlier that still apply
 
@@ -216,7 +236,7 @@ There is no next chunk. In rough order of value:
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\npu-bridge
 git status; git log --oneline -3                          # expect main at 2114c36, tree clean
 dotnet build; dotnet test                                 # expect 932 passed, 0 skipped
-.\scripts\identity.ps1 -Install                           # REQUIRED once: the folder was renamed
+.\scripts\identity.ps1 -Status                            # expect PFN NpuBridge_jtas4mnxdyzpe (re-registered after the rename)
 .\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 0 skipped, 5 informational
 gh issue list                                             # #2, #11, #14 to #17, #19, #21, #22, #24 to #28
 ```

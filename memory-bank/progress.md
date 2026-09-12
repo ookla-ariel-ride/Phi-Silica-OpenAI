@@ -17,7 +17,7 @@
 | Config precedence json < local < env < CLI | ✅ | real-file test + live probes |
 | CLI verbs `run`, `service`, `task`, `help`, `version` | ✅ | tests + live exit codes |
 | Fake backend with faults/threads/init rules | ✅ | tests |
-| Sparse package identity (`identity.ps1`) | ✅ | registered; PFN `NpuBridge_jtas4mnxdyzpe`. Since D82 `-Install` adds before it removes, so the successful path never leaves the machine unregistered; verified by re-running it over the live registration, which removed nothing because `Add-AppxPackage` updates a same-identity registration in place |
+| Sparse package identity (`identity.ps1`) | ✅ | registered; PFN `NpuBridge_jtas4mnxdyzpe`. Since D82 `-Install` adds before it removes, so the successful path never leaves the machine unregistered. Re-registered 2026-09-12 after the folder rename, and that run proved the qualifier: `Add-AppxPackage` updates a same-identity registration in place only while the **external location** is unchanged, and refuses with `0x80073D0B` when it is not, at which point D82's remove-then-add fallback carries it. Smoke then reported `identity=True` |
 | Self-relaunch via package activation + supervision | ✅ | child had identity, saw shell env, died with the parent |
 | Phi Silica adapter (experimental SDK) | ✅ | smoke passed 2026-09-11 on build 29648 (generate, preflight, system prompt, disconnect drain, text contract: `text_mismatches=0 late_deltas=0`, D65). Insider flight 29661 broke it on 2026-09-10 (workload packages fail to register, model `NotReady`); rolled back |
 | `/v1/chat/completions` non-streaming | ✅ | `ChatCompletionsTests`; smoke on the real NPU: 415 ms to 453 ms for a one-word reply on 2026-09-11 (677 ms to 899 ms in earlier runs), correct shape and usage |
@@ -45,10 +45,13 @@
 - Aion Plan backend: unscheduled, since the model has no SDK yet (issue #11 tracks it)
 
 ## Known issues and caveats
-- **Package identity is stale.** The local folder was renamed to `npu-bridge` on 2026-09-12 after the
-  chunk 8 merge, and `identity.ps1` registers with `Add-AppxPackage -ExternalLocation $BinDir`. Re-run
-  `.\scripts\identity.ps1 -Install` before the next `--backend phi-silica` run. `-Status` cannot show
-  this: it prints the WindowsApps `InstallLocation`, not the external location.
+- **A folder rename invalidates package identity, and `-Status` cannot see it.** `identity.ps1`
+  registers with `Add-AppxPackage -ExternalLocation $BinDir`, while `-Status` prints only the
+  WindowsApps `InstallLocation`, so a stale registration looks healthy. The rename to `npu-bridge` on
+  2026-09-12 hit this; `-Install` was re-run and the smoke test then reported `identity=True`. Worth
+  knowing: the in-place update was **refused** (`HRESULT 0x80073D0B`, "already installed with a
+  different external location") and D82's remove-then-add fallback is what completed it — the first
+  time that branch has been seen to fire, and a live-path argument for issue #19's unguarded removal.
 - A queue-full rejection is 429 with `Retry-After`, but the channel *slot* of a job whose caller gave
   up is held until the worker drains it, so a burst of aborted clients can still 429 a live request
   (D87 states this half as unchanged). `Retry-After`'s rolling average has no window or decay, so it
