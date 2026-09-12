@@ -2,7 +2,8 @@
 
 An OpenAI-compatible HTTP endpoint for the on-device language model on a Copilot+ PC (Snapdragon ARM64
 NPU). Point OpenCode, Hermes, `curl` or the Python `openai` client at `http://127.0.0.1:5273/v1` and
-use the NPU model as a provider: local, offline, free.
+use the NPU model as a provider: local, offline, free. `docs/CLIENTS.md` has the exact settings for
+each of those four.
 
 The model is small. Microsoft describes Phi Silica with a 4K-token context, and on a Snapdragon X
 Elite an empty context accepts 3,581 tokens of prompt, roughly 13,400 characters of English, then
@@ -91,7 +92,9 @@ print(reply.choices[0].message.content)
 ```
 
 There is no authentication. The client library insists on a key, so pass anything. Add `stream=True`
-and it streams over server-sent events like any other OpenAI provider.
+and it streams over server-sent events like any other OpenAI provider. `docs/CLIENTS.md` covers
+OpenCode and Hermes the same way, plus the wire-level traps a client author should know about before
+relying on this bridge.
 
 `scripts/smoke.ps1 -Backend phi-silica` checks the whole surface against the hardware in three to
 five minutes: health with identity, both response shapes, the cut, the context cache, the overflow
@@ -351,14 +354,15 @@ src/NpuBridge/             the ARM64 exe: Program.cs, PackageActivation, Supervi
 tests/NpuBridge.Tests/     xunit against the fake backend through TestServer
 packaging/                 AppxManifest.xml for the sparse package; BuildTools.proj
 scripts/                   identity.ps1 (package identity), smoke.ps1 (the hardware run)
-docs/                      PLAN.md, DECISIONS.md, FUTURE.md, SESSION-HANDOFF.md
+docs/                      PLAN.md, DECISIONS.md, FUTURE.md, SESSION-HANDOFF.md, CLIENTS.md
 memory-bank/               project notes kept for the next session
 nuget-local/               where the Aion SDK nupkg goes (gitignored; the adapter compiles only when it is present)
 .githooks/, .github/       the gitleaks pre-commit hook; the build-and-test and secret-scan workflows
 ```
 
 Start with `docs/PLAN.md` for the design and the order remaining work lands in, `docs/DECISIONS.md`
-for why things are the way they are, and `docs/FUTURE.md` for what is deliberately not done.
+for why things are the way they are, `docs/FUTURE.md` for what is deliberately not done, and
+`docs/CLIENTS.md` for wiring up a specific client.
 Remaining work: a request queue with `/v1/completions` and client documentation, the last chunk and a
 GitHub issue like the others. The tests run against the fake backend and need no NPU; the smoke script
 is the hardware check.
