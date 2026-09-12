@@ -207,12 +207,14 @@ internal sealed class ConversationSession
     private int _headerAppliedFor = -1;
 
     /// <summary>
-    /// False while <see cref="Acquire"/> is running, so <see cref="DroppedTurns"/> may still grow.
-    /// Set once the truncation loop has finished, in a finally, so a preflight that threw settles it
-    /// too — nothing will drop another turn after that either. Volatile for the same reason
-    /// <see cref="DroppedTurns"/> is: since chunk 8 the truncation loop runs on the scheduler's worker
-    /// while the request thread is writing keep-alives, and the release on this write is what publishes
-    /// the count the acquiring read below then trusts.
+    /// False whenever <see cref="DroppedTurns"/> may still grow: while <see cref="Acquire"/> is running,
+    /// and from the moment <see cref="TryDropOldestExchange"/> commits to a drop on the status-driven
+    /// retry path, which the endpoint closures drive from outside <see cref="Acquire"/>. Set true by
+    /// <see cref="Acquire"/>'s finally, so a preflight that threw settles it too — nothing will drop
+    /// another turn after that either. Volatile for the same reason <see cref="DroppedTurns"/> is:
+    /// since chunk 8 the truncation loop runs on the scheduler's worker while the request thread is
+    /// writing keep-alives, and the release on this write is what publishes the count the acquiring
+    /// read below then trusts.
     /// </summary>
     private bool _truncationSettled;
 
@@ -326,6 +328,16 @@ internal sealed class ConversationSession
 
         var dropped = nextUser;
         _turns = _turns.Skip(dropped).ToList();
+
+        // Unsettled before the count moves, not only inside Acquire. The endpoint closures call this
+        // directly on the status-driven retry path (a backend with no preflight reports the overflow by
+        // finishing the generation), and there the flag is true and DroppedTurns is about to grow with
+        // no Acquire running to have reset it. The window that opens here spans the failed attempt's
+        // lease disposal -- a real WinRT context disposal on hardware -- and a keep-alive landing inside
+        // it would stamp this partial count and lock it in, which is the defect the IfSettled hook
+        // exists to prevent, arriving by the sibling path. A no-op inside AcquireCore, where the flag is
+        // already false; the retry's own Acquire re-settles it in its finally.
+        Volatile.Write(ref _truncationSettled, false);
         DroppedTurns += dropped;
         _logger.LogWarning(
             "req={RequestId} prompt overflow: dropped the oldest {Dropped} turn(s) (--truncate-history); {Remaining} turn(s) remain, {TotalDropped} dropped so far.",
@@ -346,24 +358,6 @@ internal sealed class ConversationSession
     /// only from the thread that owns the response**: it reads <c>HasStarted</c> and then mutates the
     /// header collection, and Kestrel's is neither thread-safe nor mutable once the response has begun.
     /// </summary>
-    /// <summary>
-    /// What the streaming shape's first-frame hook calls, and the only difference from
-    /// <see cref="ApplyTruncationHeader"/> is that it declines to write a count that is still growing.
-    /// The first keep-alive can land while the preflight truncation loop is mid-flight, and the count
-    /// it would stamp is whatever had been dropped by then; <see cref="_headerAppliedFor"/> then makes
-    /// that partial number permanent, and the real one — larger — reaches only the log. A client told
-    /// "2 turns dropped" when 6 went is worse off than one told nothing, so it is told nothing: the
-    /// post-outcome call either writes the complete count, if the response is somehow still unstarted,
-    /// or logs the "cannot be sent" warning that a late truncation on a stream has always produced.
-    /// </summary>
-    public void ApplyTruncationHeaderIfSettled(HttpResponse response)
-    {
-        if (Volatile.Read(ref _truncationSettled))
-        {
-            ApplyTruncationHeader(response);
-        }
-    }
-
     public void ApplyTruncationHeader(HttpResponse response)
     {
         ArgumentNullException.ThrowIfNull(response);
@@ -382,6 +376,29 @@ internal sealed class ConversationSession
 
         _headerAppliedFor = dropped;
         response.Headers[TruncatedTurnsHeader] = dropped.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// What the streaming shapes' first-frame hook calls, and the only difference from
+    /// <see cref="ApplyTruncationHeader"/> is that it declines to write a count that is still growing.
+    /// A keep-alive can land while turns are still being dropped, and the count it would stamp is
+    /// whatever had gone by then; <see cref="_headerAppliedFor"/> makes that partial number permanent,
+    /// and the real one — larger — reaches only the log. A client told "2 turns dropped" when 6 went is
+    /// worse off than one told nothing, so it is told nothing: the post-outcome call then either writes
+    /// the complete count, if the response is somehow still unstarted, or logs the "cannot be sent"
+    /// warning that a late truncation on a stream has always produced.
+    ///
+    /// Both places that can grow the count clear the flag first — <see cref="Acquire"/> for the
+    /// preflight loop, <see cref="TryDropOldestExchange"/> for the status-driven retry the endpoint
+    /// closures drive — so what this declines to write is every partial count, not only the preflight
+    /// loop's.
+    /// </summary>
+    public void ApplyTruncationHeaderIfSettled(HttpResponse response)
+    {
+        if (Volatile.Read(ref _truncationSettled))
+        {
+            ApplyTruncationHeader(response);
+        }
     }
 
     private ContextLease Lookup()

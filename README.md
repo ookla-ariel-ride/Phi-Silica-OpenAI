@@ -141,10 +141,10 @@ flowchart TD
 Everything below the queue runs on one worker. There is one model handle and no way to use it from
 two requests at once, so a second request waits, and so do its cache lookup and its prompt-length
 preflight, which are calls on that same handle. A request that arrives to a full queue is refused
-with 429, code `queue_full`, and a `Retry-After` estimated from how long recent generations took. The
-wait is why a streamed request can be refused inside the stream rather than with a status code: by
-the time its turn comes, the first keep-alive comment may already have gone out and fixed the
-response at 200.
+with 429, code `queue_full`, and a `Retry-After` estimated from how long generations have averaged
+since the process started. The wait is why a streamed request can be refused inside the stream rather
+than with a status code: by the time its turn comes, the first keep-alive comment may already have
+gone out and fixed the response at 200.
 
 The preflight is the runtime's own answer to "how much of this fits", asked before anything is
 generated. Aion's preview SDK has no preflight, so on that backend the answer comes from the

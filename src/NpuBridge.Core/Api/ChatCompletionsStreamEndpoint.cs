@@ -68,8 +68,10 @@ internal sealed class ChatCompletionsStreamEndpoint
         // happened yet at this point simply finds nothing to report; the second call, once the outcome
         // is known, covers both the request that never wrote a frame at all and the one whose truncation
         // arrived too late to be sent (which then logs the warning it always did). The hook is the
-        // IfSettled form: a first keep-alive that lands inside the truncation loop must not stamp the
-        // count the loop has reached so far, because that number is locked in and the final one is not.
+        // IfSettled form: a keep-alive that lands while turns are still being dropped must not stamp
+        // the count reached so far, because that number is locked in and the final one is not. Both
+        // droppers clear the flag before the count moves -- the preflight loop inside Acquire, and the
+        // status-driven retry's own TryDropOldestExchange below -- so the hook declines during either.
         var sse = new SseStream(http.Response, () => session.ApplyTruncationHeaderIfSettled(http.Response));
         var stopwatch = Stopwatch.StartNew();
 

@@ -1619,10 +1619,12 @@ and on the future list as exactly that rather than as a defect.
 
 **The legacy parameters are accepted and warned, never implemented.** `echo`, `best_of`, `suffix`,
 `logprobs` and `logit_bias` have no equivalent field on the chat shape at all, so they go through the
-shared ignored-parameter check and earn a log line each. `echo` is the one that returns a materially
-different answer from a real server — the prompt is not prepended to `text` — and its line says so,
-because an operator's "is this parameter doing anything?" signal is worthless if it only covers the
-parameters that would have been harmless to ignore (D83 made the same mistake with `tools`).
+shared ignored-parameter check and earn a log line each, which is the point: an operator's "is this
+parameter doing anything?" signal is worthless if it covers only the parameters that would have been
+harmless to ignore (D83 made the same mistake with `tools`). `echo` is the one whose answer differs
+materially from a real server's, since the prompt is not prepended to `text`. Its warning is the same
+generic one every ignored parameter gets and does not spell that consequence out; the README does,
+and a line of its own here would be the better place for it.
 
 **Headers on the streamed shape commit at the first cutter release rather than the first delta**,
 because there is no role chunk to send ahead of the text. That is a consequence of the shape
@@ -1646,11 +1648,15 @@ client-disconnect tests cover the `http=0` clause and the D51 cancel-drain-settl
 per-endpoint code that was not extracted, so those were ported to `/v1/completions` rather than
 inherited.
 
-**D92. Publish-before-arm, three times in one file, and why the fix is `Interlocked` on both sides.**
+**D92. Publish-before-arm, twice in one file, and why the fix is `Interlocked` on both sides.**
 `GenerationScheduler.ScheduleAsync` writes a job to the channel and then sets up state that job needs.
 `TryWrite` hands the job to the worker immediately, and the worker can dequeue it, run it and settle
 it before the enqueuing thread reaches the next line — so anything armed after the write has a window
-in which it never happens at all. That shape has now produced three bugs in one file.
+in which it never happens at all. That shape produced two bugs in one file, both on this branch and
+both named here so the count is checkable: the cancellation registration, fixed in `4ee9268`, and the
+live depth counter beside it, fixed in `cb40c5e`. (An earlier draft of this entry said three. The
+third was the unsynchronised registration field from the same task-1 review round, which is a data
+race on a field rather than an arming that never happens, and does not belong in the count.)
 
 The first was the cancellation registration, armed after the write: the worker could settle the job
 before the assignment landed, so no disposal path ever saw a live registration and it leaked for as
@@ -1683,7 +1689,7 @@ eight clean runs with it.
 about 60 % of the time. A deterministic construction exists and is a visibility change only — make the
 two-flag gate visible to the test project and call `MarkDequeued(); MarkEnteredQueue();` in the
 adversarial order, asserting that the leave fires exactly once — and is filed as tech debt rather than
-written here. Given that this file has now had three bugs of one shape, the counter's remaining
+written here. Given that this file has now had two bugs of one shape, the counter's remaining
 assumption deserves stating too: it is correct only while every job written to the channel is
 eventually dequeued, which holds today because the worker loop cannot fault and drains after
 `TryComplete`.
@@ -1718,6 +1724,20 @@ The test parks the truncation loop in its second round with two of four turns go
 keep-alive to commit the headers, and asserts that no header arrives; it fails against the old hook.
 `FakeBackendOptions.OnPreflight` exists for it, because the truncation loop runs start to finish
 inside `Acquire` and has no other observable moment. 932 tests.
+
+**The same defect had a sibling, and the brief said it did not.** The whole-branch review's write-up
+stated that the *other* way turns get dropped — the status-driven retry, which a backend with no
+preflight takes because it learns the prompt was too long only by finishing the generation — "already
+degrades correctly to header absent, warning logged". It does not. The endpoint closures call
+`TryDropOldestExchange` themselves on that path, outside `Acquire` and therefore with the settled flag
+true, and the count grows before the loop re-enters `Acquire` to clear it again. The window spans the
+failed attempt's lease disposal, which on hardware is a real WinRT context disposal rather than a few
+nanoseconds. So `TryDropOldestExchange` clears the flag itself, on its success branch, before the
+count moves: a no-op inside the preflight loop where it is already clear, and the fix for the sibling
+path. The lesson is the one D81 keeps teaching in a different costume — when two places do the same
+thing, hardening one of them is half a fix, and a comment that promised "a partial count can never be
+the one the client is given" was written from the same half-view and has been corrected to say what
+the code does.
 
 **A correction to the record of an earlier round.** Task 2's implementer reported that one finding's
 interleaving "does not reproduce". The re-reviewer checked the pre-fix source and the finding was

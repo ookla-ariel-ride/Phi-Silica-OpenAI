@@ -59,8 +59,9 @@ internal sealed class CompletionsStreamEndpoint
         var includeUsage = prepared.Request.StreamOptions?.IncludeUsage == true;
 
         // The truncated-turns header, exactly as on the chat shape: applied from the request thread in
-        // the last instant before the first frame commits the response, and only once the truncation
-        // loop has settled, so a partial count can never be the one the client is given.
+        // the last instant before the first frame commits the response, and only while no drop is in
+        // progress -- the preflight loop inside Acquire, or the status-driven retry's own
+        // TryDropOldestExchange below, both of which clear the flag before the count moves.
         var sse = new SseStream(http.Response, () => session.ApplyTruncationHeaderIfSettled(http.Response));
         var stopwatch = Stopwatch.StartNew();
 
