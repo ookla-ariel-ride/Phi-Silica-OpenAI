@@ -193,8 +193,32 @@ internal sealed class ConversationSession
         _preflight = prepared.Backend.Capabilities.HasFlag(BackendCapabilities.PromptLengthPreflight);
     }
 
-    /// <summary>Turns dropped so far by overflow handling. The value of the response header when non-zero.</summary>
-    public int DroppedTurns { get; private set; }
+    private int _droppedTurns;
+
+    /// <summary>
+    /// The <see cref="DroppedTurns"/> value <see cref="ApplyTruncationHeader"/> has already written onto
+    /// the response, or -1 for none. Only ever touched by whichever thread owns the response, so it
+    /// needs no synchronisation: the JSON shape's caller is suspended while its closure runs, and the
+    /// streaming shape calls this from the request thread alone (chunk 8 fix round 2). It exists so the
+    /// header can be applied at more than one moment without the second call mistaking "already sent,
+    /// still accurate" for "too late to send", which would log a warning about a header the client
+    /// actually received.
+    /// </summary>
+    private int _headerAppliedFor = -1;
+
+    /// <summary>
+    /// Turns dropped so far by overflow handling. The value of the response header when non-zero.
+    /// Written by whichever thread runs the truncation loop — since chunk 8 that is the scheduler's
+    /// worker — and read by the request thread for its log line and its header, so the two accessors
+    /// are volatile: the reader must not be handed a value the compiler hoisted out of a loop, and on
+    /// the streaming shape the two threads genuinely run at once (the scheduled task is started, not
+    /// awaited, so the reader loop is emitting keep-alives while the closure truncates).
+    /// </summary>
+    public int DroppedTurns
+    {
+        get => Volatile.Read(ref _droppedTurns);
+        private set => Volatile.Write(ref _droppedTurns, value);
+    }
 
     /// <summary>
     /// Looks the transcript up in the cache, creates a fresh context on a miss, and — on a backend
@@ -290,11 +314,20 @@ internal sealed class ConversationSession
     /// The truncation header. Set only when turns were dropped and only while the status line is still
     /// the server's: on a stream that has already sent a keep-alive the headers are spent, and the
     /// caller says so in the log instead.
+    ///
+    /// Safe to call more than once for one request, which the streaming shape does (chunk 8 fix round
+    /// 2): once just before the first SSE frame commits the response, and once when the generation's
+    /// outcome is known, since a truncation can land on either side of that first frame. A second call
+    /// that would write exactly what the first already wrote does nothing at all — in particular it does
+    /// not warn that the header "cannot be sent" about a header the client already has. **Must be called
+    /// only from the thread that owns the response**: it reads <c>HasStarted</c> and then mutates the
+    /// header collection, and Kestrel's is neither thread-safe nor mutable once the response has begun.
     /// </summary>
     public void ApplyTruncationHeader(HttpResponse response)
     {
         ArgumentNullException.ThrowIfNull(response);
-        if (DroppedTurns == 0)
+        var dropped = DroppedTurns;
+        if (dropped == 0 || dropped == _headerAppliedFor)
         {
             return;
         }
@@ -302,11 +335,12 @@ internal sealed class ConversationSession
         if (response.HasStarted)
         {
             _logger.LogWarning("req={RequestId} {Dropped} turn(s) were dropped after the response headers were committed; the {Header} header cannot be sent.",
-                _prepared.RequestId, DroppedTurns, TruncatedTurnsHeader);
+                _prepared.RequestId, dropped, TruncatedTurnsHeader);
             return;
         }
 
-        response.Headers[TruncatedTurnsHeader] = DroppedTurns.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        _headerAppliedFor = dropped;
+        response.Headers[TruncatedTurnsHeader] = dropped.ToString(System.Globalization.CultureInfo.InvariantCulture);
     }
 
     private ContextLease Lookup()

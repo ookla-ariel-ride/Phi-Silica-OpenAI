@@ -73,7 +73,13 @@ internal sealed class ChatCompletionsStreamEndpoint
         var created = time.GetUtcNow().ToUnixTimeSeconds();
         var includeUsage = prepared.Request.StreamOptions?.IncludeUsage == true;
 
-        var sse = new SseStream(http.Response);
+        // The truncated-turns header is applied here, from the request thread, in the last instant
+        // before the first frame commits the response -- see the note on the scheduled closure below for
+        // why it cannot be applied where the turns are actually dropped. A truncation that has not
+        // happened yet at this point simply finds nothing to report; the second call, once the outcome
+        // is known, covers both the request that never wrote a frame at all and the one whose truncation
+        // arrived too late to be sent (which then logs the warning it always did).
+        var sse = new SseStream(http.Response, () => session.ApplyTruncationHeader(http.Response));
         var stopwatch = Stopwatch.StartNew();
 
         // The client-side cut. It runs here, on the single channel reader, and never on the backend's
@@ -163,9 +169,13 @@ internal sealed class ChatCompletionsStreamEndpoint
         try
         {
             // See ChatCompletionsEndpoint (the JSON shape) for the fuller account of why Acquire moved
-            // in here. ApplyTruncationHeader runs from the worker thread once per attempt, safe for the
-            // same reason it is there: the caller is suspended on this ScheduleAsync call and touches
-            // neither the response nor session again until it resumes.
+            // in here. Unlike that shape, this closure must not touch http.Response at all (fix round 2):
+            // this call is started rather than awaited, so the request thread runs straight on into the
+            // reader loop and writes keep-alive frames to that same response while this runs. The
+            // truncated-turns header is therefore applied by the request thread alone -- once as
+            // SseStream is about to commit the response, and once when the outcome is known -- because a
+            // truncation can land on either side of that first frame, and because Kestrel's header
+            // collection is neither thread-safe nor mutable after the response has started.
             generation = scheduler.ScheduleAsync(async ct =>
             {
                 while (true)
@@ -186,8 +196,6 @@ internal sealed class ChatCompletionsStreamEndpoint
 
                     try
                     {
-                        session.ApplyTruncationHeader(http.Response);
-
                         // Not a `using`: the caller's finally owns this source's lifetime, because the
                         // caller's finally is what cancels through it on the way out.
                         var generationCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -354,6 +362,18 @@ internal sealed class ChatCompletionsStreamEndpoint
                 result = schedulerOutcome.Attempt!.Result!;
                 queueWaitMs = schedulerOutcome.QueueWaitMs;
             }
+
+            // A generation was attempted on the truncated transcript, so the header says so -- whatever
+            // that generation goes on to report, exactly as on the JSON shape. The second and last of
+            // the two moments the request thread owns the response for this purpose: the first, in
+            // SseStream, is the only chance a request that does write frames ever gets, and this is the
+            // only chance a request that writes none (an ordinary status-code failure, or a reply with
+            // no deltas) ever gets. On a stream that has already started this writes nothing and logs
+            // the warning instead. Deliberately after the three branches converge and not inside them:
+            // a scheduler-level refusal and a preflight refusal both return from inside
+            // ReportSchedulerOutcomeAsync without reaching here, and neither may carry the header --
+            // no reply was produced for the dropped turns to describe.
+            session.ApplyTruncationHeader(http.Response);
 
             stopwatch.Stop();
             var cacheLabel = lease!.CacheHit ? "hit" : "miss";
@@ -933,9 +953,21 @@ internal sealed class ChatCompletionsStreamEndpoint
     private sealed class SseStream
     {
         private readonly HttpResponse _response;
+        private readonly Action? _beforeHeaders;
         private bool _headersPrepared;
 
-        public SseStream(HttpResponse response) => _response = response;
+        /// <param name="beforeHeaders">
+        /// Run once, on this thread, in the last instant the response is still mutable — after that the
+        /// status line, the content type and every header are fixed. It is where a header whose value is
+        /// only known late (the truncated-turns count, chunk 8) gets its last chance, and running it here
+        /// rather than from whichever thread computed it is what keeps every mutation of the response on
+        /// the one thread that owns it.
+        /// </param>
+        public SseStream(HttpResponse response, Action? beforeHeaders = null)
+        {
+            _response = response;
+            _beforeHeaders = beforeHeaders;
+        }
 
         /// <summary>
         /// True once the response has actually begun, i.e. once 200 and <c>text/event-stream</c> are
@@ -962,6 +994,10 @@ internal sealed class ChatCompletionsStreamEndpoint
         {
             if (!_headersPrepared)
             {
+                // Anything else that still wants a header goes on first: after this block the response
+                // is committed by the write below and nothing can be added.
+                _beforeHeaders?.Invoke();
+
                 // Assigned once and only while the response is still mutable. A failed first write
                 // leaves them assigned on a response that never started, which is harmless: the
                 // ordinary error result the caller returns instead overwrites the status and the
