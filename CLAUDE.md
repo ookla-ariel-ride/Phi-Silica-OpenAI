@@ -485,7 +485,10 @@ carrying its scope, the decisions that constrain it, its known blockers and its 
 defects and cleanups from reviews are issues labelled `bug` or `tech-debt`. Read the issue before
 starting the work, put context a later session will need into the issue rather than only into chat,
 and close it from the merge commit (`closes #N`). `docs/FUTURE.md` stays the long-form record of why
-something was deferred; the issue is the work item.
+something was deferred; the issue is the work item. Sidequest (project-scoped plugin, enabled in
+`.claude/settings.json`) is the in-flight board: a ticket holds the dispatch, verification and review
+loop for one issue while it is being worked, and the GitHub issue stays the public record that opens
+and closes the work.
 
 ## Delegate to subagents
 
