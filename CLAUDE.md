@@ -13,71 +13,39 @@ fake backend for tests. Aion 1.0 Plan is a different model (14B, 32K context, na
 calling) with no SDK as of 2026-09-10; it is tracked as a GitHub issue, and a backend for it would
 bypass the tool-call emulation rather than use it.
 
-Status: `docs/PLAN.md` is the signed-off design (read it first). Chunks 1 to 7 of 8 are built and
-merged: skeleton, the Phi Silica adapter, non-streaming `POST /v1/chat/completions` with the prompt
-template, streaming over server-sent events with the client-side cut for `max_tokens`/`stop`, the
-context cache with overflow handling (chunk 5, merged 2026-09-11, D71 to D75: a continuing
-conversation sends only its newest turns on a cached context, an over-length transcript is refused
-by the preflight before a token is generated, and `--truncate-history` drops the oldest exchanges
-instead), and the Aion Instruct Preview adapter (chunk 6, merged 2026-09-11 as code-verified only,
-D66 to D70): `AionBackend`, the shared `DeltaAccumulator` in Core, the Aion capability-profile tests
-and the `-Backend aion` smoke steps exist, but no Aion generation has ever run on this machine,
-because build 29648 never appends the `WIN://SYSAPPID` token attribute for a main-package dynamic
-dependency, so the Qualcomm QNN provider that Windows ML 1.8 needs cannot be image-mapped (D70; issue
-#2 stays open for the hardware half). Do not spend time on that blocker again: Developer Mode, SFC,
-DISM, ACLs, drivers and package identity are all ruled out; only another Windows build or a Feedback
-Hub report remains. Also merged 2026-09-11: the OpenAI conformance pass (D77: required-but-nullable
-fields written as nulls, `model` required and served-only, schema ranges enforced) and D78 (no
-suffix lookup for truncated conversations; the follow-up turn already hits) and D79 (test hardening
-from the coverage audit: the smoke script's readiness step says what ready means per backend, its
-teardown proves the activated child exited and every auxiliary server gets a teardown row, an
-`InfoStep` may fail on a contradiction, `/healthz` reports the keep-alive timings, and issue #14's
-first six tests landed) and D80 (issue #13, closed: `usage` and the `max_tokens` budget are Phi-3
-tokens on Phi Silica because the runtime's tokenizer was measured to be Phi-3.5-mini's, the preflight's
-answer is read as the UTF-8 bytes it is, chars/4 stays on Aion and the fake, `POST /debug/tokenize`
-and a smoke step repeat the measurement per build) and D81 (issue #9, closed: the post-generation
-pipeline is written once — `Api/GenerationPipeline.cs` holds the shared `DeltaSink`, `CutWatcher`,
-guarded cancel and raw-output log, and `GenerationOutcome` beside `GenerationFailure` decides
-failure/filtered/content for both shapes, so the D56 and D57 drifts cannot recur;
-`FakeBackendOptions.StartGate` replaced `StartDelay` and the last three wall-clock races with it;
-655 tests, and the smoke run reproduced D80's numbers exactly) and D82 (issue #10, closed: the JSON
-path's catch is the streaming path's pair, so a cancellation that is not the client's is a 502 with
-the ordinary body rather than a bare 500; `SseStream.Started` is the response's `HasStarted`, which
-turned out to be a simplification rather than the bug it was filed as; `identity.ps1 -Install` adds
-before it removes, so a failed install no longer leaves nothing registered; 657 tests) and chunk 7,
-tool-call emulation (issue #3, closed, D83: `tools`/`tool_choice` produce OpenAI-shaped `tool_calls`
-on both shapes from a runtime with no native tool calling — an instruction block in the system text,
-the streamed reply buffered whole behind keep-alives, and a deliberately tolerant parser whose rule is
-that a false positive is worse than a miss; 866 tests, and the hardware probe called the tool 20 times
-out of 20 where PLAN predicted 60–80 %, on the easy single-tool case it asks). Issues #14, #15, #17,
-#19, #21 and #22 stay open for their remaining items.
+**All eight chunks of `docs/PLAN.md` are built and merged; there is no next chunk.** Work from here
+is GitHub issues. `docs/PLAN.md` is the signed-off design; `docs/DECISIONS.md` records why things are
+the way they are, decision by decision (D1 to D96), and is where the chunk-by-chunk history this
+section used to duplicate actually lives; `docs/SESSION-HANDOFF.md` carries the current state and
+what to do next; `docs/FUTURE.md` holds deferred work. Read the handoff first; update DECISIONS and
+FUTURE whenever work changes a choice or defers something.
 
-**All eight chunks are built and merged.** Chunk 8 (issue #4) merged 2026-09-12, D84 to D92: a
-`GenerationScheduler` (one worker, bounded `Channel<GenerationJob>`, `--queue-capacity` default 4,
-finally read) serializes the shared model handle, and what runs inside the scheduled closure is
-`ConversationSession.Acquire` as well as the generation — the cache lookup, `CreateContext` and the
-preflight all touch that handle, so guarding only `GenerateAsync` would have left the race the chunk
-exists to close (D84; the chunk's own brief said otherwise and PLAN §2.7 won). A queue-full request is
-429 with `Retry-After` and `rate_limit_error`/`queue_full`; `/healthz` reports real `queue_depth` and
-`queue_capacity`; `/debug/generate` goes through the scheduler too (D90, superseding D40).
-`POST /v1/completions` is real on both shapes (`text_completion`, `choices[].text`, the `chatcmpl-`
-id prefix kept deliberately, a multi-element `prompt` array refused 400, legacy-only parameters
-warned and ignored, D91). 932 tests pass, and `smoke.ps1 -Backend phi-silica` passed 28 PASS / 0 FAIL
-/ 0 SKIP / 5 INFO on the first attempt with no RPC flake: two concurrent requests really queued
-(`queue_depth` peaked at 1), `--queue-capacity 1` admitted one and rejected two. Chunk 6 is still the
-only one code-verified rather than hardware-verified. Issues #24 to #28 carry what chunk 8 knowingly
-left. The repository is
-`ookla-ariel-ride/npu-bridge`, and the local folder was renamed to match on 2026-09-12
-(`...\GitHub\npu-bridge`). Package identity is registered against the build output path, so that
-rename invalidated the existing registration: re-run `.\scripts\identity.ps1 -Install` before the
-next `--backend phi-silica` run.
-All four defects from the 2026-09-10 code review (#5 to #8) are fixed and merged (D62 to D65). The
-Insider flight to build 29661 broke Phi Silica and was rolled back to 29648; if it is offered again,
-expect the same (workload packages fail to register, model `NotReady`). An empty
-`Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'` listing is not proof of breakage on 29648;
-`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D92 so
-far); `docs/FUTURE.md` holds deferred work. Update both whenever a chunk changes a choice or defers
-something.
+Current state: 932 tests pass, `smoke.ps1 -Backend phi-silica` passes clean on hardware, and the
+repository is `ookla-ariel-ride/npu-bridge`.
+
+Standing facts that will cost you a session if you do not know them:
+
+- **Chunk 6 (Aion) is code-verified only — no Aion generation has ever run here.** Build 29648 never
+  appends the `WIN://SYSAPPID` token attribute for a main-package dynamic dependency, so the Qualcomm
+  QNN provider that Windows ML 1.8 needs cannot be image-mapped (D70, issue #2). **Do not spend time
+  on that blocker again**: Developer Mode, SFC, DISM, ACLs, drivers and package identity are all ruled
+  out. Only another Windows build or a Feedback Hub report remains.
+- **Package identity is registered against the build output path.** Moving or renaming the folder
+  invalidates it; re-run `.\scripts\identity.ps1 -Install` before the next `--backend phi-silica` run.
+  `identity.ps1 -Status` will not reveal this — the symptom is a relaunch failing with
+  "registered for \<other folder\>".
+- **Build 29661 broke Phi Silica and was rolled back to 29648.** If the Insider flight is offered
+  again, expect the same (workload packages fail to register, model `NotReady`).
+- **An empty `Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'` listing is not proof of
+  breakage** on 29648. `/healthz` is the check.
+- **A real agent client does not fit.** Measured 2026-09-12 (D93): a terminal agent's tool schemas
+  alone are 3 to 7 times the 3,581-token window, so an agent must have its toolset cut down before it
+  can use this bridge at all. Compliance below that boundary is near-perfect; the window is the
+  constraint, not the model's protocol discipline.
+
+Open issues carry the rest: #24 to #28 are chunk 8's known leftovers, #29 to #31 came out of the
+issue #21 measurement (#29 is the serious one — see the crash warning under Commands), and #2, #11,
+#14 to #17, #19 and #22 are longer-running.
 
 ## Machine reality
 
@@ -119,7 +87,9 @@ NpuBridge.exe service install|start|stop|uninstall   # Windows service for aion/
 Re-run `identity.ps1 -Install` after the build output folder or the manifest changes. If Phi Silica
 relaunch fails with "registered for <other folder>", that is why.
 `smoke.ps1` reports with `Write-Host`; redirect with `6>&1` if you need a transcript, plain `>` captures nothing.
-Do not `dotnet build` while `smoke.ps1` has a server up: the exe is locked and the copy fails.
+Do not `dotnet build` while a server is up — `smoke.ps1`'s, or one you started yourself: the exe is
+locked and the copy fails. **`dotnet test` builds too**, so it fails the same way; stop the server
+first, or accept that the suite cannot run while one is live.
 Two smoke lines look like failures and are not. A *first*-generation "the remote procedure call failed"
 is the model runtime's known flake — re-run once; the same fault on a later generation is real. And
 `system prompt honoured: False` on the `/debug/generate` row is D45: only the bare debug path ignores it.
@@ -407,6 +377,10 @@ Live today:
   identically to one that never mentioned tools. The streamed shape **buffers the whole reply** before
   emitting anything, sending `: keep-alive` comments meanwhile, because only a finished reply can be
   told from prose; then one chunk carrying the whole `tool_calls` array, then the finish chunk.
+  Because the block lands in the system text, it is also what makes a real agent client unusable here
+  and what can crash the model host: measured, a terminal agent's 25 tools render far past the window
+  and past the ~44,000-character boundary at which `CreateContext` fail-fasts (D93, D94, issue #29).
+  Any change that makes the rendered block larger is a change to that hazard, not just to a prompt.
   A parsed call is `message.tool_calls` with `content: null` and `finish_reason: "tool_calls"` — except
   that a `max_tokens` cut which still parses reports `length` (the client gets the calls *and* the
   truth that the text was truncated), and `index` is written only on the streaming shape, per OpenAI's
