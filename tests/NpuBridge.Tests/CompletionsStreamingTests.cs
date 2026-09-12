@@ -75,6 +75,11 @@ public class CompletionsStreamingTests
         Assert.All(chunks, c => Assert.Equal(JsonValueKind.Null, c.GetProperty("choices")[0].GetProperty("logprobs").ValueKind));
     }
 
+    /// <summary>
+    /// Fix round 1, finding 6: the previous version of this test only checked that a usage chunk with
+    /// empty <c>choices</c> existed somewhere in the body, which a usage chunk emitted <em>first</em>
+    /// would also satisfy. It must be the trailing chunk -- every content-bearing chunk comes before it.
+    /// </summary>
     [Fact]
     public async Task Include_usage_adds_one_trailing_chunk_with_empty_choices_and_null_usage_before_it()
     {
@@ -85,6 +90,10 @@ public class CompletionsStreamingTests
 
         var usageChunk = Assert.Single(chunks, c => c.GetProperty("choices").GetArrayLength() == 0);
         Assert.True(usageChunk.GetProperty("usage").GetProperty("completion_tokens").GetInt32() > 0);
+
+        // The ordering the test's name claims: the usage chunk is last, not merely present -- a usage
+        // chunk emitted first would also have satisfied the Assert.Single above.
+        Assert.Equal(usageChunk.GetRawText(), chunks[^1].GetRawText());
 
         foreach (var chunk in chunks.Where(c => c.GetProperty("choices").GetArrayLength() > 0))
         {
@@ -106,6 +115,7 @@ public class CompletionsStreamingTests
         var finish = chunks.Select(c => c.GetProperty("choices")[0].GetProperty("finish_reason"))
             .Single(f => f.ValueKind != JsonValueKind.Null);
         Assert.Equal("length", finish.GetString());
+        host.AssertNoLeak();
     }
 
     [Fact]
@@ -122,6 +132,7 @@ public class CompletionsStreamingTests
         var finish = chunks.Select(c => c.GetProperty("choices")[0].GetProperty("finish_reason"))
             .Single(f => f.ValueKind != JsonValueKind.Null);
         Assert.Equal("stop", finish.GetString());
+        host.AssertNoLeak();
     }
 
     [Fact]
