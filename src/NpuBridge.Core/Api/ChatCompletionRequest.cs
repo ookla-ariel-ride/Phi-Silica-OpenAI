@@ -162,10 +162,16 @@ public sealed class ChatMessageContentConverter : JsonConverter<ChatMessageConte
 
 /// <summary>
 /// Reads <c>stop</c> as either a bare JSON string or an array of strings, normalizing both to a list;
-/// writes back as a single string when there's exactly one entry, otherwise an array.
+/// writes back as a single string when there's exactly one entry, otherwise an array. Not sealed:
+/// <see cref="PromptOrArrayConverter"/> (chunk 8 task 3, fix round 1 finding 4) overrides
+/// <see cref="FieldName"/> so the JSON error messages name <c>prompt</c> rather than <c>stop</c> when
+/// this same reader is reused for <c>/v1/completions</c>'s <c>prompt</c> field.
 /// </summary>
-public sealed class StringOrArrayConverter : JsonConverter<IReadOnlyList<string>?>
+public class StringOrArrayConverter : JsonConverter<IReadOnlyList<string>?>
 {
+    /// <summary>The field name these messages should quote. Overridden by a converter reused for a different field.</summary>
+    protected virtual string FieldName => "stop";
+
     public override IReadOnlyList<string>? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
         switch (reader.TokenType)
@@ -183,7 +189,7 @@ public sealed class StringOrArrayConverter : JsonConverter<IReadOnlyList<string>
                 {
                     if (reader.TokenType != JsonTokenType.String)
                     {
-                        throw new JsonException("stop array entries must be strings.");
+                        throw new JsonException($"{FieldName} array entries must be strings.");
                     }
 
                     list.Add(reader.GetString()!);
@@ -192,7 +198,7 @@ public sealed class StringOrArrayConverter : JsonConverter<IReadOnlyList<string>
                 return list;
 
             default:
-                throw new JsonException("stop must be a string, an array of strings, or null.");
+                throw new JsonException($"{FieldName} must be a string, an array of strings, or null.");
         }
     }
 
