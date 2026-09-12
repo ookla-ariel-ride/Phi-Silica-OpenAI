@@ -101,3 +101,6 @@ skills-lock.json
 # Per-machine project config, its language-server cache and the agent's own memories. Serena
 # writes these on first activation; none of it is project source, and the cache is large.
 .serena/
+
+# Claude Code per-user project settings (model-gateway writes a machine-local endpoint here)
+.claude/settings.local.json
