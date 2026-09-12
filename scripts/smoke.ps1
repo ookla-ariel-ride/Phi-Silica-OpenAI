@@ -8,7 +8,7 @@
   /debug/generate (raw model access, cancellation, prompt-length preflight), /v1/chat/completions
   non-streaming and streaming (the SSE wire contract and the client-side cut), the context cache
   (a continuation hits, a control misses, both timed) and overflow handling (the preflight refusal,
-  then --truncate-history on a second server) and, once chunk 7 lands, a tool-call compliance probe.
+  then --truncate-history on a second server) and a tool-call compliance probe.
 
   It also takes the measurements docs/DECISIONS.md cites: the token estimate against the progress
   callbacks, which system-prompt placement this model obeys, whether cancelling a generation really
@@ -34,7 +34,7 @@
   Do not start the exe; test whatever is already listening on the port.
 
 .PARAMETER ToolProbeRuns
-  How many times to run the tool-call compliance probe (0 = skip). Ignored until chunk 7.
+  How many times to run the tool-call compliance probe (0 = skip).
 
 .EXAMPLE
   .\scripts\smoke.ps1 -Backend phi-silica
@@ -787,8 +787,72 @@ try {
     }
 
     if ($ToolProbeRuns -gt 0) {
+        # What the bridge guarantees and what the model manages are different questions, and this step
+        # only fails on the first. The bridge must answer every run with a well-formed reply -- either
+        # tool_calls with content null and finish_reason "tool_calls", or ordinary content -- and never
+        # with a call to a tool that was not offered, arguments that are not JSON, or the raw protocol
+        # leaking out as content. Whether the model chooses to call at all is the measurement, and PLAN
+        # section 2.6 expects 60 to 80 % on a model this size: a low rate is a finding to record, not a
+        # failing step.
         Step "tool-call compliance probe ($ToolProbeRuns runs)" {
-            Skip 'tool calling arrives in chunk 7; tools/tool_choice are accepted and ignored in chunk 3'
+            $tools = @(@{
+                type     = 'function'
+                function = @{
+                    name        = 'get_weather'
+                    description = 'Get the current weather for a city'
+                    parameters  = @{
+                        type       = 'object'
+                        properties = @{ location = @{ type = 'string'; description = 'City name' } }
+                        required   = @('location')
+                    }
+                }
+            })
+
+            $called = 0
+            $prose = 0
+            $names = @{}
+            $badArguments = 0
+            $leaked = 0
+
+            for ($i = 0; $i -lt $ToolProbeRuns; $i++) {
+                $body = @{
+                    model    = $servedModel
+                    messages = @(@{ role = 'user'; content = 'What is the weather in Paris right now?' })
+                    tools    = $tools
+                } | ConvertTo-Json -Depth 10
+
+                $r = Get-Json '/v1/chat/completions' 'POST' $body
+                $choice = $r.choices[0]
+
+                if ($choice.finish_reason -eq 'tool_calls') {
+                    $called++
+                    if ($null -ne $choice.message.content) {
+                        throw "run $($i + 1): finish_reason tool_calls but content was not null"
+                    }
+                    foreach ($call in $choice.message.tool_calls) {
+                        $names[$call.function.name] = $true
+                        try { $null = $call.function.arguments | ConvertFrom-Json -Depth 10 }
+                        catch { $badArguments++ }
+                    }
+                } else {
+                    $prose++
+                    if ($choice.finish_reason -ne 'stop' -and $choice.finish_reason -ne 'length') {
+                        throw "run $($i + 1): unexpected finish_reason $($choice.finish_reason)"
+                    }
+                    # The protocol reaching the client as prose means the parser missed a shape the
+                    # model actually produces, which is the one failure of this feature that matters.
+                    if ($choice.message.content -match '"tool_calls"\s*:') { $leaked++ }
+                }
+            }
+
+            if ($badArguments -gt 0) { throw "$badArguments call(s) carried arguments that are not JSON" }
+            if ($leaked -gt 0) { throw "$leaked repl(y|ies) leaked tool-call JSON as content; the parser missed a real shape" }
+
+            $unexpected = @($names.Keys | Where-Object { $_ -ne 'get_weather' })
+            if ($unexpected.Count -gt 0) { throw "called tool(s) that were never offered: $($unexpected -join ', ')" }
+
+            $rate = [math]::Round(100.0 * $called / $ToolProbeRuns, 0)
+            "$called/$ToolProbeRuns called the tool ($rate %), $prose answered in prose; no leaked protocol, no unoffered tool, all arguments valid JSON. PLAN expects 60-80 % on this model size."
         }
     }
 
