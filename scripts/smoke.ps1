@@ -205,6 +205,39 @@ function Invoke-Sse([string] $path, [string] $body, [int] $timeoutSec = 300) {
     }
 }
 
+# Fires one POST and returns immediately with the in-flight task, so a caller can start several requests
+# before awaiting any of them -- the shape chunk 8's concurrency step and its queue-full step both need,
+# and the one thing Invoke-Sse deliberately does not offer (it blocks until its own request is done,
+# which is fine for every step that only ever needs one call in flight at a time). Same handler/client
+# setup as Invoke-Sse's and for the same reason (UseProxy off, so a machine-wide proxy cannot intercept a
+# loopback call). $baseUrl defaults to the main server but takes an aux server's own base for the
+# queue-full step, which needs its own --queue-capacity.
+function Start-JsonRequest([string] $path, [string] $body, [string] $baseUrl = $base, [int] $timeoutSec = 300) {
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.UseProxy = $false
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds($timeoutSec)
+    $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, "$baseUrl$path")
+    $request.Content = [System.Net.Http.StringContent]::new($body, [System.Text.Encoding]::UTF8, 'application/json')
+    [pscustomobject]@{ Client = $client; Handler = $handler; Task = $client.SendAsync($request) }
+}
+
+# Awaits a Start-JsonRequest task to completion and reads its body, disposing the client/handler
+# afterwards -- the two are always used as a pair, never the task alone.
+function Complete-JsonRequest($pending) {
+    try {
+        $response = $pending.Task.GetAwaiter().GetResult()
+        $text = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        $json = try { $text | ConvertFrom-Json -Depth 20 } catch { $null }
+        $retryAfter = if ($response.Headers.Contains('Retry-After')) { $response.Headers.GetValues('Retry-After') | Select-Object -First 1 } else { $null }
+        [pscustomobject]@{ StatusCode = [int]$response.StatusCode; Body = $text; Json = $json; RetryAfter = $retryAfter }
+    }
+    finally {
+        $pending.Client.Dispose()
+        $pending.Handler.Dispose()
+    }
+}
+
 # The finish reasons carried by a stream's chunks, in order. Not simply choices[0] on every chunk: the
 # usage chunk carries an empty choices array by design. The leading comma keeps the result an array
 # when there is exactly one -- PowerShell would otherwise unroll it to a bare string, whose .Count is
@@ -856,6 +889,168 @@ try {
 
             $rate = [math]::Round(100.0 * $called / $ToolProbeRuns, 0)
             "$called/$ToolProbeRuns called the tool ($rate %), $prose answered in prose; no leaked protocol$unexpectedNote, all arguments valid JSON. PLAN expects 60-80 % on this model size."
+        }
+    }
+
+    # --- chunk 8: the generation scheduler and legacy /v1/completions -----------------------------
+    # Issue #4's own requirement, and the gap docs/FUTURE.md records by name: "two simultaneous requests
+    # against a real NPU are entirely untested." Every step above this one has run one request at a time.
+    Step 'two concurrent requests share the queue: the second genuinely waits behind the first' {
+        # The fake backend generates with no per-token delay (the same reason 'client disconnect
+        # mid-generation' skips it above), so the window in which the second request is provably still
+        # queued -- rather than already finished, or never queued because the fake finished too fast to
+        # overlap the poll below -- is too narrow to catch reliably. Meaningful on phi-silica and aion,
+        # where a real generation runs long enough for a 100 ms poll loop to land inside it.
+        if ($Backend -eq 'fake') { Skip 'the fake backend has no generation delay; the queueing window is too narrow to observe reliably' }
+
+        $bodyA = @{ model = $servedModel; max_tokens = 64; messages = @(@{ role = 'user'; content = 'Write a detailed essay of at least 400 words about the history of computing.' }) } | ConvertTo-Json -Depth 5
+        $bodyB = @{ model = $servedModel; max_tokens = 16; messages = @(@{ role = 'user'; content = 'Reply with exactly the word PONG.' }) } | ConvertTo-Json -Depth 5
+
+        # Both fired before either is awaited (the async idiom Invoke-Sse already uses internally for its
+        # own single request), so the two are genuinely concurrent rather than merely close in time.
+        $pendingA = Start-JsonRequest '/v1/chat/completions' $bodyA
+        $pendingB = Start-JsonRequest '/v1/chat/completions' $bodyB
+
+        # The proof is /healthz's own live queue_depth (chunk 8), never a duration: it counts only jobs
+        # the worker has not yet reached, so seeing it reach 1 while both requests are still outstanding
+        # is direct evidence the second waited on the scheduler rather than getting its own context the
+        # way chunk 5 left two concurrent requests able to. Polled, not slept for -- the loop's own exit
+        # is bounded by the two requests finishing (or a generous deadline), never by a fixed clock, and
+        # nothing below this point depends on how long either request took.
+        $maxDepth = 0
+        $deadline = (Get-Date).AddSeconds(90)
+        while ((Get-Date) -lt $deadline -and -not ($pendingA.Task.IsCompleted -and $pendingB.Task.IsCompleted)) {
+            $h = Get-Json '/healthz'
+            if ($h.queue_depth -gt $maxDepth) { $maxDepth = $h.queue_depth }
+            if ($maxDepth -ge 1) { break }
+            Start-Sleep -Milliseconds 100
+        }
+
+        $a = Complete-JsonRequest $pendingA
+        $b = Complete-JsonRequest $pendingB
+
+        if ($a.StatusCode -ne 200) { throw "request A: HTTP $($a.StatusCode): $($a.Body)" }
+        if ($b.StatusCode -ne 200) { throw "request B: HTTP $($b.StatusCode): $($b.Body)" }
+        if (-not $a.Json.choices[0].message.content) { throw "request A: empty content: $($a.Body)" }
+        if (-not $b.Json.choices[0].message.content) { throw "request B: empty content: $($b.Body)" }
+        if ($maxDepth -lt 1) { throw "queue_depth never reached 1 while both requests were in flight (observed max $maxDepth); the second request may not have queued behind the first" }
+
+        "both requests completed (A: $($a.Json.usage.completion_tokens) completion tokens, B: $($b.Json.usage.completion_tokens)); queue_depth peaked at $maxDepth while both were outstanding, proving the second genuinely waited on the scheduler rather than getting its own context"
+    }
+
+    Step 'POST /v1/completions (legacy, non-streaming)' {
+        $body = @{ model = $servedModel; prompt = 'Reply with exactly the word PONG.' } | ConvertTo-Json -Depth 5
+        $c = Get-Json '/v1/completions' 'POST' $body
+        if ($c.object -ne 'text_completion') { throw "object=$($c.object)" }
+        # Same id allocator as the chat shape (ChatCompletionId.NewId): both endpoints hand out
+        # chatcmpl- ids, there is no separate cmpl- prefix on this bridge.
+        if ($c.id -notlike 'chatcmpl-*') { throw "id=$($c.id) does not start with chatcmpl-" }
+        $choice = $c.choices[0]
+        if ([string]::IsNullOrEmpty($choice.text)) { throw "empty text: $($c | ConvertTo-Json -Compress)" }
+        if ($choice.index -ne 0) { throw "index=$($choice.index)" }
+        if ($choice.finish_reason -ne 'stop') { throw "finish_reason=$($choice.finish_reason)" }
+        if ($choice.PSObject.Properties.Name -notcontains 'logprobs') { throw 'choices[0] carries no logprobs field, even as an explicit null (D77 convention)' }
+        $u = $c.usage
+        if (-not ($u.prompt_tokens -gt 0 -and $u.completion_tokens -gt 0 -and $u.total_tokens -eq ($u.prompt_tokens + $u.completion_tokens))) {
+            throw "usage=$($u | ConvertTo-Json -Compress)"
+        }
+        "id=$($c.id) text='$($choice.text.Trim())' usage=$($u | ConvertTo-Json -Compress)"
+    }
+
+    Step 'POST /v1/completions (legacy, streaming SSE)' {
+        $body = @{
+            model          = $servedModel
+            stream         = $true
+            stream_options = @{ include_usage = $true }
+            prompt         = 'Reply with exactly the word PONG.'
+        } | ConvertTo-Json -Depth 5
+
+        $s = Invoke-Sse '/v1/completions' $body
+        if ($s.StatusCode -ne 200) { throw "HTTP $($s.StatusCode): $($s.Body)" }
+        if ($s.ContentType -ne 'text/event-stream') { throw "Content-Type=$($s.ContentType)" }
+        if (-not $s.Done) { throw "stream did not end with the done marker: $($s.Frames -join ' | ')" }
+        if ($s.Chunks.Count -lt 1) { throw "no chunks: $($s.Frames -join ' | ')" }
+
+        foreach ($c in $s.Chunks) {
+            if ($c.object -ne 'text_completion') { throw "object=$($c.object)" }
+        }
+
+        # The legacy shape's own contract: text lives directly on the choice, never nested in a delta the
+        # way the chat shape's chunks carry it. Invoke-Sse's frame reader knows nothing about either wire
+        # shape, so $s.Content (built off .delta.content) would silently read as empty string here; this
+        # step reads choices[0].text itself instead of trusting that field.
+        $withChoice = @($s.Chunks | Where-Object { $_.choices.Count -gt 0 })
+        if ($withChoice.Count -eq 0) { throw "no chunk carried a choice: $($s.Frames -join ' | ')" }
+        foreach ($c in $withChoice) {
+            if ($null -eq $c.choices[0].text) { throw "a choice-bearing chunk has no text field: $($c | ConvertTo-Json -Compress)" }
+        }
+        $text = -join ($withChoice | ForEach-Object { $_.choices[0].text })
+        if (-not $text) { throw 'the text deltas concatenate to nothing' }
+
+        $finishes = Get-FinishReasons $s.Chunks
+        if ($finishes.Count -ne 1 -or $finishes[0] -ne 'stop') { throw "finish_reason=$($finishes -join ',') expected exactly one 'stop'" }
+
+        $withUsage = @($s.Chunks | Where-Object { $null -ne $_.usage })
+        if ($withUsage.Count -ne 1) { throw "$($withUsage.Count) usage chunks, expected exactly 1" }
+        $last = $s.Chunks[-1]
+        if ($last.choices.Count -ne 0) { throw "the usage chunk carries $($last.choices.Count) choice(s), expected none" }
+        $u = $last.usage
+        if (-not ($u.prompt_tokens -gt 0 -and $u.completion_tokens -gt 0 -and $u.total_tokens -eq ($u.prompt_tokens + $u.completion_tokens))) {
+            throw "usage=$($u | ConvertTo-Json -Compress)"
+        }
+
+        "chunks=$($s.Chunks.Count) ttft=$($s.FirstChunkMs)ms total=$($s.TotalMs)ms usage=$($u | ConvertTo-Json -Compress) text='$($text.Trim())'"
+    }
+
+    Step 'queue-full: a request beyond capacity gets 429 with Retry-After' {
+        # The fake backend's generation is fast enough that three near-simultaneous requests against a
+        # capacity of one can race the worker draining the queue before the third even arrives -- the
+        # same reason the concurrency step above skips it. On phi-silica and aion a real generation is
+        # slow enough relative to three loopback SendAsync calls fired back to back that the race is not
+        # a practical concern.
+        if ($Backend -eq 'fake') { Skip 'the fake backend generates too fast for three near-simultaneous requests to reliably overlap a capacity-1 queue' }
+        if ($NoStart) { Skip '-NoStart is set; this step needs a dedicated aux server started with a small --queue-capacity' }
+
+        $auxPort = $Port + 3
+        $auxProcess = Start-AuxServer 'queue-capacity-1' $auxPort @('--queue-capacity', '1')
+        try {
+            $auxBase = "http://127.0.0.1:$auxPort"
+            $bodies = 1..3 | ForEach-Object {
+                @{ model = $servedModel; max_tokens = 48; messages = @(@{ role = 'user'; content = "Write a short paragraph about topic number ${_} in the history of computing." }) } | ConvertTo-Json -Depth 5
+            }
+
+            # Fired together, not staggered: with --queue-capacity 1 the channel holds one job beyond
+            # whatever the worker has already dequeued, so at most two of these three can ever be
+            # admitted regardless of arrival order. The third's rejection is decided synchronously against
+            # the channel's own TryWrite (GenerationScheduler.ScheduleAsync) before any generation starts,
+            # so which one is rejected is not deterministic, but that at least one of three is, is.
+            $pending = $bodies | ForEach-Object { Start-JsonRequest '/v1/chat/completions' $_ $auxBase }
+            $completed = @($pending | ForEach-Object { Complete-JsonRequest $_ })
+
+            $rejected = @($completed | Where-Object { $_.StatusCode -eq 429 })
+            $ok = @($completed | Where-Object { $_.StatusCode -eq 200 })
+            if (($ok.Count + $rejected.Count) -ne $completed.Count) {
+                throw "unexpected status code(s) among the three: $(($completed | ForEach-Object StatusCode) -join ',')"
+            }
+            if ($rejected.Count -eq 0) {
+                throw "none of 3 concurrent requests against --queue-capacity 1 got 429; got $(($completed | ForEach-Object StatusCode) -join ',')"
+            }
+
+            foreach ($r in $rejected) {
+                if (-not $r.RetryAfter) { throw "429 carried no Retry-After header: $($r.Body)" }
+                $e = $r.Json.error
+                if ($e.type -ne 'rate_limit_error') { throw "429 error.type=$($e.type), expected rate_limit_error" }
+                if ($e.code -ne 'queue_full') { throw "429 error.code=$($e.code), expected queue_full" }
+                if ([string]::IsNullOrEmpty($e.message)) { throw '429 error carried no message' }
+            }
+            foreach ($r in $ok) {
+                if (-not $r.Json.choices[0].message.content) { throw "an admitted request returned empty content: $($r.Body)" }
+            }
+
+            "of 3 concurrent requests against --queue-capacity 1: $($ok.Count) admitted (HTTP 200), $($rejected.Count) rejected (HTTP 429, Retry-After=$($rejected[0].RetryAfter)s, error.type=rate_limit_error, error.code=queue_full)"
+        }
+        finally {
+            Stop-AuxServer $auxProcess $auxPort 'queue-capacity-1'
         }
     }
 
