@@ -28,8 +28,9 @@ namespace NpuBridge.Api;
 ///   <item>A job cancelled while still queued completes its caller as
 ///   <see cref="ScheduleResultKind.Cancelled"/> the instant its token fires, without ever invoking its
 ///   body: the model is never touched for work nobody is waiting for, and the caller does not wait for
-///   the worker to drain to its position first. The queue slot itself is freed only when the worker
-///   reaches it (deferred; see the fix report).</item>
+///   the worker to drain to its position first. <see cref="QueueDepth"/> also stops counting it at that
+///   same instant (fix round 1, Finding 3) rather than only once the worker drains to it; the channel
+///   slot itself is still held until then, which is invisible to every caller of this class.</item>
 ///   <item>An enqueue attempt after the scheduler has started shutting down is
 ///   <see cref="ScheduleResultKind.Cancelled"/>, not <see cref="ScheduleResultKind.Rejected"/>: a
 ///   stopped scheduler is never coming back to honour a <c>Retry-After</c>.</item>
@@ -63,6 +64,20 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
     private Task _worker = Task.CompletedTask;
     private bool _disposed;
 
+    /// <summary>
+    /// Jobs genuinely waiting on the worker right now, live (fix round 1, Finding 3): incremented once a
+    /// job is actually written to <see cref="_queue"/>, decremented the instant it stops being something
+    /// the worker still needs to get to -- either because its own caller cancelled it while it was still
+    /// queued, or because the worker dequeued it. Deliberately not <c>_queue.Reader.Count</c>: that count
+    /// only shrinks when the worker drains to a cancelled job's position, so a caller that enqueues,
+    /// times out and retries several times against one long generation used to leave every one of those
+    /// dead jobs occupying a slot for the generation's whole duration -- shedding load the bridge had
+    /// already stopped waiting for, and inflating <see cref="ComputeRetryAfterSeconds"/> off the same
+    /// stale number. See <see cref="QueuedJob{TResult}.LeaveQueueIfNeeded"/> for how exactly-once is
+    /// guaranteed between those two triggers.
+    /// </summary>
+    private int _liveQueueDepth;
+
     public GenerationScheduler(BridgeOptions options, TimeProvider time, ILogger<GenerationScheduler> logger)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -82,8 +97,13 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
         });
     }
 
-    /// <summary>Jobs waiting for the worker right now — dequeued and running does not count. Read by <c>/healthz</c> (Task 2).</summary>
-    public int QueueDepth => _queue.Reader.Count;
+    /// <summary>
+    /// Jobs waiting for the worker right now — dequeued and running does not count, and (fix round 1,
+    /// Finding 3) neither does a job whose own caller has already cancelled it while it was still
+    /// queued: this is <see cref="_liveQueueDepth"/>, not <c>_queue.Reader.Count</c>. Read by
+    /// <c>/healthz</c> (Task 2) and by <see cref="ComputeRetryAfterSeconds"/>.
+    /// </summary>
+    public int QueueDepth => Volatile.Read(ref _liveQueueDepth);
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -164,7 +184,8 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(operation);
 
-        var job = new QueuedJob<TResult>(operation, _time.GetUtcNow(), _time, cancellationToken);
+        var job = new QueuedJob<TResult>(operation, _time.GetUtcNow(), _time,
+            onLeftQueue: () => Interlocked.Decrement(ref _liveQueueDepth), cancellationToken);
 
         // Controller ruling, fix-round-1 finding 3: complete the caller the moment its own token fires
         // rather than leaving it to wait for the worker to drain to this job's position in the queue.
@@ -178,6 +199,12 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
 
         if (_queue.Writer.TryWrite(job))
         {
+            // Only from here on does this job count toward QueueDepth (Finding 3): before this line the
+            // cancellation callback above could have already fired (a token already cancelled when
+            // ScheduleAsync was called runs its UnsafeRegister callback inline) and found nothing to
+            // decrement, correctly, since MarkEnteredQueue had not run yet.
+            Interlocked.Increment(ref _liveQueueDepth);
+            job.MarkEnteredQueue();
             return job.Completion.Task;
         }
 
@@ -283,15 +310,30 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
         private readonly Func<CancellationToken, Task<TResult>> _operation;
         private readonly TimeProvider _time;
         private readonly CancellationToken _cancellationToken;
+        private readonly Action _onLeftQueue;
         private CancellationTokenRegistration _cancellationRegistration;
         private int _dequeued;
 
-        public QueuedJob(Func<CancellationToken, Task<TResult>> operation, DateTimeOffset enqueuedAt, TimeProvider time, CancellationToken cancellationToken)
+        // Fix round 1, Finding 3. Two separate flags, not one: _queueDepthArmed only becomes true after
+        // this job is actually written to the channel (set by MarkEnteredQueue, called right after a
+        // successful TryWrite), so the cancellation callback below -- armed before TryWrite is even
+        // attempted, and able to fire synchronously inline if the caller's token is already cancelled at
+        // the moment ScheduleAsync is called -- cannot decrement a counter this job was never added to.
+        // _queueDepthClaimed is the exactly-once gate once armed: whichever of "cancelled while still
+        // queued" (the callback) or "dequeued" (MarkDequeued) reaches it first is the one that actually
+        // calls _onLeftQueue, mirroring the same race _dequeued already coordinates for who owns
+        // completing the job, but as a separate piece of state so the counter never depends on which of
+        // the two obligations happened to run first.
+        private int _queueDepthArmed;
+        private int _queueDepthClaimed;
+
+        public QueuedJob(Func<CancellationToken, Task<TResult>> operation, DateTimeOffset enqueuedAt, TimeProvider time, Action onLeftQueue, CancellationToken cancellationToken)
         {
             _operation = operation;
             EnqueuedAt = enqueuedAt;
             _time = time;
             _cancellationToken = cancellationToken;
+            _onLeftQueue = onLeftQueue;
         }
 
         public TaskCompletionSource<ScheduleResult<TResult>> Completion { get; } =
@@ -301,7 +343,33 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
 
         public bool IsCancellationRequested => _cancellationToken.IsCancellationRequested;
 
-        public void MarkDequeued() => Volatile.Write(ref _dequeued, 1);
+        /// <summary>Called once, right after a successful <c>TryWrite</c> -- arms <see cref="LeaveQueueIfNeeded"/> to actually decrement the live counter this job was just added to.</summary>
+        public void MarkEnteredQueue() => Volatile.Write(ref _queueDepthArmed, 1);
+
+        public void MarkDequeued()
+        {
+            Volatile.Write(ref _dequeued, 1);
+            LeaveQueueIfNeeded();
+        }
+
+        /// <summary>
+        /// Decrements the scheduler's live queue-depth counter exactly once for this job, and only if it
+        /// was ever counted at all (<see cref="_queueDepthArmed"/>) -- never for a job whose enqueue
+        /// attempt failed (queue full), even if the cancellation callback below happened to fire in the
+        /// narrow window before that failure was known.
+        /// </summary>
+        private void LeaveQueueIfNeeded()
+        {
+            if (Volatile.Read(ref _queueDepthArmed) == 0)
+            {
+                return;
+            }
+
+            if (Interlocked.CompareExchange(ref _queueDepthClaimed, 1, 0) == 0)
+            {
+                _onLeftQueue();
+            }
+        }
 
         /// <summary>
         /// Completes <see cref="Completion"/> as <see cref="ScheduleResultKind.Cancelled"/> the instant
@@ -342,6 +410,11 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
                 var queueWait = job._time.GetUtcNow() - job.EnqueuedAt;
                 job.Completion.TrySetResult(ScheduleResult.Cancelled<TResult>(queueWait));
 
+                // Fix round 1, Finding 3: this job is no longer something the worker still needs to
+                // reach, so it stops counting toward QueueDepth right now rather than whenever the
+                // worker eventually drains to it.
+                job.LeaveQueueIfNeeded();
+
                 // Safe to dispose the registration from inside its own callback: it is already
                 // running, so this only stops it from being disposed again later and releases the
                 // token's reference to it.
@@ -373,7 +446,17 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
             }
             catch (OperationCanceledException) when (_cancellationToken.IsCancellationRequested)
             {
-                Completion.TrySetResult(ScheduleResult.Cancelled<TResult>(queueWait));
+                // Fix round 1, Finding 1: this operation was invoked -- RunAsync only ever runs after
+                // the worker's own IsCancellationRequested check found the token still live at dequeue
+                // (otherwise the job took the Drop path below instead) -- and it ended by throwing for
+                // its own token rather than reporting a domain result. That is a real thing that
+                // happened to a running generation, not "the scheduler never got to this job", and a
+                // caller must be able to tell the two apart (Cancelled with Ran false is Drop's; Ran
+                // true is this one) rather than reporting both as the same benign "dropped while
+                // queued" -- which is what let an adapter that breaks the no-raw-cancellation contract
+                // (D82) come back as an incorrectly cheerful "the queue is shutting down" instead of the
+                // failure it is.
+                Completion.TrySetResult(ScheduleResult.Cancelled<TResult>(queueWait, ran: true));
             }
             catch (Exception ex)
             {
@@ -411,12 +494,13 @@ public enum ScheduleResultKind
 /// </summary>
 public sealed class ScheduleResult<TResult>
 {
-    internal ScheduleResult(ScheduleResultKind kind, TResult? result, TimeSpan queueWait, int retryAfterSeconds)
+    internal ScheduleResult(ScheduleResultKind kind, TResult? result, TimeSpan queueWait, int retryAfterSeconds, bool ran)
     {
         Kind = kind;
         Result = result;
         QueueWait = queueWait;
         RetryAfterSeconds = retryAfterSeconds;
+        Ran = ran;
     }
 
     public ScheduleResultKind Kind { get; }
@@ -432,6 +516,21 @@ public sealed class ScheduleResult<TResult>
 
     /// <summary>Whole seconds for the <c>Retry-After</c> header. Zero when <see cref="Kind"/> is not <see cref="ScheduleResultKind.Rejected"/>.</summary>
     public int RetryAfterSeconds { get; }
+
+    /// <summary>
+    /// True once the worker actually invoked the caller's operation. Always true on
+    /// <see cref="ScheduleResultKind.Completed"/>; on <see cref="ScheduleResultKind.Cancelled"/> it is
+    /// what tells apart a job the worker never got to run at all (dropped while still queued, or a
+    /// post-shutdown enqueue -- <c>false</c>, nothing touched the model) from one that ran and ended by
+    /// throwing <see cref="OperationCanceledException"/> for its own token instead of reporting a
+    /// domain result (<c>true</c> -- something real happened to a live generation, most plausibly a
+    /// backend adapter letting the runtime's own cancellation escape rather than reporting a
+    /// <c>Cancelled</c> status, which is exactly the contract violation D82 exists to answer). Always
+    /// <c>false</c> on <see cref="ScheduleResultKind.Rejected"/>: the queue was full, and nothing ran.
+    /// Added fix round 1, Finding 1, after both kinds of <c>Cancelled</c> looked identical to a caller
+    /// and a job that ran and threw was reported as the queue merely being busy.
+    /// </summary>
+    public bool Ran { get; }
 }
 
 /// <summary>
@@ -442,11 +541,16 @@ public sealed class ScheduleResult<TResult>
 public static class ScheduleResult
 {
     public static ScheduleResult<TResult> Completed<TResult>(TResult result, TimeSpan queueWait) =>
-        new(ScheduleResultKind.Completed, result, queueWait, 0);
+        new(ScheduleResultKind.Completed, result, queueWait, 0, ran: true);
 
-    public static ScheduleResult<TResult> Cancelled<TResult>(TimeSpan queueWait) =>
-        new(ScheduleResultKind.Cancelled, default, queueWait, 0);
+    /// <param name="ran">
+    /// True only from <see cref="GenerationScheduler"/>'s own worker, for a job whose operation was
+    /// invoked and ended by throwing <see cref="OperationCanceledException"/> for its own token. Every
+    /// other caller (a job dropped while still queued, or a post-shutdown enqueue) leaves this false.
+    /// </param>
+    public static ScheduleResult<TResult> Cancelled<TResult>(TimeSpan queueWait, bool ran = false) =>
+        new(ScheduleResultKind.Cancelled, default, queueWait, 0, ran);
 
     public static ScheduleResult<TResult> Rejected<TResult>(int retryAfterSeconds) =>
-        new(ScheduleResultKind.Rejected, default, TimeSpan.Zero, retryAfterSeconds);
+        new(ScheduleResultKind.Rejected, default, TimeSpan.Zero, retryAfterSeconds, ran: false);
 }

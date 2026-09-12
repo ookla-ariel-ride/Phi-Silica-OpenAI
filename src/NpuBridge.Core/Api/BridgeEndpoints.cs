@@ -66,15 +66,15 @@ internal static class FallbackEndpoint
 
 /// <summary>Wire shape of <c>GET /healthz</c>. Property names become snake_case on the wire.</summary>
 /// <param name="QueueDepth">
-/// <see cref="GenerationScheduler.QueueDepth"/> as-is (chunk 8): jobs waiting for the worker right now,
-/// dequeued-and-running excluded. A job whose own request was cancelled while still queued completes
-/// its caller immediately but still occupies this count until the worker drains to it and drops it, so
-/// this can read one or two higher than "callers still waiting" for a moment after a client gives up.
-/// Reporting a count that excludes those would need the scheduler to track cancellation state per
-/// queued job without dequeuing it, which <see cref="System.Threading.Channels.Channel{T}"/> has no way
-/// to do short of adding bookkeeping to code that has already been through two adversarial review
-/// rounds for a health metric nobody polls faster than the queue itself drains; not done, recorded here
-/// as the ruling (task-2-brief.md's "controller ruling carried into this task").
+/// <see cref="GenerationScheduler.QueueDepth"/> (chunk 8): callers still genuinely waiting for the
+/// worker right now — dequeued-and-running excluded, and a job whose own request was already cancelled
+/// while queued excluded too, from the instant its token fired rather than from whenever the worker
+/// drains to it (fix round 1, Finding 3). That distinction is not cosmetic, which is why the
+/// scheduler keeps a live counter rather than reading the channel's own count: a client that issues and
+/// abandons requests against one long generation would otherwise fill every slot with jobs nobody is
+/// waiting for, shedding load for the rest of that generation and inflating the <c>Retry-After</c>
+/// computed off the same number. The channel slot itself is still held until the worker reaches it,
+/// which no caller of the scheduler can observe.
 /// </param>
 public sealed record HealthResponse(
     string Status,
