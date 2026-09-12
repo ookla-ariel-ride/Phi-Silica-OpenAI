@@ -265,8 +265,12 @@ public class ContextCacheEndpointTests
     public async Task Two_concurrent_requests_for_one_conversation_never_share_a_context()
     {
         // Both start before either finishes: the first checks the context out, the second misses and
-        // creates its own. Both generations then complete with the same reply, so both are stored
-        // under the same key and the cache keeps one, disposing the other (D11 for the older).
+        // creates its own -- the context lookup itself is not queued, only the generation is (chunk 8,
+        // task-2-brief.md). What one worker forbids by construction is the two generations running at
+        // once: the second's call into the backend does not happen until the first's has completely
+        // ended, so it queues behind it instead of racing it. Both still complete with the same reply,
+        // so both are stored under the same key and the cache keeps one, disposing the other (D11 for
+        // the older) -- exactly the cache and leak claims this test made before chunk 8.
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["same"], FirstTokenGate = gate });
         await using var host = await BridgeTestHost.StartAsync(fake);
@@ -283,18 +287,35 @@ public class ContextCacheEndpointTests
 
         var a = host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = conversation });
         var b = host.Client.PostAsJsonAsync(Path, new { model = "fake", stream = true, messages = conversation });
+
+        // Both requests reach the context lookup before either's generation runs, so both contexts
+        // exist right away: whichever of a/b gets there first checks the cached one out, and the other
+        // misses and creates a fresh one.
+        await TestWait.UntilAsync(() => fake.ContextsCreated == 2);
+        Assert.Equal(0, host.Cache.Count);
+
+        // Only one generation has actually reached the backend: the scheduler's one worker is holding
+        // it open at the gate, and the other is still behind it in the queue, never having touched the
+        // model. fake.Calls records a call the instant GenerateAsync is entered, before either gate, so
+        // this is the queueing itself under test -- not a race that happens not to have resolved yet.
+        await TestWait.UntilAsync(() => fake.Calls.Count == 2);
+        await TestWait.UntilAsync(() => host.Scheduler.QueueDepth == 1);
+        Assert.Equal(2, fake.Calls.Count);
+
+        // Release the gate: the running generation completes, the worker moves on to the one that was
+        // queued behind it, and that call reaches the model too -- the same gate, already open by then,
+        // does not hold it.
+        secondGate.SetResult();
+        var responses = await Task.WhenAll(a, b);
+        Assert.All(responses, r => Assert.Equal(HttpStatusCode.OK, r.StatusCode));
+        await Task.WhenAll(responses.Select(r => r.Content.ReadAsStringAsync()));
+
         await TestWait.UntilAsync(() => fake.Calls.Count == 3);
 
         // One of them is on the cached context, the other on a fresh one.
         Assert.Equal(2, fake.ContextsCreated);
         Assert.NotEqual(fake.Calls[1].ContextId, fake.Calls[2].ContextId);
         Assert.Contains(fake.Calls[0].ContextId, new[] { fake.Calls[1].ContextId, fake.Calls[2].ContextId });
-        Assert.Equal(0, host.Cache.Count);
-
-        secondGate.SetResult();
-        var responses = await Task.WhenAll(a, b);
-        Assert.All(responses, r => Assert.Equal(HttpStatusCode.OK, r.StatusCode));
-        await Task.WhenAll(responses.Select(r => r.Content.ReadAsStringAsync()));
 
         await TestWait.UntilAsync(() => fake.ContextsDisposed == 1);
         Assert.Equal(1, host.Cache.Count);

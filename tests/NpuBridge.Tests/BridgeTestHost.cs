@@ -43,6 +43,9 @@ internal sealed class BridgeTestHost : IAsyncDisposable
 
     public ContextCache Cache => _app.Services.GetRequiredService<ContextCache>();
 
+    /// <summary>Chunk 8: the one queue every generation (both response shapes, and <c>/debug/generate</c>) goes through.</summary>
+    public GenerationScheduler Scheduler => _app.Services.GetRequiredService<GenerationScheduler>();
+
     /// <summary>
     /// The leak invariant since chunk 5: every context the fake created is either in the cache or
     /// disposed, and nothing is both. Before the cache, "no leak" meant "all disposed"; a successful
