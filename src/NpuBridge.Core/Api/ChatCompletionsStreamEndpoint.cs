@@ -81,15 +81,15 @@ internal sealed class ChatCompletionsStreamEndpoint
         // stop string can straddle two deltas, and a delta already written cannot be recalled.
         var cutter = new OutputCutter(prepared.Limits);
 
-        // Whether a delta ever arrived, which is not the same question as "has anything been written":
-        // a keep-alive comment starts the stream without opening the assistant message, and a reply with
-        // no deltas at all still needs its role chunk before the finish chunk. Declared out here because
-        // the loop below may run more than once and the answer that matters is the last attempt's.
+        // Whether a delta ever arrived. Declared out here only so the retry loop can reassign it; every
+        // read is inside the loop.
         var streamed = false;
 
-        // Whether the assistant message has been opened. D81 removed this because it was always equal
-        // to `streamed` at its only read; chunk 7 breaks that equality, because a buffered reply sees
-        // deltas without writing anything, so the role chunk is deferred to the tail.
+        // Whether the assistant message has been opened, which is a different question: a keep-alive
+        // comment starts the stream without opening it, and a reply with no deltas at all still needs
+        // its role chunk before the finish chunk. D81 removed this flag because it was then always
+        // equal to `streamed` at its only read; chunk 7 breaks that equality, because a buffered reply
+        // sees deltas without writing anything and defers the role chunk to the tail.
         var roleSent = false;
 
         // With tools offered, nothing goes out until the reply is whole: only a finished reply can be
@@ -172,7 +172,7 @@ internal sealed class ChatCompletionsStreamEndpoint
                     // streamed one is; what it releases is accumulated rather than written, and read
                     // from EmittedText in the tail.
                     if (await DrainBufferedAsync(sse, channel.Reader, cutter, streaming, generationCts,
-                            logger, requestId, cancelledByCut, aborted).ConfigureAwait(false))
+                            logger, requestId, aborted).ConfigureAwait(false))
                     {
                         cancelledByCut = true;
                     }
@@ -335,9 +335,14 @@ internal sealed class ChatCompletionsStreamEndpoint
                 // One chunk carrying the whole array, arguments included, then the finish chunk — the
                 // shape OpenAI produces when it sends arguments in one piece. There is nothing to
                 // stream: the bridge cannot know a reply is a call until the model has stopped.
-                finishReason = "tool_calls";
+                //
+                // The cut keeps its label. A budget that fired produced a call out of a reply the
+                // model had not finished, and saying "tool_calls" would tell a client that resumes on
+                // "length" that there was nothing left to resume. Both facts reach it: the calls are
+                // sent, and the finish reason still says the text was truncated.
+                finishReason = cutter.FinishReason ?? "tool_calls";
                 await sse.WriteChunkAsync(Chunk(requestId, created, model, includeUsage,
-                    new ChatCompletionDelta(null, null, toolCalls), finishReason: null), aborted).ConfigureAwait(false);
+                    new ChatCompletionDelta(null, null, Indexed(toolCalls)), finishReason: null), aborted).ConfigureAwait(false);
             }
             else if (buffering)
             {
@@ -459,6 +464,21 @@ internal sealed class ChatCompletionsStreamEndpoint
     private static string CacheLabel(ContextLease? lease) => lease is null ? "-" : lease.CacheHit ? "hit" : "miss";
 
     /// <summary>
+    /// The calls with their positions, which only the streaming shape carries: a client assembles the
+    /// array across chunks by <c>index</c>, and OpenAI's non-streaming tool call has no such field.
+    /// </summary>
+    private static ChatCompletionToolCall[] Indexed(IReadOnlyList<ChatCompletionToolCall> calls)
+    {
+        var indexed = new ChatCompletionToolCall[calls.Count];
+        for (var i = 0; i < calls.Count; i++)
+        {
+            indexed[i] = calls[i].AtIndex(i);
+        }
+
+        return indexed;
+    }
+
+    /// <summary>
     /// Waits until either the first delta is queued (true) or the generation ended without producing one
     /// (false), emitting <c>: keep-alive</c> comments meanwhile. The first comment is the first byte of
     /// the response and commits the headers, so its delay answers a different question from the ones
@@ -555,7 +575,6 @@ internal sealed class ChatCompletionsStreamEndpoint
     /// that what the cutter releases is accumulated in it rather than written out. The caller reads it
     /// back from <c>EmittedText</c> once the flush has run.
     /// </summary>
-    /// <param name="alreadyCancelled">Whether the caller has already cancelled at the cut on an earlier attempt.</param>
     /// <returns>True when this drain cancelled the generation because the cut fired.</returns>
     private static async Task<bool> DrainBufferedAsync(
         SseStream sse,
@@ -565,7 +584,6 @@ internal sealed class ChatCompletionsStreamEndpoint
         CancellationTokenSource generationCts,
         ILogger logger,
         string requestId,
-        bool alreadyCancelled,
         CancellationToken cancellationToken)
     {
         var cancelled = false;
@@ -584,7 +602,7 @@ internal sealed class ChatCompletionsStreamEndpoint
             {
                 cutter.Accept(delta);
 
-                if (cutter.StopRequested && !alreadyCancelled && !cancelled)
+                if (cutter.StopRequested && !cancelled)
                 {
                     cancelled = true;
                     await GenerationPipeline.CancelGuardedAsync(generationCts, logger, requestId, "at the cut")

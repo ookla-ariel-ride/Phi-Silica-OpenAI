@@ -49,8 +49,9 @@ internal static class ToolCallParser
 {
     /// <summary>
     /// Reading JSON the way the model writes it: trailing commas after the last element are the most
-    /// common single defect in a small model's JSON, and a comment is free to allow. The depth cap is
-    /// well past any real tool argument and bounds the work a nested candidate can cost.
+    /// common single defect in a small model's JSON, and a comment is free to allow. The depth cap is well
+    /// past any real tool argument and fails a pathological nest fast; the scan in front of the parse is
+    /// what MaxCandidates bounds.
     /// </summary>
     private static readonly JsonDocumentOptions DocumentOptions = new()
     {

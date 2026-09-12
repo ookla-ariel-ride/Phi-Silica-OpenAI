@@ -64,17 +64,23 @@ public sealed record ChatCompletionDelta(
     IReadOnlyList<ChatCompletionToolCall>? ToolCalls = null);
 
 /// <summary>
-/// One tool call on the wire. <see cref="Index"/> is required on the streaming shape, where a client
-/// assembles calls across chunks by it; it is harmless on the non-streaming one and is written there
-/// too rather than kept as a second nearly-identical type.
+/// One tool call on the wire. <see cref="Index"/> exists only on the streaming shape, where a client
+/// assembles calls across chunks by it; OpenAI's non-streaming
+/// <c>ChatCompletionMessageToolCall</c> has just <c>id</c>, <c>type</c> and <c>function</c>, so it is
+/// null there and omitted. Writing it anyway was tidier by one type and wrong by D77, which is a
+/// decision to follow the schema's shapes exactly — a strict client generated from it rejects an
+/// unknown field.
 /// </summary>
 public sealed record ChatCompletionToolCall(
-    int Index,
+    int? Index,
     string Id,
     ChatCompletionFunctionCall Function)
 {
     [JsonPropertyName("type")]
     public string ToolType { get; init; } = "function";
+
+    /// <summary>The same call as the streaming shape sends it, carrying its position in the array.</summary>
+    public ChatCompletionToolCall AtIndex(int index) => this with { Index = index };
 }
 
 /// <summary><see cref="Arguments"/> is JSON <em>text</em>, per OpenAI's schema — never a nested object.</summary>

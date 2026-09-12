@@ -259,7 +259,12 @@ internal sealed class ChatCompletionsEndpoint
             if (toolCalls is not null)
             {
                 content = null;
-                finishReason = "tool_calls";
+
+                // The cut keeps its label, for the reason the streaming path gives: a budget that
+                // fired produced this call out of a reply the model had not finished, and saying
+                // "tool_calls" would tell a client that resumes on "length" there is nothing to
+                // resume. It still gets the calls.
+                finishReason = cut.FinishReason ?? "tool_calls";
             }
 
             // 8b. Back into the cache -- the rule is GenerationOutcome's, and the finally disposes every

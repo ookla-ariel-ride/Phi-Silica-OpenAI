@@ -47,8 +47,9 @@ internal static class ToolCallReply
             // what the prompt's tool marker then shows the model. Deliberately not derived from the
             // arguments: two identical calls in one reply are two calls, and a client matching results
             // to calls by id would collapse them.
+            // No index: that field belongs to the streaming shape, and the caller adds it there.
             calls[i] = new ChatCompletionToolCall(
-                i,
+                Index: null,
                 "call_" + Ulid.NewUlid(),
                 new ChatCompletionFunctionCall(parsed[i].Name, parsed[i].Arguments));
         }

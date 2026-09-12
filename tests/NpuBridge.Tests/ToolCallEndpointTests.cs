@@ -394,6 +394,133 @@ public class ToolCallEndpointTests
         Assert.EndsWith("data: [DONE]\n\n", text, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// <c>index</c> belongs to the streaming shape only. A client assembles the array across chunks by
+    /// it, and OpenAI's non-streaming tool call has just <c>id</c>, <c>type</c> and <c>function</c> —
+    /// so writing it on both was one type tidier and wrong by D77, which is a decision to follow the
+    /// schema's shapes exactly. A client generated from that schema rejects an unknown field.
+    /// </summary>
+    [Fact]
+    public async Task Index_is_written_on_the_streamed_call_and_omitted_from_the_json_one()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => [FencedCall] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var json = await PostAsync(host, Body(stream: false, tools: Weather));
+        Assert.False(json.GetProperty("choices")[0].GetProperty("message").GetProperty("tool_calls")[0]
+            .TryGetProperty("index", out _));
+
+        var text = await (await host.Client.PostAsJsonAsync(Path, Body(stream: true, tools: Weather))).Content.ReadAsStringAsync();
+        var streamed = Sse.Chunks(text)
+            .First(c => c.GetProperty("choices").GetArrayLength() > 0
+                && c.GetProperty("choices")[0].GetProperty("delta").TryGetProperty("tool_calls", out _))
+            .GetProperty("choices")[0].GetProperty("delta").GetProperty("tool_calls")[0];
+        Assert.Equal(0, streamed.GetProperty("index").GetInt32());
+    }
+
+    /// <summary>
+    /// A cut keeps its label even when what survived parses as a call. The budget fired, so the model
+    /// had not finished, and reporting <c>tool_calls</c> would tell a client that resumes on
+    /// <c>length</c> there is nothing left to resume. It gets both facts: the calls, and the truth
+    /// that the text was truncated.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_cut_that_still_parses_reports_length_rather_than_tool_calls(bool stream)
+    {
+        // The budget lands inside the trailing prose, after a complete call has already been written.
+        var reply = """{"tool_calls":[{"name":"get_weather","arguments":{"location":"Paris"}}]}""";
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => FakeBackend.Tokenize(reply + " and then some more words to overrun the budget") });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var body = new
+        {
+            model = "fake",
+            stream,
+            tools = Weather,
+            max_tokens = reply.Length / 4,
+            messages = new[] { new { role = "user", content = "weather in paris?" } },
+        };
+
+        var response = await host.Client.PostAsJsonAsync(Path, body);
+        var text = await response.Content.ReadAsStringAsync();
+
+        var finish = stream
+            ? Sse.Chunks(text)[^1].GetProperty("choices")[0].GetProperty("finish_reason").GetString()
+            : JsonDocument.Parse(text).RootElement.GetProperty("choices")[0].GetProperty("finish_reason").GetString();
+
+        Assert.Equal("length", finish);
+    }
+
+    /// <summary>
+    /// A filtered reply is never parsed, on either shape — it is the one path where withheld text
+    /// could come back as arguments the client would execute — and it reports no completion tokens,
+    /// because with tools present nothing was delivered before the filter was known.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_filtered_reply_with_tools_present_yields_no_call_and_no_delivered_tokens(bool stream)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => FakeBackend.Tokenize(FencedCall),
+            FailAfterTokens = 3,
+            FailureStatus = NpuBridge.Backends.GenerationStatus.ContentFiltered,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        if (stream)
+        {
+            var text = await (await host.Client.PostAsJsonAsync(Path, new
+            {
+                model = "fake",
+                stream = true,
+                tools = Weather,
+                stream_options = new { include_usage = true },
+                messages = new[] { new { role = "user", content = "weather in paris?" } },
+            })).Content.ReadAsStringAsync();
+
+            Assert.DoesNotContain("\"tool_calls\"", text, StringComparison.Ordinal);
+            Assert.Equal("content_filter", Sse.Chunks(text).Last(c => c.GetProperty("choices").GetArrayLength() > 0)
+                .GetProperty("choices")[0].GetProperty("finish_reason").GetString());
+
+            var usage = Sse.Chunks(text).Single(c => c.TryGetProperty("usage", out var u) && u.ValueKind == JsonValueKind.Object);
+            Assert.Equal(0, usage.GetProperty("usage").GetProperty("completion_tokens").GetInt32());
+        }
+        else
+        {
+            var body = await PostAsync(host, Body(stream: false, tools: Weather));
+            var choice = body.GetProperty("choices")[0];
+
+            Assert.Equal("content_filter", choice.GetProperty("finish_reason").GetString());
+            Assert.False(choice.GetProperty("message").TryGetProperty("tool_calls", out _));
+            Assert.Equal(0, body.GetProperty("usage").GetProperty("completion_tokens").GetInt32());
+        }
+
+        host.AssertNoLeak();
+    }
+
+    /// <summary>
+    /// <c>tool_choice: "none"</c> injects nothing, so a request carrying tools keys identically to the
+    /// same conversation without them — which is what "genuinely inert" has to mean once the block
+    /// lives in the system text.
+    /// </summary>
+    [Fact]
+    public async Task Tool_choice_none_keys_the_same_as_a_request_with_no_tools()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        await PostAsync(host, Body(stream: false, tools: Weather, toolChoice: "none"));
+        await PostAsync(host, Body(stream: false));
+
+        Assert.Equal(2, fake.Calls.Count);
+        Assert.Equal(fake.Calls[0].SystemPrompt, fake.Calls[1].SystemPrompt);
+        Assert.Equal(fake.Calls[0].Prompt, fake.Calls[1].Prompt);
+    }
+
     [Fact]
     public async Task A_tool_call_leaks_no_context_on_either_shape()
     {
