@@ -20,7 +20,7 @@ section used to duplicate actually lives; `docs/SESSION-HANDOFF.md` carries the 
 what to do next; `docs/FUTURE.md` holds deferred work. Read the handoff first; update DECISIONS and
 FUTURE whenever work changes a choice or defers something.
 
-Current state: 932 tests pass, `smoke.ps1 -Backend phi-silica` passes clean on hardware, and the
+Current state: 932 tests pass (last confirmed by CI on 2026-09-12), `smoke.ps1 -Backend phi-silica` passes clean on hardware, and the
 repository is `ookla-ariel-ride/npu-bridge`.
 
 Standing facts that will cost you a session if you do not know them:
@@ -100,7 +100,7 @@ the whole machine for several minutes: every generation then returns 502 `The RP
 unavailable` in 3 to 17 ms, `/healthz` still says `ready` (issue #30), a bridge restart does not clear
 it, and the host processes are protected so they cannot be killed. It self-heals after minutes. This is
 easy to trigger by accident, because tool emulation renders the tool block into the system text — a
-real agent's toolset is ~40 KB. Find limits with `POST /debug/tokenize`, not by sending the request.
+real agent's toolset is ~37 KB on the wire. Find limits with `POST /debug/tokenize`, not by sending the request.
 "RPC server is unavailable" persisting past one retry means this happened; wait it out.
 
 Aion's SDK NuGet is not on nuget.org. It comes from the sample repo's GitHub release

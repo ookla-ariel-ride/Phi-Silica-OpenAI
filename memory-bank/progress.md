@@ -36,8 +36,8 @@
 
 ## Not built yet
 - **No chunk is outstanding.** `docs/PLAN.md`'s eight chunks are all merged as of 2026-09-12. Remaining
-  work is GitHub issues: #24 to #28 from chunk 8, #14/#15/#16 from the coverage audit, #17, #19, #21,
-  #22, plus #2 and #11 for Aion.
+  work is GitHub issues: #24 to #28 from chunk 8, #29 to #31 from the issue #21 measurement, #14/#15/#16
+  from the coverage audit, #17, #19, #22, plus #2 and #11 for Aion.
 - Aion Instruct adapter hardware verification: the adapter merged 2026-09-11 (chunk 6, D66 to D70) but
   build 29648 never grants a main-package dynamic dependency execute access, so no Aion generation has
   run; issue #2 stays open. Aion Instruct itself ships in October/November 2026 as a model swap behind

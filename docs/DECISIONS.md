@@ -1771,6 +1771,11 @@ directory: the `AGENTS.md`/cwd context tier, at 46 KB the obvious suspect, is no
 That much is a designed 2x2 comparison. "Not the system prompt" is weaker — the two failing requests
 carried 55,663 and 8,061 characters of system message and both failed, which is consistent with it,
 but nothing captured what the successful `-t clarify` runs sent. `docs/CLIENTS.md` carries the table.
+The timings there are process wall-clock around the whole `hermes` invocation as read at the shell,
+rounded to the second on purpose: the first write-up quoted 13.1 s for two independent runs and
+38.9/33.6 s for the failing pair, while the request dumps' own timestamps put those failures at
+roughly 36 and 31 s. The tenth-of-a-second figures were never reconciled and are not reproducible
+from the evidence files, so the record keeps "about 13 s" and "~37 s / ~32 s" and nothing finer.
 
 One thing the wire dumps settle that the prose had guessed at: **neither captured request set
 `stream`**, so nothing on this branch exercised the buffered streaming branch on hardware (issue #31).
@@ -1847,7 +1852,11 @@ occupancy. The `SystemPromptPressure` dimension recorded only "called" and "righ
 argument claim covers the 96 calls where arguments were actually checked, not all of them. The
 schema-depth dimension is part of this: its first run recorded `Fidelity = False` across all six
 calls because of a probe bug (`param($args)` shadowing PowerShell's automatic variable), and the
-corrected re-run is what the 3/3 above refers to.
+corrected re-run is what the 3/3 above refers to. One more provenance note: the committed
+`scripts/tool-probe.ps1` is a later revision than the one that produced the dimension 1 to 4
+evidence files. It gained the rendered-character reporting for dimension 1 and D96's tokenize
+guards after those runs, so a re-run prints columns those files lack. The verdict columns (called,
+right tool, arguments valid, arguments correct) are unchanged by that, and the files stand.
 
 So **`--tool-schema full` should not be built** — compact rendering already consumes the window and a
 fuller form moves the boundary the wrong way. **Structured JSON output** (2.4.x stable, Phi Silica

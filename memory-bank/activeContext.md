@@ -1,11 +1,13 @@
 # Active Context: npu-bridge
 
-_Last updated: 2026-09-12, after the chunk 8 merge (D84 to D92). **All eight chunks of `docs/PLAN.md`
-are built and merged; the plan is complete.** Work from here is GitHub issues, not chunks._
+_Last updated: 2026-09-12 (evening), after PR #32 (issue #21 measured, D93 to D96) was fast-forward
+merged. **All eight chunks of `docs/PLAN.md` are built and merged; the plan is complete.** Work from
+here is GitHub issues, not chunks._
 
 ## Where we are
-`main` is on the chunk 8 merge (`2114c36`) plus the state-doc pass, the only branch, in sync with
-origin, tree clean. 932 tests pass, the solution builds with no warnings, CI is green.
+`main` is on the PR #32 fast-forward merge, in sync with origin. 932 tests pass (CI on PR #32,
+2026-09-12; not run locally that day because a live bridge held the exe), the solution builds with no
+warnings, CI is green. PR #32 changed no product code: `scripts/tool-probe.ps1` plus documents.
 `smoke.ps1 -Backend phi-silica` passed at the merge (28 PASS / 0 FAIL / 0 SKIP / 5 INFO, first
 attempt, no RPC flake) and again on 2026-09-12 after the folder rename and identity re-register:
 all steps passed, 0 skipped, 5 informational, no FAIL or WARN rows, `identity=True`, `queue_depth`
@@ -120,7 +122,7 @@ No chunk is outstanding. What remains is issues.
 - **#19:** two `identity.ps1` defects, both unreachable while the manifest stays at 0.1.0.0. Note that
   the folder rename has made `-Install` newly relevant even though the version has not moved. It was
   closed twice by accidental closing keywords in commit messages; check it is still open.
-- **#21:** measured 2026-09-12 (D93 to D96), closes when PR #32 lands. Compliance was not the problem —
+- **#21:** measured 2026-09-12 (D93 to D96), closed by the PR #32 merge. Compliance was not the problem —
   40/40 across 1 to 25 tools, 32/32 at up to 85 % occupancy deterministically. The hard case fails
   because a real agent's tool schemas alone are nearly three times the window. **Both design questions
   are answered: do not build `--tool-schema full`, and structured JSON output is not indicated for

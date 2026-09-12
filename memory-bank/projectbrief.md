@@ -64,8 +64,10 @@ LoRA adapters, Microsoft Store publication. Tracked in `docs/FUTURE.md`.
    that Aion Instruct itself ships in October/November 2026 as a model swap behind the Phi Silica API,
    so the flag change in goal 2 may end up being no change at all.
 7. Tool-calling emulation. **Done** (2026-09-11, D83). The honest reporting goal 5 asks for is the
-   smoke script's probe: 20/20 on one tool with one required string argument, and the many-tool case
-   named as unmeasured rather than assumed (issue #21).
+   smoke script's probe (20/20 on one tool with one required string argument) plus the issue #21
+   hard-case measurement (2026-09-12, D93 to D96): compliance held across 1 to 25 tools, deep schemas,
+   system-prompt pressure and 85 % window occupancy, with one hallucinated tool name under stochastic
+   sampling. What does not fit is a real agent's tool schemas, nearly 3x the window on their own.
 8. Concurrency/queueing, `/v1/completions`, client docs. **Done** (2026-09-12, D84 to D92). The
    scheduler serializes the shared model handle rather than only the generation, because the cache
    lookup and the preflight are calls on that handle too (D84).
@@ -78,8 +80,9 @@ tool-detection path would be a caller of it and not a third copy, and the three 
 from the 2026-09-10 review (D82; issue #10 closed), taken in the same window because two of them sat
 in the files D81 had just rewritten. Chunk 7 then landed the same day, and chunk 8 the next, which
 completes the plan. **All eight chunks are built and merged as of 2026-09-12.** Remaining work is
-tracked as GitHub issues rather than chunks: #24 to #28 from chunk 8's own review, #14 to #16 from the
-coverage audit, #17, #19, #21, #22, and #2 and #11 for Aion.
+tracked as GitHub issues rather than chunks: #24 to #28 from chunk 8's own review, #29 to #31 from the
+issue #21 measurement (#29 is the model-host crash guard), #14 to #16 from the coverage audit, #17,
+#19, #22, and #2 and #11 for Aion.
 
 ## Repository
 `https://github.com/ookla-ariel-ride/npu-bridge` (renamed from `Phi-Silica-OpenAI` on 2026-09-11; the

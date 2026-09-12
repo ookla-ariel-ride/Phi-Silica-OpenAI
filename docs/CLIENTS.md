@@ -182,13 +182,14 @@ $env:HERMES_HOME = 'C:\some\scratch\hermes-home'   # fresh config root
 hermes -t clarify -z "What is 2+2? Answer with just the number." --safe-mode --cli
 ```
 
-That exact command answered `` `4` `` off the NPU in 13.1 s.
+That exact command answered `` `4` `` off the NPU in about 13 s of process wall-clock, measured at
+the shell around the whole `hermes` invocation rather than around the bridge request.
 
 ### The tool schemas are what will not fit
 
 This is the thing to understand before pointing Hermes at this bridge for real work. Phi Silica's
 usable window is **3,581 tokens**, and Hermes's tool-schema JSON for its full toolset is about
-**40 KB — roughly 10,000 tokens on its own**, nearly three times the entire window. Because tool
+**37 KB on the wire — roughly 10,000 tokens on its own**, nearly three times the entire window. Because tool
 emulation (D83) renders that block into the **system text**, a full-toolset Hermes does not merely
 overflow; it crosses the threshold where `CreateContext` throws, and the request comes back as a
 502 rather than a clean 400 (issue #29). Hermes then retries it three times, so one impossible
