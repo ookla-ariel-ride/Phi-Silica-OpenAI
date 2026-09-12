@@ -96,8 +96,9 @@ and it streams over server-sent events like any other OpenAI provider.
 `scripts/smoke.ps1 -Backend phi-silica` checks the whole surface against the hardware in three to
 five minutes: health with identity, both response shapes, the cut, the context cache, the overflow
 refusal and `--truncate-history` on a second server, the tokenizer against the model's own prompt
-limit, and at the end that the relaunched child process exited and the port is free. It starts and
-tears down three helper servers along the way, each with its own pass or fail row. Re-run
+limit, a tool-call probe over N runs (`-ToolProbeRuns`, five by default), and at the end that the
+relaunched child process exited and the port is free. It starts and tears down three helper servers
+along the way, each with its own pass or fail row. Re-run
 `identity.ps1 -Install` whenever the build output folder or the manifest changes.
 
 ## How a request travels
@@ -183,16 +184,43 @@ Silica, and `temperature` and `top_p` are range-checked as OpenAI's schema state
 `max_completion_tokens` and `stop` are enforced by the bridge, since neither Windows API offers them.
 The reply is cut at the limit, counted in the model's own tokens on Phi Silica, and the generation is
 cancelled there. Cancelling stops the accelerator: measured on the streaming path, a reply cut after
-four tokens finished in about a fifth of the time the same prompt took with a generous cap. An
-assistant message's `tool_calls` are carried and distinguish conversations in the cache, but tool
-calling itself is not emulated yet: `tools`, `tool_choice` and a few other parameters are accepted
-and ignored with one warning each per process. `n` above 1 is a 400, and so is `stream_options`
-without `stream: true`.
+four tokens finished in about a fifth of the time the same prompt took with a generous cap. `tools`
+and `tool_choice` drive the emulated function calling described below. `logprobs`, `response_format`,
+`seed`, `presence_penalty`, `frequency_penalty` and `user` are accepted and ignored, with one warning
+each per process. `n` above 1 is a 400, and so is `stream_options` without `stream: true`.
 
 The response and chunk objects carry every field OpenAI's schema requires, including the nullable ones
 (`logprobs`, `refusal`, a `finish_reason` on every streamed choice, and `"usage": null` on the chunks
 before the usage chunk when you ask for usage), so a client generated from the schema reads them
 without presence checks.
+
+## Tool calling
+
+Neither Windows API offers function calling, so the bridge emulates it. A request that carries `tools`
+gets a compact signature for each one, and the JSON envelope to answer in, appended to its system
+text; the reply is read back by a deliberately tolerant parser that accepts a fenced block, a
+`tool_calls` wrapper, a lone call object, a bare array, and single quotes on a last pass. What the
+parser cannot read comes back as ordinary content. A call the model did not mean is worse than a call
+missed, because the client's answer to a call is to run it.
+
+A reply that parses arrives as `message.tool_calls` with `content: null` and
+`finish_reason: "tool_calls"`. The call ids are the bridge's own, and a client that echoes them back
+unchanged finds its conversation in the context cache on the next turn. A tool name that was never
+offered is passed through for the client to reject. If `max_tokens` cut the reply short and it still
+parses, the calls are sent and `finish_reason` says `length`, so a client that resumes on truncation
+still knows to.
+
+With `tools` present a streamed reply is buffered whole before anything goes out, because nothing can
+tell a call from prose until the model has stopped; keep-alive comments hold the connection open
+meanwhile and the calls then arrive in a single chunk. Offering different tools makes a different
+conversation as far as the cache is concerned, since the instruction block is part of the system text.
+
+How well the model follows the protocol is its own business. Measured here on Phi Silica, twenty runs
+of a request offering one tool with one required string argument called the tool twenty times, with no
+prose, no protocol text leaking into the content and no invented tool name. That is the easy end of
+the problem: many tools, nested schemas and a long agent system prompt are not measured yet, and the
+expectation for that case is 60 to 80 %. `--tool-emulation off` turns the feature off for the process,
+`tool_choice: "none"` for one request.
 
 ## Configuration
 
@@ -208,6 +236,8 @@ everything.
 | `--truncate-history` | off | drop the oldest exchanges on overflow instead of returning 400 |
 | `--context-window-hint <tokens>` | `4096` | a warning is logged when a conversation reaches nine tenths of it; overflow itself is decided by the model's preflight |
 | `--system-prompt-placement auto\|native\|prompt` | `auto` | deliver the system message through the backend's own context, or fold it into the prompt text |
+| `--tool-emulation on\|off` | on | emulated function calling; `off` makes `tools` and `tool_choice` accepted-and-ignored again |
+| `--tool-schema compact\|full` | `compact` | compact signatures or whole JSON Schema in the injected block; full costs most of the window on a real tool set |
 | `--self-relaunch on\|off` | on | see the note below on why the process relaunches |
 | `--install-model` | off | let Phi Silica fetch its model through Windows Update if missing, several gigabytes |
 | `--verbose` | off | log the rendered prompt, the tail sent on a cache hit, and the raw model output |
@@ -215,8 +245,8 @@ everything.
 | `--laf-token`, `--laf-attestation` | none | unused on the experimental channel; prefer the settings file |
 | `--service-name`, `--task-name` | `NpuBridge`, `npu-bridge` | names for the service and logon task |
 
-`--queue-capacity`, `--tool-emulation` and `--tool-schema` are accepted and range-checked, but
-nothing reads them yet; setting one changes no behaviour.
+`--queue-capacity` is accepted and range-checked, but nothing reads it yet; setting it changes no
+behaviour.
 
 Secrets belong in `appsettings.local.json`, which is gitignored. A gitleaks pre-commit hook and a
 GitHub Actions workflow scan for them; enable the hook with `git config core.hooksPath .githooks`.
@@ -280,6 +310,7 @@ src/NpuBridge.Core/        logic, no WinRT references, tested without the NPU
   Hosting/                 DI wiring, sc.exe and schtasks command builders, process identity
   Prompting/               PromptTemplate (message flattening, tails), ConversationKey (the cache key)
   Tokenizers/              ITokenCounter; the Phi-3 counter and its vendored tokenizer.model; chars/4
+  Tools/                   the offered-tool catalog, the schema renderer, the tolerant call parser
 src/NpuBridge/             the ARM64 exe: Program.cs, PackageActivation, Supervisor, service and task verbs
   Backends/                PhiSilicaBackend, AionBackend, PackageDependency
 tests/NpuBridge.Tests/     xunit against the fake backend through TestServer
@@ -293,9 +324,9 @@ nuget-local/               where the Aion SDK nupkg goes (gitignored; the adapte
 
 Start with `docs/PLAN.md` for the design and the order remaining work lands in, `docs/DECISIONS.md`
 for why things are the way they are, and `docs/FUTURE.md` for what is deliberately not done.
-Remaining work, in order: a consolidation of the two endpoints' shared pipeline, tool-call
-emulation, then a request queue with `/v1/completions`. Each is a GitHub issue. The tests run against the fake backend and need no NPU; the smoke script is the
-hardware check.
+Remaining work: a request queue with `/v1/completions` and client documentation, the last chunk and a
+GitHub issue like the others. The tests run against the fake backend and need no NPU; the smoke script
+is the hardware check.
 
 ## References
 

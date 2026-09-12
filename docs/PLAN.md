@@ -1,8 +1,8 @@
 # npu-bridge — Plan
 
 OpenAI-compatible HTTP endpoint over the Copilot+ PC on-device language model (Phi Silica today,
-Aion Instruct Preview next). Status: **signed off (§4); chunks 1 to 6 of 8 built and merged (6 code-verified only, D70);
-chunk 7 next (real token counts landed as D80, the shared post-generation pipeline as D81, the 2026-09-10 review notes as D82).** This document is the historical design record and is not updated to match the code as it
+Aion Instruct Preview next). Status: **signed off (§4); chunks 1 to 7 of 8 built and merged (6 code-verified only, D70);
+chunk 8 next (real token counts landed as D80, the shared post-generation pipeline as D81, the 2026-09-10 review notes as D82, tool-call emulation as D83).** This document is the historical design record and is not updated to match the code as it
 ships — current state lives in `memory-bank/progress.md`, and decisions made since sign-off are in
 `docs/DECISIONS.md`.
 
@@ -391,7 +391,7 @@ build + tests green, an adversarial review pass, and updates to `DECISIONS.md` /
 | 4 | **Done.** **Streaming SSE.** Channel hand-off, chunk framing, `[DONE]`, mid-stream error event, disconnect → cancel + drain, keep-alive, `stream_options.include_usage`, `max_tokens`/`stop` client-side cut. | tests for framing, error, cancel timing | tok/s numbers, does `Cancel()` actually stop the NPU |
 | 5 | **Done (2026-09-11, D71 to D75).** **Context cache + overflow.** `ConversationKey` (length-prefixed encoding of `(system, turns)`, not the rendered prompt), `ContextCache` (LRU, exclusive checkout, disposal on eviction/replacement/shutdown), `ConversationSession`/`ContextLease` (lookup, tail rendering, preflight-driven overflow, the `--truncate-history` loop, status-driven retry without a preflight, the header, the pressure warning), `/healthz` cache fields, two smoke steps. | 462 tests incl. leak counting on the fake and both shapes | measured: hit TTFT 235 ms vs 392 ms replay; the preflight refuses 16.6K chars in 31 ms; truncation answers with the header |
 | 6 | **Done (code-verified only, 2026-09-11).** **Aion adapter.** `PackageDependency` (from the sample's `FrameworkDependency`), `AionBackend` behind a conditional SDK reference, `nuget-local/` with the 1.0.0 nupkg, shared `DeltaAccumulator` in Core, capability-profile tests, smoke script gains `-Backend aion`. Hardware half blocked by the OS on this machine (D70); issue #2 open for it. | 404 tests, CI without the nupkg | smoke test after `Bootstrap.ps1`-style framework install: not yet possible here |
-| 7 | **Tool emulation.** Injection, compact schema renderer, tolerant parser, response shaping, tool-result rendering, streaming buffering. Largest test file in the repo. | adversarial parser tests, end-to-end via scripted fake outputs | compliance probe in `smoke.ps1` |
+| 7 | **Done (2026-09-11, D83).** **Tool emulation.** Injection into the system text (so the cache key covers the tools offered), `ToolSchemaRenderer` (compact signatures by default), the tolerant `ToolCallParser`, `ToolCallReply` shaping both shapes, tool-call and tool-result rendering in the transcript, streaming buffered whole behind keep-alives. Five test files, 1,880 lines; the parser's 581 are the adversarial shapes. | 866 tests | measured: 20/20 runs called the tool, no prose, no leaked protocol, no unoffered tool, every argument valid JSON — on one tool with one required string argument; the 10-tool case is unmeasured (issue #21) |
 | 8 | **Concurrency + `/v1/completions` + docs.** Scheduler with bounded queue, 429 + `Retry-After`, queued-cancel, legacy endpoint, `CLIENTS.md` (OpenCode, Hermes, curl, Python), README. | queue tests with a slow fake | OpenCode/Hermes actually driving it |
 
 Chunks 2 and 6 are deliberately small; the point of doing 2 before 3 is that you can request the

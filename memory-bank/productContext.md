@@ -52,9 +52,20 @@ so those tools can run fully local, offline, and free.
   near the cap, because the exact cut cannot be placed until the text ends.
 - A system message is delivered to the model by default (`--system-prompt-placement auto`, native
   context when the backend supports one), and the model does follow it under both placements (D45).
-  `tools` and `tool_choice` are accepted but ignored until chunk 7; each warns once per process.
-- Once tool-call emulation ships (chunk 7), a request with `tools` will have its whole reply buffered
-  before streaming.
+- Tool calling is emulated (chunk 7, D83). A request carrying `tools` has a compact signature per
+  tool and the answer envelope appended to its system text, and the reply read back by a tolerant
+  parser; a reply that parses comes back as `message.tool_calls` with `content: null` and
+  `finish_reason: "tool_calls"`, one that does not comes back as ordinary content, never an error.
+  A tool name nobody offered is surfaced for the client to reject. A `max_tokens` cut that still
+  parses sends its calls with `finish_reason: "length"`, so a client that resumes on truncation
+  still knows to. With `tools` present a streamed reply is buffered whole behind keep-alive comments
+  and arrives in one chunk, because nothing can tell a call from prose until the model has stopped.
+  `--tool-emulation off` turns the feature off for the process, and only then are `tools` and
+  `tool_choice` reported as accepted-and-ignored with one warning each; `tool_choice: "none"` turns
+  it off for a single request and reports nothing. Measured on Phi Silica: twenty runs of a one-tool,
+  one-argument request called the tool twenty times; the many-tool agent case is unmeasured (issue
+  #21), and a zero-argument call written without the `tool_calls` wrapper reads as content (issue
+  #22).
 - A continuing conversation hits the context cache (`--context-cache-size`, default 4) and sends only
   its newest turns. The reply is the one a replay would give, sooner. Context overflow returns
   HTTP 400 `context_length_exceeded`, decided by the backend's preflight before any generation where

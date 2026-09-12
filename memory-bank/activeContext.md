@@ -1,16 +1,17 @@
 # Active Context: npu-bridge
 
-_Last updated: 2026-09-11, latest (D82 the three 2026-09-10 review notes merged, issue #10 closed;
-chunk 7 next)_
+_Last updated: 2026-09-11, latest (chunk 7 merged, D83 tool-call emulation, issue #3 closed;
+chunk 8 next and last)_
 
 ## Where we are
-Chunks 1 to 6 are merged on `main` (`43457c0`). Today added chunk 5 (context cache and overflow
+Chunks 1 to 7 are merged on `main` (`b7e4eb3`). Today added chunk 5 (context cache and overflow
 handling, D71 to D76), the OpenAI conformance pass (D77), D78, which closed issue #12 without a
 change, D79, the test hardening from the coverage audit (issue #15's first three smoke items
 and issue #14's first six tests), and D80, real token counts (issue #13 closed): `usage` and the
 `max_tokens` budget are Phi-3 tokens on Phi Silica, the preflight's byte answer is converted, chars/4
-stays on Aion and the fake. D81 then wrote the post-generation pipeline once, closing issue #9, and
-D82 took the three low-severity notes from the 2026-09-10 review, closing issue #10.
+stays on Aion and the fake. D81 then wrote the post-generation pipeline once, closing issue #9,
+D82 took the three low-severity notes from the 2026-09-10 review, closing issue #10, and chunk 7
+(D83) built tool-call emulation, closing issue #3. Chunk 8 is the only one left.
 Chunk 6, the Aion Instruct Preview adapter, is merged but code-verified only: build 29648
 never appends `WIN://SYSAPPID` for a main-package dynamic dependency, so the Qualcomm QNN provider
 cannot be image-mapped and no Aion generation has ever run here (D70; issue #2 open). Only `main`
@@ -22,14 +23,15 @@ Aion Instruct ships as a model swap behind the Phi Silica API (Microsoft's Phi S
 Feature Rollout with a registry key, retail in November with Phi Silica removed, no LAF token.
 `PhiSilicaBackend` is therefore the production Aion path. Details in `techContext.md`.
 
-657 tests pass. `scripts/smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648,
-including four teardown rows (main server plus three auxiliary servers) and the D80 tokenizer step
-(3581 / 3543 / 3581 tokens at the fox, JSON and CJK boundaries); the D81 run returned every one of
-those numbers again on the refactored pipeline, which the unit suite cannot check because it never
-sees a real backend, and the D82 run is what says the reordered `identity.ps1 -Install` still grants
-identity, since the run relaunches through package activation. `/healthz` is the readiness check,
-not the package list. The model runtime can fail its RPC channel on the first generation after start
-(seen twice now, 2026-09-11); the re-run is clean.
+866 tests pass. `scripts/smoke.ps1 -Backend phi-silica -ToolProbeRuns 20` passes every step on build
+29648 with nothing skipped for the first time, including four teardown rows (main server plus three
+auxiliary servers), the D80 tokenizer step (3581 / 3543 / 3581 tokens at the fox, JSON and CJK
+boundaries) and the chunk 7 tool probe (20/20 runs called the tool); the D81 run returned every one
+of those tokenizer numbers again on the refactored pipeline, which the unit suite cannot check
+because it never sees a real backend, and the D82 run is what says the reordered
+`identity.ps1 -Install` still grants identity, since the run relaunches through package activation.
+`/healthz` is the readiness check, not the package list. The model runtime can fail its RPC channel
+on the first generation after start (seen twice now, 2026-09-11); the re-run is clean.
 
 ## What today built
 - Chunk 5: `ConversationKey` (a length-prefixed encoding of `(system, turns)`, never the rendered
@@ -95,6 +97,20 @@ not the package list. The model runtime can fail its RPC channel on the first ge
   rebuild removes nothing at all, and remove-then-add survives as a fallback for a refused in-place
   update. The review's catch was in the test, not the code: see `systemPatterns.md` on why a
   disconnect never reaches either clause. Two `identity.ps1` defects went out as #19.
+- Chunk 7 (D83, issue #3): tool-call emulation on both response shapes. `Tools/ToolCatalog` reads
+  the offered tools (nested and flat forms, order preserved), `Tools/ToolSchemaRenderer` writes the
+  instruction block in compact signature form (`--tool-schema compact|full`), and
+  `PromptTemplate.Render` appends it to the *system text*, so `ConversationKey` covers which tools
+  were offered and two requests offering different ones cannot share a context. `Tools/ToolCallParser`
+  reads the reply back through five strategies (fence, `tool_calls` wrapper, unwrapped single call,
+  bare array, a relaxed single-quote pass) and never throws: anything it cannot read is content,
+  because a false positive is worse than a miss when the client's answer to a call is to run it.
+  `Api/ToolCallReply` shapes the result for both endpoints and computes what the cache stores. An
+  assistant turn's `tool_calls` render back into the transcript in the same envelope the model is
+  asked to produce; tool results render as `[Tool result: name (id)]`. With tools present the stream
+  buffers the whole reply behind keep-alives, then sends one chunk carrying the array and the finish
+  chunk. Off by three paths that are one code path: no tools, `tool_choice: "none"`,
+  `--tool-emulation off`. Measured on the NPU: 20/20 runs called the tool on a single-argument tool.
 - The README rewritten for chunk 5 and validated again (real layout, two Mermaid diagrams, a
   references section, no contributing section); a humanizer pass over the docs; the gitleaks path
   allowlists for docs removed (notes are scanned; a full-history scan is clean). After D79 the
@@ -113,19 +129,30 @@ not the package list. The model runtime can fail its RPC channel on the first ge
 - Issue #17: `BackendCapabilities.Cancellation` is advertised by `PhiSilicaBackend` and read by
   nobody. Report it on `/healthz`, read it in the fake, or drop it; split out of #9 because that was
   a no-behaviour-change consolidation.
-- Issue #19: two `identity.ps1` defects from the D82 review, both unreachable while the manifest
-  stays at 0.1.0.0. `Get-RegisteredPackage` sorts `Version` as the string it is, so `0.9.0.0`
-  outranks `0.10.0.0` and a bump can leave two registrations; and the superseded removal is
-  unguarded under `$ErrorActionPreference = 'Stop'`, so if a bump replaces the registration rather
-  than adding to it, the removal fails "not found" and kills the script after the install succeeded.
+- Issue #19 (closed on GitHub, and should not be: the D82 state commit quoted the phrase that had
+  already closed it once and closed it again): two `identity.ps1` defects from the D82 review, both
+  unreachable while the manifest stays at 0.1.0.0. `Get-RegisteredPackage` sorts `Version` as the
+  string it is, so `0.9.0.0` outranks `0.10.0.0` and a bump can leave two registrations; and the
+  superseded removal is unguarded under `$ErrorActionPreference = 'Stop'`, so if a bump replaces the
+  registration rather than adding to it, the removal fails "not found" and kills the script after the
+  install succeeded.
   D82's reordering is what made the first of those load-bearing. Doing the issue means bumping the
   manifest and measuring what a bump actually leaves registered.
 - D80 leftovers (`docs/FUTURE.md`): the pressure warning still measures characters against the hint
   × 4; Aion keeps chars/4 until a generation runs there; when Aion Instruct arrives behind the Phi
   Silica API, run the smoke's tokenizer step before trusting the counter for that model.
-- Chunk 7 (issue #3) is next. `ChatMessage.ToolCalls` is carried and keyed but not rendered. Its
-  buffered path is the third caller of the shared pipeline: it classifies through
-  `GenerationOutcome.Classify` and passes the cut's verdict in, rather than deciding either itself.
+- Chunk 8 (issue #4) is next and last: the generation scheduler with a bounded queue, 429 with
+  `Retry-After`, queued-cancel, `/v1/completions`, `docs/CLIENTS.md`. `--queue-capacity` is accepted
+  and range-checked today and read by nothing. The tool-buffered streaming path holds its context for
+  a whole generation, which is the longest wait the queue will have to explain.
+- Issue #21: tool-call compliance on the hard case (10-plus tools, nested schemas, a 3K-token agent
+  system prompt) is unmeasured. The smoke probe's 20/20 is one tool with one required string
+  argument, the easy end; PLAN's 60–80 % expectation is about the other. Its answer decides whether
+  `--tool-schema full` or structured JSON output (2.4.x stable, Phi Silica only) is worth building.
+- Issue #22: an unwrapped zero-argument call (`{"name":"get_time"}`) reads as content, because
+  outside a `tool_calls` wrapper an object needs both `name` and `arguments` or a sentence quoting
+  `{"name":"Ada"}` becomes a call. Accepted in D83 rather than fixed; the wrapper is what the
+  instruction asks for and what the model produced 20 times out of 20.
 - Chunk 5 deferrals (`docs/FUTURE.md`, chunk 5 section): mixed raw-then-markers format on a hit
   after a bare first message; the pressure warning cannot fire on Phi Silica at the default hint
   (the owner kept 4096); the header is lost on a stream that truncates after a keep-alive.
@@ -138,9 +165,9 @@ not the package list. The model runtime can fail its RPC channel on the first ge
 - Do not re-investigate the Aion blocker on this machine (D70).
 
 ## How to resume
-1. Read `CLAUDE.md`, then `docs/SESSION-HANDOFF.md`, then `docs/DECISIONS.md` D71 to D82 and the
-   chunk 5 section of `docs/FUTURE.md`.
-2. `dotnet build; dotnet test` (657). `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298` should
-   pass every step (1 skipped, 5 informational). Do not build while a smoke server is running.
-3. Chunk 7 (issue #3). Read the issue and its comments before starting, and D81 for the pipeline it
-   plugs into.
+1. Read `CLAUDE.md`, then `docs/SESSION-HANDOFF.md`, then `docs/DECISIONS.md` D71 to D83 and the
+   chunk 5 and chunk 7 sections of `docs/FUTURE.md`.
+2. `dotnet build; dotnet test` (866). `.\scripts\smoke.ps1 -Backend phi-silica -Port 5298` should
+   pass every step (0 skipped, 5 informational). Do not build while a smoke server is running.
+3. Chunk 8 (issue #4). Read the issue and its comments before starting, D81 for the pipeline the
+   scheduler wraps, and D83 for what the buffered tool path already holds a context through.

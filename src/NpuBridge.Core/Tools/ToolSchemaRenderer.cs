@@ -5,7 +5,8 @@ using NpuBridge.Configuration;
 namespace NpuBridge.Tools;
 
 /// <summary>
-/// Renders the tool instruction block that is prepended to the system section, in the exact wording
+/// Renders the tool instruction block that is appended to the system section, after the client's own
+/// system text, in the exact wording
 /// docs/PLAN.md section 2.6 item 1 fixes. The envelope line is a contract with the parser on the other
 /// side of the round trip: change it here and the tolerant parser's first branch stops matching what
 /// the model was told to produce.

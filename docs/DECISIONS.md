@@ -1383,8 +1383,8 @@ agent prompt. What 20/20 establishes is that a model this size understands the i
 compact signature form at all, and that the parser handles what it actually emits. The hard case is
 issue #21.
 
-**D83 review round (a Claude subagent and Codex, 2026-09-11).** Eleven findings, all real, listed in
-the merge commit. Both reviewers independently found the same one, and it is the one worth keeping in
+**D83 review round (a Claude subagent and Codex, 2026-09-11, then a whole-branch pass).** Fifteen
+findings across the three, all real; the fix commits list them. Both reviewers independently found the same one, and it is the one worth keeping in
 mind.
 
 **Every turn of an agent loop missed the cache.** The reply was stored with `Keep(result.Text)`, so
@@ -1420,4 +1420,35 @@ the operator's "is this feature on?" signal said the opposite of the truth the m
 shipped. The test that should have caught it asserted the list's contents and passed, because the
 stale entries were in the expected value; it now names each implemented parameter individually.
 
-859 tests.
+866 tests.
+
+**D83's two wire-visible decisions, which PLAN did not settle.** Both came out of the reviews and both
+differ from §2.6 item 4's letter, so they are recorded here rather than left in a commit message.
+
+**A cut that still parses reports `length`, not `tool_calls`.** PLAN says a tool-call reply finishes
+`tool_calls`, flatly. But a `max_tokens` budget that fired produced its call out of a reply the model
+had not finished — the cut may have landed after the first of two calls, or in the prose after one —
+and answering `tool_calls` tells a client that resumes on `length` there is nothing left to resume.
+The client gets both facts instead: the calls it can run, and the truth that the text was truncated.
+Both shapes do it, which was already true; what was missing was a decision about which label wins.
+
+**`index` is written only on the streaming shape.** OpenAI's `ChatCompletionMessageToolCall` has
+`id`, `type` and `function`; `index` exists only on the streamed delta, where a client assembles the
+array across chunks by it. Writing it on both was one type tidier and wrong by D77, which is a
+decision to follow the schema's shapes exactly — a client generated from that schema rejects an
+unknown field. `ChatCompletionToolCall.Index` is therefore nullable and omitted off the stream.
+
+**Accepted costs, both from the parser's declaration rule.** An unwrapped call with no arguments
+(`{"name":"get_time"}` for a zero-argument tool) is content, because outside a `tool_calls` wrapper an
+object needs both keys or a sentence quoting `{"name":"Ada"}` becomes a call. The wrapper is what the
+injected instruction asks for and what the model produced 20 times out of 20, so this bites only a
+reply that drops the wrapper *and* omits arguments; issue #22 carries the fix if it ever shows up. A
+bare array does not declare its elements either, for the same reason: `The staff list is
+[{"name":"Ada"}]` is a sentence, and brackets are punctuation the model did not have to mean.
+
+**The scan bound counts characters, not candidates.** A reply that is nothing but openers costs one
+scan to end-of-text per opener. Bounding the *number* of candidates punishes the wrong reply, because
+a code block is full of balanced braces that each cost only their own short span — an agent's reply
+would stop being searched partway through and a call after the code would be dropped. Unbalanced
+braces are what cost, and each spends the whole remaining text, so a character budget stops exactly
+them: 32 times the reply's length, with a floor for short replies.

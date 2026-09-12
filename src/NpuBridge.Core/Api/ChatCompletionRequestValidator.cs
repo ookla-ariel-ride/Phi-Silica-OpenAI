@@ -44,7 +44,15 @@ public static class ChatCompletionRequestValidator
 {
     private static readonly string[] KnownRoles = ["system", "developer", "user", "assistant", "tool"];
 
-    public static ChatCompletionValidationResult Validate(ChatCompletionRequest request)
+    /// <param name="toolEmulation">
+    /// Whether <c>--tool-emulation</c> is on. It decides one thing only: whether <c>tools</c> and
+    /// <c>tool_choice</c> are ignored parameters. Chunk 7 implements them, so they left the list — but
+    /// with emulation off they really are accepted and ignored, and that is the one configuration
+    /// where the operator most needs to be told, since it is the one they chose. Defaulted so the
+    /// dozens of tests that validate a request in isolation say nothing about a switch they do not
+    /// exercise.
+    /// </param>
+    public static ChatCompletionValidationResult Validate(ChatCompletionRequest request, bool toolEmulation = true)
     {
         ArgumentNullException.ThrowIfNull(request);
 
@@ -153,10 +161,10 @@ public static class ChatCompletionRequestValidator
         // And `tools` and `tool_choice` since chunk 7 (D83): the emulation reads both. The warning is
         // the operator's signal for "is this feature on?", so leaving them listed would have said the
         // opposite of the truth the moment the feature shipped.
-        return ChatCompletionValidationResult.Valid(CollectIgnoredParameters(request));
+        return ChatCompletionValidationResult.Valid(CollectIgnoredParameters(request, toolEmulation));
     }
 
-    private static List<string> CollectIgnoredParameters(ChatCompletionRequest request)
+    private static List<string> CollectIgnoredParameters(ChatCompletionRequest request, bool toolEmulation)
     {
         var ignored = new List<string>();
 
@@ -171,6 +179,8 @@ public static class ChatCompletionRequestValidator
         AddIfPresent(request.Temperature is not null, "temperature");
         AddIfPresent(request.TopP is not null, "top_p");
         AddIfPresent(request.TopK is not null, "top_k");
+        AddIfPresent(!toolEmulation && request.Tools is not null, "tools");
+        AddIfPresent(!toolEmulation && request.ToolChoice is not null, "tool_choice");
         AddIfPresent(request.Logprobs is not null, "logprobs");
         AddIfPresent(request.ResponseFormat is not null, "response_format");
         AddIfPresent(request.Seed is not null, "seed");

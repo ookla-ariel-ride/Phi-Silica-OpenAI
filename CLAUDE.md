@@ -13,7 +13,7 @@ fake backend for tests. Aion 1.0 Plan is a different model (14B, 32K context, na
 calling) with no SDK as of 2026-09-10; it is tracked as a GitHub issue, and a backend for it would
 bypass the tool-call emulation rather than use it.
 
-Status: `docs/PLAN.md` is the signed-off design (read it first). Chunks 1 to 6 of 8 are built and
+Status: `docs/PLAN.md` is the signed-off design (read it first). Chunks 1 to 7 of 8 are built and
 merged: skeleton, the Phi Silica adapter, non-streaming `POST /v1/chat/completions` with the prompt
 template, streaming over server-sent events with the client-side cut for `max_tokens`/`stop`, the
 context cache with overflow handling (chunk 5, merged 2026-09-11, D71 to D75: a continuing
@@ -44,16 +44,21 @@ failure/filtered/content for both shapes, so the D56 and D57 drifts cannot recur
 path's catch is the streaming path's pair, so a cancellation that is not the client's is a 502 with
 the ordinary body rather than a bare 500; `SseStream.Started` is the response's `HasStarted`, which
 turned out to be a simplification rather than the bug it was filed as; `identity.ps1 -Install` adds
-before it removes, so a failed install no longer leaves nothing registered; 657 tests). Issues #14,
-#15, #17 and #19 stay open for their remaining items. Next is chunk 7 (tool-call emulation, issue
-#3). The repository is
+before it removes, so a failed install no longer leaves nothing registered; 657 tests) and chunk 7,
+tool-call emulation (issue #3, closed, D83: `tools`/`tool_choice` produce OpenAI-shaped `tool_calls`
+on both shapes from a runtime with no native tool calling — an instruction block in the system text,
+the streamed reply buffered whole behind keep-alives, and a deliberately tolerant parser whose rule is
+that a false positive is worse than a miss; 866 tests, and the hardware probe called the tool 20 times
+out of 20 where PLAN predicted 60–80 %, on the easy single-tool case it asks). Issues #14, #15, #17,
+#19, #21 and #22 stay open for their remaining items. Next is chunk 8, the last one (concurrency
+scheduler and `/v1/completions`, issue #4). The repository is
 `ookla-ariel-ride/npu-bridge`; the local folder keeps its old name because package identity is
 registered against the build path.
 All four defects from the 2026-09-10 code review (#5 to #8) are fixed and merged (D62 to D65). The
 Insider flight to build 29661 broke Phi Silica and was rolled back to 29648; if it is offered again,
 expect the same (workload packages fail to register, model `NotReady`). An empty
 `Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'` listing is not proof of breakage on 29648;
-`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D82 so
+`/healthz` is the check. `docs/DECISIONS.md` records why things are the way they are (D1 to D83 so
 far); `docs/FUTURE.md` holds deferred work. Update both whenever a chunk changes a choice or defers
 something.
 
@@ -88,7 +93,7 @@ dotnet test --filter "DisplayName~Loading_backend"          # one test by name f
 dotnet run --project src/NpuBridge -- --backend fake --verbose   # run the exe (bin\Debug\...\win-arm64\NpuBridge.exe)
 .\scripts\identity.ps1 -Install                # sparse package identity for Phi Silica; installs the runtime dep; prints the PFN
 .\scripts\identity.ps1 -Status                 # is the package registered, which PFN
-.\scripts\smoke.ps1 -Backend phi-silica        # real NPU run: health, models, /debug/generate, chat (JSON and SSE), the cut, the cache hit, the overflow refusal and --truncate-history (on a second server), the D80 tokenizer boundary check, the D53/D55 measurements, teardown; the tool probe SKIPs until chunk 7
+.\scripts\smoke.ps1 -Backend phi-silica        # real NPU run: health, models, /debug/generate, chat (JSON and SSE), the cut, the cache hit, the overflow refusal and --truncate-history (on a second server), the D80 tokenizer boundary check, the D53/D55 measurements, the tool-call compliance probe (-ToolProbeRuns, default 5), teardown
 NpuBridge.exe task install|status|uninstall    # logon task that starts Phi Silica with identity (install/uninstall elevated)
 NpuBridge.exe service install|start|stop|uninstall   # Windows service for aion/fake (elevated)
 ```
@@ -125,8 +130,10 @@ Three projects, deliberately:
   `ContextLease`), and the token counters (`Tokenizers/`: `ITokenCounter`, `CharEstimateTokenCounter`,
   `Phi3TokenCounter` over the embedded Phi-3.5-mini `tokenizer.model`, D80; `Microsoft.ML.Tokenizers`
   is Core's only package reference).
-  Not built yet, so do not describe these as existing: tool-call emulation (chunk 7), generation
-  scheduler and `/v1/completions` (chunk 8).
+  the tool-call emulation (`Tools/`: `ToolCallParser`, `ToolCatalog`, `ToolSchemaRenderer`, plus
+  `Api/ToolCallReply`, D83).
+  Not built yet, so do not describe these as existing: the generation scheduler and `/v1/completions`
+  (chunk 8).
 - `src/NpuBridge` (net10.0-windows10.0.26100.0, ARM64 exe): `Program.cs`, config, service and task
   verbs, `PhiSilicaBackend`, `AionBackend` (behind a conditional SDK reference: when
   `nuget-local/` lacks the Aion nupkg the adapter is excluded and `--backend aion` explains why in
@@ -169,8 +176,9 @@ HTTP → ChatRequestPreparer (shared by both shapes): body → validate DTO → 
        the new key) or Dispose in the finally (stream: cancel → drain → settle, D51)
 ```
 
-No scheduler (chunk 8) and no tool-call parse (chunk 7) exist yet; nothing is queued, and two
-concurrent requests for one conversation each get their own context (the second misses).
+No scheduler (chunk 8) exists yet: nothing is queued, and two concurrent requests for one
+conversation each get their own context (the second misses). Tool-call emulation landed as D83 and
+adds a buffered branch to the streaming path when `tools` is present.
 
 ### Backend contract facts that must not be "simplified" away
 
@@ -234,14 +242,17 @@ concurrent requests for one conversation each get their own context (the second 
 - **The cache key is `ConversationKey`, never the rendered prompt (D71).** The three collision
   surfaces (unescaped turn markers, native placement dropping the system text from the prompt, the
   raw pass-through of a lone user message) are closed by a length-prefixed encoding of
-  `(system, turns)`; `ConversationKeyTests` pins each one both ways. Anything chunk 7 adds to a turn
-  (rendered tool calls, injected tool schemas in the system text) must enter the key through
+  `(system, turns)`; `ConversationKeyTests` pins each one both ways. Anything a turn gains must enter the key through
   `PromptTemplate.TurnText` or the system text, or a cached context will be handed to a conversation
-  the model never saw. Sampling parameters are deliberately not in the key.
-- **`ChatMessage.ToolCalls` is carried and keyed but not rendered.** An assistant message with
-  `content: null` and a `tool_calls` array keys as a distinct turn (D71) but still renders as an
-  empty turn in the prompt. Chunk 7 owns the rendering, and its stored key after a tool-call reply
-  must be computed from the parsed calls so a client that re-serialises our output still hits.
+  the model never saw. Chunk 7 did both: tool calls render into the turn body, and the injected tool
+  block is part of the system text (D83). Sampling parameters are deliberately not in the key.
+- **A tool-call reply is stored under what the client will send back, not under what the model wrote
+  (D83).** `ChatMessage.ToolCalls` renders into the turn body and `ConversationKey` hashes the array's
+  ids, names and arguments as fields of their own. So `ContextLease.Keep` stores the *calls*, not
+  `result.Text`: the context absorbed the fence and the prose around it, but the client returns an
+  assistant message with null content and the array this bridge emitted. Keyed by the text instead —
+  which is what it did first — every turn of an agent loop missed, which is the case the cache exists
+  for. The round trip holds only while the client echoes the `arguments` string byte for byte.
 - **Overflow is decided by the preflight where one exists (D73).** Phi Silica reports
   `PromptLargerThanContext` only sometimes (a prompt moderately over the window gets it in about
   600 ms; D55's 225 KB prompt got a generic `Error` after 26 s, D80), so `ConversationSession` asks
@@ -250,14 +261,14 @@ concurrent requests for one conversation each get their own context (the second 
   actual overflow status is still unmeasured (D70), so re-check that path when it runs. After a
   truncation the next request in that conversation misses and truncates again (`docs/FUTURE.md`).
 - **A context in the cache is never in use, and a context that failed is never in the cache (D72).**
-  Keep the lease discipline when chunk 7 buffers replies for tool detection: `Keep` only after the
-  generation task has ended `Complete` with the client-visible text equal to the backend's text;
-  everything else disposes. Chunk 8's scheduler may let the second concurrent request for one
+  `Keep` only after the generation task has ended `Complete` with the client-visible text equal to
+  the backend's text; everything else disposes. Chunk 7 buffers a reply for tool detection and still
+  obeys it. Chunk 8's scheduler may let the second concurrent request for one
   conversation wait for the first's context instead of missing.
 - **The post-generation pipeline is shared now, so a third caller uses it rather than copying it
   (D81).** `GenerationOutcome.Classify(result, cancelledByCut)` is the one place failure, filtered and
   content are told apart, and both shapes agree only because neither decides for itself. Chunk 7's
-  buffer-when-tools-present path calls it too, and supplies the cut's post-flush verdict as an
+  buffer-when-tools-present path calls it, and supplies the cut's post-flush verdict as an
   argument the way the other two do — the classifier reads no cutter, deliberately, because when that
   verdict is legible differs by shape (D57). `DeltaSink` takes a `ChannelWriter<string>` or a
   `CutWatcher` and never a delegate, so the callback provably cannot reach the response; a path that
@@ -333,13 +344,32 @@ Live today:
   reply outranks the cut. Both shapes cut through the same `OutputCutter`, so the same text always
   yields the same reply and finish reason.
 
+- **Tool calling is emulated (D83).** With `tools` present and `--tool-emulation on` (the default), an
+  instruction block naming the tools in a compact signature form (`--tool-schema compact|full`) is
+  appended to the **system text** — which is what puts it in the conversation key, so two requests
+  offering different tools cannot share a context. Offering no tools, `tool_choice: "none"` and
+  `--tool-emulation off` all disable it by one path, a null catalog, and a disabled request keys
+  identically to one that never mentioned tools. The streamed shape **buffers the whole reply** before
+  emitting anything, sending `: keep-alive` comments meanwhile, because only a finished reply can be
+  told from prose; then one chunk carrying the whole `tool_calls` array, then the finish chunk.
+  A parsed call is `message.tool_calls` with `content: null` and `finish_reason: "tool_calls"` — except
+  that a `max_tokens` cut which still parses reports `length` (the client gets the calls *and* the
+  truth that the text was truncated), and `index` is written only on the streaming shape, per OpenAI's
+  schema. Unknown tool names are surfaced, not filtered: the client decides.
+- **`ToolCallParser` never throws, and a false positive is worse than a miss** — the client's answer to
+  a call is to run it. Anything it cannot read is content. Its rules exist because each was violated:
+  an object that never declared itself a call needs both `name` and `arguments` (a fenced
+  `{"name":"Ada"}` became a call to a tool named Ada); `parameters` is accepted only inside a
+  `tool_calls` wrapper (outside one, `name` + `parameters` is the tool *definition* echoed back);
+  arguments supplied and unreadable drop the call rather than defaulting to `{}`; and a bare array
+  does not declare its elements. Its tests are the main regression guard for the feature — add to them
+  before changing it.
+
 Agreed design for chunks that have not landed. These rules are what each chunk must implement; none of
 it is current behaviour, so do not describe it as working:
 
-- **Chunk 7 (tool-call emulation)** will buffer the whole reply when `tools` is present, sending
-  keep-alive comments meanwhile, before deciding between content and `tool_calls`. Tool-call JSON
-  parsing is to be deliberately tolerant, and its parser tests are meant to be the main regression
-  guard for the feature.
+- **Chunk 8 (concurrency and `/v1/completions`)** will queue generations rather than letting two
+  concurrent requests each take their own context, and `--queue-capacity` will finally be read.
 
 ## Working method for this repo
 

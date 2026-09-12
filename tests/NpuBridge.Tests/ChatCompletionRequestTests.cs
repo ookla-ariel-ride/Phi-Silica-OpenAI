@@ -293,6 +293,35 @@ public class ChatCompletionRequestTests
         Assert.DoesNotContain("tool_choice", result.IgnoredParameters, StringComparer.Ordinal);
     }
 
+    /// <summary>
+    /// With <c>--tool-emulation off</c> the two really are accepted and ignored, so they go back on the
+    /// list. That is the one configuration where the operator most needs to be told, because it is the
+    /// one they chose — and the first version of this change dropped them unconditionally, which made
+    /// the signal say the opposite of the truth in exactly that case.
+    /// </summary>
+    [Fact]
+    public void Tools_are_reported_as_ignored_when_emulation_is_off()
+    {
+        var json = """
+            {
+                "model": "fake",
+                "messages": [{"role":"user","content":"hi"}],
+                "tools": [{"type":"function","function":{"name":"f"}}],
+                "tool_choice": "auto"
+            }
+            """;
+
+        var request = JsonSerializer.Deserialize<ChatCompletionRequest>(json, JsonDefaults.Options)!;
+
+        var off = ChatCompletionRequestValidator.Validate(request, toolEmulation: false);
+        Assert.Contains("tools", off.IgnoredParameters, StringComparer.Ordinal);
+        Assert.Contains("tool_choice", off.IgnoredParameters, StringComparer.Ordinal);
+
+        var on = ChatCompletionRequestValidator.Validate(request, toolEmulation: true);
+        Assert.DoesNotContain("tools", on.IgnoredParameters, StringComparer.Ordinal);
+        Assert.DoesNotContain("tool_choice", on.IgnoredParameters, StringComparer.Ordinal);
+    }
+
     [Fact]
     public void Stop_as_bare_string_and_as_array_normalize_to_same_list()
     {

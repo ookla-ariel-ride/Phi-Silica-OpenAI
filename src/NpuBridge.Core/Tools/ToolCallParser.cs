@@ -61,10 +61,14 @@ internal static class ToolCallParser
     };
 
     /// <summary>
-    /// How many balanced-span candidates one strategy will try before giving up and calling the reply
-    /// content. See <see cref="FirstCandidate"/> for why a bound is needed at all.
+    /// How much text one strategy will scan looking for a balanced span before giving up and calling
+    /// the reply content, as a multiple of the reply's own length plus a floor for short replies. See
+    /// <see cref="FirstCandidate"/> for why a bound is needed and why it counts characters rather than
+    /// candidates.
     /// </summary>
-    private const int MaxCandidates = 128;
+    private const int ScanBudgetPerCharacter = 32;
+
+    private const int MinimumScanBudget = 100_000;
 
     /// <summary>
     /// Non-ASCII is written through rather than escaped, so an emoji or a CJK argument stays legible
@@ -165,8 +169,13 @@ internal static class ToolCallParser
     /// The markers are not decoration. Requiring <c>"name"</c> and <c>"arguments"</c> together for
     /// the unwrapped single call is what PLAN §2.6 item 3 asks for, and it is what stops
     /// <c>{"name": "Ada"}</c> in a sentence about a person from becoming a call to a tool named Ada.
-    /// Inside a wrapper or an array the model has already declared what the object is, so
-    /// <see cref="ReadCall"/> accepts a call with no arguments there and supplies <c>{}</c>.
+    ///
+    /// Only a <c>tool_calls</c> wrapper declares its contents, and a bare array does not — deliberately.
+    /// An array is punctuation the model did not have to mean: <c>The staff list is [{"name":"Ada"}]</c>
+    /// is a sentence, and treating the brackets as a declaration puts that back to being a call. So a
+    /// bare array's elements face the same both-keys rule as a bare object, and only inside
+    /// <c>tool_calls</c> does <see cref="ReadCall"/> accept a call with no arguments and supply
+    /// <c>{}</c>.
     ///
     /// The comparison ignores case for the same reason the property lookup does: the markers stand in
     /// for property names, and the model capitalises them as it pleases.
@@ -183,20 +192,28 @@ internal static class ToolCallParser
         string text, char opener, bool preferEnclosingArray, string marker, params string[] anyOf)
     {
         // Each candidate is scanned to its closing brace, so a reply that is nothing but openers costs
-        // one scan per opener -- quadratic in a reply the model controls the length of. A call the
-        // model actually meant is among the first few openers; the hundredth is a reply that is not
-        // one. Bounding the attempts keeps a pathological reply from spending real CPU after the
-        // generation has already finished, and costs nothing on any reply that parses.
-        var attempts = 0;
+        // one scan to end-of-text per opener -- quadratic in a reply whose length the model controls,
+        // and paid after the generation has already finished.
+        //
+        // The bound counts characters scanned rather than candidates tried, because counting
+        // candidates punishes the wrong reply. A code block is full of braces, and they are balanced,
+        // so each one costs its own short span and nothing more; a candidate limit would stop looking
+        // partway through an ordinary reply from an agent toolset and silently drop a call that came
+        // after the code. Unbalanced braces are what actually cost, and each one spends the whole
+        // remaining text, so a character budget stops exactly them.
+        var budget = Math.Max(MinimumScanBudget, text.Length * ScanBudgetPerCharacter);
 
         for (var start = text.IndexOf(opener); start >= 0; start = text.IndexOf(opener, start + 1))
         {
-            if (++attempts > MaxCandidates)
+            var end = MatchingBrace(text, start);
+
+            // What that scan cost: to the closing brace, or to the end of the text when there is none.
+            budget -= end < 0 ? text.Length - start : end - start + 1;
+            if (budget < 0)
             {
                 return null;
             }
 
-            var end = MatchingBrace(text, start);
             if (end < 0)
             {
                 continue;

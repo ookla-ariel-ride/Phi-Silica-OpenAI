@@ -1,28 +1,31 @@
-# Session handoff, 2026-09-11, after the D82 merge
+# Session handoff, 2026-09-11, after the chunk 7 merge (D83)
 
-Supersedes the handoff written after the D81 merge earlier today (in git history). Everything
+Supersedes the handoff written after the D82 merge earlier today (in git history). Everything
 below was verified at write time.
 
 ## Where things stand
 
-- `main` is at or after `43457c0`, tree clean, in sync with origin. The repository is
-  `ookla-ariel-ride/npu-bridge` (renamed today; the old `Phi-Silica-OpenAI` URL redirects). The local
-  folder keeps its old name on purpose: package identity is registered against the build path, and
-  renaming it means `identity.ps1 -Install` again.
-- Chunks 1 to 6 are merged. Chunk 5 (context cache and overflow, D71 to D76), the OpenAI
+- `main` is at or after `b7e4eb3` (the tip of `feat/chunk-7-tool-calls`), in sync with origin. The
+  repository is `ookla-ariel-ride/npu-bridge` (renamed today; the old `Phi-Silica-OpenAI` URL
+  redirects). The local folder keeps its old name on purpose: package identity is registered against
+  the build path, and renaming it means `identity.ps1 -Install` again.
+- Chunks 1 to 7 are merged. Chunk 5 (context cache and overflow, D71 to D76), the OpenAI
   conformance pass (D77), D78 (issue #12 closed without a change), D79 (test hardening from the
   coverage audit), D80 (real token counts, issue #13), D81 (one post-generation pipeline for both
-  response shapes, issue #9) and D82 (the three 2026-09-10 review notes, issue #10) all landed
-  today. Chunk 6 stays code-verified only (D70; issue #2 open).
-- 657 tests pass. `smoke.ps1 -Backend phi-silica -Port 5298` passes every step on build 29648 on the
-  final `main` code: four teardown rows, and the D80 numbers unchanged by the D81 refactor
-  (`prompt_tokens` 41 / `completion_tokens` 2 on both shapes, 3581 tokens at the fox and CJK
-  preflight boundaries, the eight-token cut streaming 31 characters with `finish=length`, a cache
-  hit on the continuation, `text_mismatches=0`, `late_deltas=0`). It was run again after D82, which
-  is what says the reordered `identity.ps1 -Install` still grants identity: the run relaunches
-  through package activation and reports `identity=True`.
-- Open issues: #2, #3, #4, #11, #14, #15, #16, #17, #19. Closed today: #1, #9, #10, #12, #13.
-  Progress on #14 and #15 is recorded in comments on each.
+  response shapes, issue #9), D82 (the three 2026-09-10 review notes, issue #10) and chunk 7, D83
+  (tool-call emulation, issue #3) all landed today. Chunk 6 stays code-verified only (D70; issue #2
+  open). Chunk 8 is the only one left.
+- 866 tests pass, 0 skipped. `smoke.ps1 -Backend phi-silica -ToolProbeRuns 20` passes every step on
+  build 29648 on the final code, with nothing skipped for the first time: the tool probe had been a
+  SKIP placeholder since chunk 3 and is now a real step, and it measured 20/20 runs calling the tool,
+  no prose, no leaked protocol, no unoffered tool and every argument valid JSON. The D80 numbers came
+  back unchanged (`prompt_tokens` 41 / `completion_tokens` 2 on both shapes, 3581 tokens at the fox
+  and CJK preflight boundaries, the eight-token cut streaming 31 characters with `finish=length`, a
+  cache hit on the continuation, `text_mismatches=0`, `late_deltas=0`), and four teardown rows.
+- Open issues: #2, #4, #11, #14, #15, #16, #17, #21, #22, and #19, which is closed on GitHub but
+  should not be — a commit message closed it a second time by the same keyword accident (see "Things
+  learned"). Closed today: #1, #9, #10, #12, #13 and #3. Progress on #14 and #15 is recorded in
+  comments on each.
 
 ## What this session did, in order
 
@@ -114,6 +117,20 @@ below was verified at write time.
     `identity.ps1` defects a version bump would reach. 657 tests, the smoke run passed afterwards.
     Fast-forward merged; #10 closed from the commit, which also closed #19 by accident — GitHub read
     the message's "Filed rather than fixed: #19" as a closing keyword — and it was reopened.
+12. Chunk 7 on the branch `feat/chunk-7-tool-calls`, issue #3: tool-call emulation. `Tools/`
+    (`ToolCatalog`, `ToolSchemaRenderer`, `ToolCallParser`) plus `Api/ToolCallReply.cs`; the
+    instruction block is appended to the system text, which is what puts the offered tools into the
+    conversation key; an assistant turn's `tool_calls` render back into the transcript in the same
+    envelope the model is asked to produce, and tool results as `[Tool result: name (id)]`; with
+    tools present the streamed reply is buffered whole behind keep-alives, then one chunk carrying
+    the array and the finish chunk. Three review passes (two adversarial, then whole-branch),
+    fifteen findings, all fixed — the two worth carrying are in "Things learned". Two decisions
+    PLAN §2.6 item 4 did not settle went into D83 rather than a commit message: a `max_tokens` cut
+    that still parses reports `length`, and `index` is written only on the streaming shape. 866
+    tests, 0 skipped, the whole solution building with no warnings; the smoke run's tool probe
+    measured 20/20 over 20 runs. Two new issues: #21 (the hard case is unmeasured) and #22 (a
+    zero-argument call without the wrapper reads as content, an accepted cost recorded in D83).
+    Fast-forward merged; #3 closed from the commit.
 
 ## Decisions the owner made today
 
@@ -124,8 +141,8 @@ below was verified at write time.
 - The Phi-3 tokenizer is adopted for real token counts (issue #13), on the condition that the
   measurement in that issue agrees with the preflight; `tokenizer.model` is vendored in the repo.
   The condition was met (D80) and the tokenizer is in.
-- Work order: issue #13, then issue #9, then chunk 7 (issue #3). #13 and #9 are both done, so the
-  order now starts at chunk 7.
+- Work order: issue #13, then issue #9, then chunk 7 (issue #3). All three are done, so the order
+  now starts at chunk 8 (issue #4), the last chunk.
 - The repository was renamed to `npu-bridge` with a description and topics.
 - The suffix lookup for truncated conversations (issue #12) was approved on a premise I gave the
   owner that turned out to be wrong; the test written first showed the follow-up turn already hits.
@@ -133,30 +150,31 @@ below was verified at write time.
 
 ## Do this next
 
-1. Chunk 7 (issue #3), the work order's next item, with none of the small cleanups left in front of
-   it. `ChatMessage.ToolCalls` is carried and keyed; rendering the model its own protocol, computing
-   the stored key from the parsed calls, and buffering with keep-alives are the chunk's job.
-   Structured JSON output (2.4.x stable) is the design option on the issue. Three things D81 leaves
-   for it: the buffered path calls
-   `GenerationOutcome.Classify(result, cancelledByCut)` instead of telling failure, filtered and
-   content apart for itself; it supplies the cut's post-flush verdict as an argument, because the
-   classifier deliberately reads no cutter (when that verdict is legible differs by shape, D57); and
-   `DeltaSink`'s destination is a `ChannelWriter<string>` or a `CutWatcher`, never a delegate, so a
-   buffering path cannot smuggle the response onto the backend's callback thread. A path that wants
-   both destinations adds a third factory and decides their order there.
-2. Issues #14 and #15 whenever there is an hour to spend: #14's items 7 to 12 plus its "move into
+1. Chunk 8 (issue #4), the last chunk and the work order's next item: the generation scheduler with
+   a bounded queue (`--queue-capacity`, accepted and range-checked today but read by nothing), 429
+   with `Retry-After`, queued-cancel, `/v1/completions`, and `docs/CLIENTS.md` for OpenCode, Hermes,
+   `curl` and the Python client. Two things earlier chunks left for it: the scheduler may let the
+   second concurrent request for one conversation wait for the first's context instead of missing
+   (`docs/FUTURE.md`, chunk 5), and the tool-buffered streaming path holds a context for the whole
+   generation, so queueing behind it is the longest wait the queue will have to explain.
+2. Issue #21, the tool-call compliance measurement the probe does not make: 10-plus tools, nested
+   schemas and a 3K-token agent system prompt, which is the shape OpenCode presents. It needs
+   hardware and an hour, and its answer decides whether `--tool-schema full`, structured JSON output
+   (2.4.x stable, Phi Silica only) or nothing at all is worth building.
+3. Issues #14 and #15 whenever there is an hour to spend: #14's items 7 to 12 plus its "move into
    Core", "make injectable" and "delete or mark" sections, #15's items 4 to 9 and the manual
    checklist. Each issue carries a comment saying exactly what landed and what each test does and
    does not pin; #14's newest comment is the D81 gap, `DeltaSink` and `CutWatcher` hoisted into Core
    without unit tests of their own. #17 is the same size and needs a choice first: report
-   `BackendCapabilities.Cancellation` on `/healthz`, read it in the fake, or drop it. #19 only bites
-   at the first version bump of the package, and its definition of done is to bump the manifest and
-   measure what a bump leaves registered rather than assume it.
-3. When a Windows build with Aion Instruct behind the Phi Silica API arrives: `smoke.ps1 -Backend
+   `BackendCapabilities.Cancellation` on `/healthz`, read it in the fake, or drop it. #19 needs
+   reopening before anything else; it only bites at the first version bump of the package, and its
+   definition of done is to bump the manifest and measure what a bump leaves registered rather than
+   assume it. #22 is the smallest of them and D83 argues for leaving it alone.
+4. When a Windows build with Aion Instruct behind the Phi Silica API arrives: `smoke.ps1 -Backend
    phi-silica` under the registry key, re-check D31, decide the fate of the preview adapter. Run the
    tokenizer step before trusting the Phi-3 counter for that model. When any Aion generation runs,
    re-check the status-driven overflow path (D73) and measure its tokenizer the way D80 did.
-4. Undecided, waiting on the owner: whether the runtime RPC fault deserves a `bug` issue and a
+5. Undecided, waiting on the owner: whether the runtime RPC fault deserves a `bug` issue and a
    recreate-the-model fix, or stays a documented surprise (`docs/FUTURE.md`, README).
 
 ## Things learned today worth keeping
@@ -220,6 +238,21 @@ below was verified at write time.
   `identity.ps1 -Install` after a rebuild is, so the reordered script removes nothing on that path.
 - GitHub reads "fixed: #19" as a closing keyword wherever it appears in a commit message, so
   "Filed rather than fixed: #19" closed the issue it was filing. Spell such a line without a keyword.
+  It then happened a second time, in the commit that recorded the first one: `5e8cf7c`'s sentence
+  explaining the accident quoted the offending phrase and closed #19 again. Writing about a closing
+  keyword is still writing a closing keyword; #19 is closed on GitHub today and should be reopened.
+- Store a cached reply in the shape the client will send back to continue the conversation.
+  Tool calls were stored as the raw model text — fence, prose and all — while a client returns an
+  assistant message with null content and the `tool_calls` array the bridge emitted, which
+  `ConversationKey` hashes field by field. The two could never match on any input, so every turn of
+  an agent loop missed the cache: the exact case the cache exists for, invisible to every test that
+  did not replay a reply through the client's side of the round trip (D83).
+- `JsonDocument.Parse(string)` transcodes UTF-16 to UTF-8 before parsing, so invalid input throws
+  `ArgumentException`, not `JsonException`. A `catch (JsonException)` around it looks exhaustive and
+  is not: a lone surrogate escaped the tool-call parser and turned a successful generation into a 502
+  blaming the backend. D58 exists because this runtime splits surrogate pairs across callbacks, so
+  that input is not hypothetical. Check what a framework method throws on malformed input rather
+  than what its name suggests.
 - Deduplicating test helpers surfaced an expectation that had been passing on a coincidence: the
   cache's `prompt_tokens` test counted `"sys" + prompt` as one string, while the bridge counts the
   prompt and the native system text separately, and chars/4 makes those agree unless the prompt's
@@ -254,6 +287,14 @@ below was verified at write time.
   `IAsyncEnumerable<string>` responder redesign issue #9 sketched for `FakeBackend` was deliberately
   not built — each knob models a distinct runtime behaviour, and replacing them churns every test
   that sets `Responder`.
+- The tool-call parser's governing rule is that a false positive is worse than a miss, because the
+  client's answer to a call is to run it (D83). Three consequences are settled and deliberate: an
+  object outside a `tool_calls` wrapper needs both `name` and `arguments`, so a zero-argument call
+  without the wrapper reads as content (#22, filed and not fixed); `parameters` is accepted only
+  inside the wrapper, since outside one it is the tool definition echoed back; and arguments that
+  were supplied and cannot be read drop the call instead of defaulting to `{}`. Two wire shapes are
+  settled with it: a `max_tokens` cut that still parses reports `length`, and `index` rides only the
+  streamed delta.
 - `SseStream.Started` is the response's `HasStarted` and the note that asked for the change was
   wrong about why (D82): a write that fails has already started the response, so the old flag was
   right about that case. Do not re-file it as a defect.
@@ -264,8 +305,8 @@ below was verified at write time.
 
 ```powershell
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\Phi-Silica-OpenAI
-git status; git log --oneline -3                          # expect main at or after 43457c0, tree clean
-dotnet build; dotnet test                                 # expect 657 passed
-.\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 1 skipped, 5 informational
-gh issue list                                             # #2, #3, #4, #11, #14, #15, #16, #17, #19 open
+git status; git log --oneline -3                          # expect main at or after b7e4eb3, tree clean
+dotnet build; dotnet test                                 # expect 866 passed
+.\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 0 skipped, 5 informational
+gh issue list                                             # #2, #4, #11, #14 to #17, #21, #22 open; #19 needs reopening
 ```

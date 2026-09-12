@@ -3,13 +3,14 @@
 ## Works today (verified)
 | Area | Status | Evidence |
 |---|---|---|
-| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; 657 xunit tests green (chunk 5, the D77 conformance pass, D78, the D79 test hardening, D80 real token counts, the D81 shared pipeline and the D82 review notes merged 2026-09-11) |
+| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; 866 xunit tests green (chunk 5, the D77 conformance pass, D78, the D79 test hardening, D80 real token counts, the D81 shared pipeline, the D82 review notes and chunk 7 tool-call emulation merged 2026-09-11) |
+| Tool-call emulation (`tools`, `tool_choice`) | ✅ | Chunk 7, D83: `Tools/` (`ToolCatalog`, `ToolSchemaRenderer`, `ToolCallParser`) and `Api/ToolCallReply`, on both response shapes. The instruction block is appended to the system text so `ConversationKey` covers the tools offered; the parser never throws and anything it cannot read is content; the stream buffers the whole reply behind keep-alives, then one chunk carrying the array. Five test files, 1,880 lines, of which `ToolCallParserTests` holds the adversarial shapes; smoke on the NPU: 20/20 runs called the tool, no prose, no leaked protocol, no unoffered tool, every argument valid JSON |
 | One post-generation pipeline for both shapes | ✅ | D81: `Api/GenerationPipeline.cs` (`DeltaSink`, `CutWatcher`, `CancelGuardedAsync`, the raw-output log) and `GenerationOutcome` beside `GenerationFailure`; `GenerationOutcomeTests` pins every status crossed with the handler's own cancel, so the D56 and D57 drifts between the two hand-written copies cannot recur. No client-visible change: the smoke run on the NPU returned D80's numbers exactly |
 | A cancellation that is not the client's | ✅ | D82: the JSON path's catch is the streaming path's pair exactly — one clause filtered on `RequestAborted` that logs `http=0` and returns nothing, then an unfiltered one through `GenerationFailure` — so a backend that lets the runtime's own cancellation escape is answered with 502 and the ordinary error body instead of an unhandled 500. `ChatCompletionsTests` has one test per clause, each checked to fail against the old `when (ex is not OperationCanceledException)` filter |
 | Token counts (`usage`, `max_tokens`) | ✅ | D80: Phi-3 tokens on Phi Silica (`Phi3TokenCounter` over the vendored Phi-3.5-mini model, measured against the runtime's preflight: 3581 tokens at every ASCII boundary), chars/4 on Aion and the fake; `TokenCounterTests`, `TokenUsageTests`, `TokenBudgetCutTests`, `DebugTokenizeTests`; the smoke's tokenizer step repeats the measurement per build (fails above 2 % spread) |
 | Preflight units | ✅ | D80: `GetUsablePromptLength` answers in UTF-8 bytes, converted by `Utf8Offsets`; before the fix a 5,001-char CJK prompt at 1.6 × the window passed the preflight |
 | `/healthz`, `/v1/models`, `/v1` fallback | ✅ | TestServer tests + live curl on the exe; `/healthz` carries identity, cache counters (D74), keep-alive timings (D79) and backend diagnostics, and a test pins that the registered options, not defaults, are reported |
-| Smoke script trust (`scripts/smoke.ps1`) | ✅ | D79: readiness requires identity and bootstrap `ok` on phi-silica, the preflight step refuses a null answer, teardown proves the activated child and the port are gone (60 s), each auxiliary server has its own teardown row, `InfoStep` may fail on a contradiction. Run on the NPU 2026-09-11: all steps passed, 1 skipped, 5 informational, four teardown rows |
+| Smoke script trust (`scripts/smoke.ps1`) | ✅ | D79: readiness requires identity and bootstrap `ok` on phi-silica, the preflight step refuses a null answer, teardown proves the activated child and the port are gone (60 s), each auxiliary server has its own teardown row, `InfoStep` may fail on a contradiction. Run on the NPU 2026-09-11 after chunk 7: all steps passed, 0 skipped, 5 informational, four teardown rows. The tool probe (`-ToolProbeRuns`, five by default) was the last SKIP placeholder and is now a real step; it fails on what the bridge guarantees (a reply shaped wrongly, arguments that are not JSON, protocol text leaking as content) and reports what the model chooses, including a call to an unoffered tool, which the bridge is required to surface |
 | Config precedence json < local < env < CLI | ✅ | real-file test + live probes |
 | CLI verbs `run`, `service`, `task`, `help`, `version` | ✅ | tests + live exit codes |
 | Fake backend with faults/threads/init rules | ✅ | tests |
@@ -37,8 +38,7 @@
   run; issue #2 stays open. Aion Instruct itself ships in October/November 2026 as a model swap behind
   the Phi Silica API, so `PhiSilicaBackend` is the production path.
 - Aion Plan backend: unscheduled, since the model has no SDK yet (a GitHub issue tracks it)
-- Tool-call emulation (chunk 7)
-- Scheduler, 429 queue, client docs (chunk 8)
+- Scheduler, 429 queue, client docs (chunk 8) — `--queue-capacity` is accepted and read by nothing
 
 ## Known issues and caveats
 - The Phi Silica runtime can fail its first generation after a start with an RPC fault, after which
@@ -53,6 +53,13 @@
   reached only through the endpoint suites (#14).
 - `BackendCapabilities.Cancellation` is advertised by `PhiSilicaBackend` and the fake's default and
   read by nothing: no endpoint branches on it, `/healthz` omits it, no test asserts it (#17).
+- Tool-call compliance is measured only at the easy end (#21): one tool, one required string
+  argument, 20/20 on the NPU. Many tools, nested schemas and a 3K-token agent system prompt are the
+  case PLAN predicted 60–80 % for, and nothing here has measured it.
+- An unwrapped zero-argument call (`{"name":"get_time"}`) is read as content, because outside a
+  `tool_calls` wrapper an object needs both `name` and `arguments` (#22, accepted in D83). A
+  streamed tool-call reply delivers no token until the model has stopped; that is the price of
+  telling a call from prose, and keep-alives cover it.
 - `identity.ps1` is not ready for a version bump (#19): `Get-RegisteredPackage` sorts `Version` as a
   string, so `0.9.0.0` outranks `0.10.0.0` and a bump can leave two registrations, and the
   superseded removal is unguarded under `$ErrorActionPreference = 'Stop'`, so a bump that replaces
@@ -147,3 +154,17 @@
   the exception name on the `http=0` line, fails without the clause, and was stable over eight runs.
   The same review produced #19. 657 tests, the NPU smoke run passed afterwards. Fast-forward merged;
   #10 closed from the commit, whose "Filed rather than fixed: #19" line also closed #19 by accident.
+- Chunk 7 (2026-09-11, branch `feat/chunk-7-tool-calls`, D83): tool-call emulation, issue #3. Three
+  passes — two adversarial (a Claude subagent and Codex) and a whole-branch review — fifteen
+  findings, all real, all fixed. Both adversarial reviewers independently found the same one: tool
+  calls were stored in the cache as the raw model text, while a client sends back the structured
+  `tool_calls` array `ConversationKey` hashes, so the two could never match and every turn of an
+  agent loop missed the cache. `Keep` and `Compute` now take the turn rather than its text, and the
+  stored key describes what the client will send back rather than what the context literally holds.
+  The second worth keeping is a framework trap: `JsonDocument.Parse(string)` throws
+  `ArgumentException`, not `JsonException`, on invalid UTF-16, so a lone surrogate escaped the parser
+  and answered a successful generation with a 502 blaming the backend. A third was in the operator
+  signal rather than the code — `tools` and `tool_choice` were still on the accepted-and-ignored
+  list, and the test that should have caught it asserted the list's contents with the stale entries
+  in its expected value. 866 tests; the NPU run's tool probe called the tool 20 times out of 20.
+  Fast-forward merged; #3 closed from the commit, #21 and #22 filed.

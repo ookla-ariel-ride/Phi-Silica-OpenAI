@@ -13,23 +13,27 @@ NpuBridge (exe, ARM64)          NpuBridge.Core (net10.0, no WinRT)          NpuB
   ProcessIdentity.cs               Prompting/  PromptTemplate (flattening, tail), ConversationKey
                                    Tokenizers/ ITokenCounter, Phi3TokenCounter, CharEstimate
                                    Backends/   ContextCache; Api/ ConversationSession + ContextLease
-                                    (not yet)   Tools/ (chunk 7)
+                                   Tools/      ToolCatalog, ToolSchemaRenderer, ToolCallParser
 ```
 Logic lives in Core so it is testable without the NPU; the exe holds only wiring, WinRT adapters and
 Windows-specific glue. Tests boot the real endpoint pipeline in-process. The cache landed beside the
 backends (`Backends/ContextCache`) with its key in `Prompting/` and the per-request session in `Api/`
-rather than in a `Context/` folder; `Tools/` (tool-call emulation, chunk 7) doesn't exist yet;
+rather than in a `Context/` folder; `Tools/` holds only the tool-call emulation's own logic, with the
+wire shaping it feeds (`ToolCallReply`) in `Api/` beside the DTOs it builds;
 streaming lives in `Api/ChatCompletionsStreamEndpoint` beside the JSON shape, not in a separate folder. `AionBackend`
 compiles only when `nuget-local/` holds the Aion nupkg (`AionSdkAvailable`, D66); CI builds without it.
 
-## Request flow (as built through chunk 5, D81 and D82, 2026-09-11)
+## Request flow (as built through chunk 7, D81 to D83, 2026-09-11)
 `ChatRequestPreparer` does the shared part for both shapes, in order: parse the JSON body (malformed
 body → 400, no context created) → validate the DTO against what the deserializer can actually produce,
 not just what the type declares (400 on failure, no context created) → check the backend is `Ready`
 (503 if not, no context created) → warn once per process on any accepted-but-ignored parameter →
-choose the system-prompt placement → render the prompt (`PromptTemplate`) → compute the output limits
-(`max_tokens`/`stop`, D53). Then `ChatCompletionsEndpoint` (JSON) or `ChatCompletionsStreamEndpoint`
-(SSE) builds a `ConversationSession` and acquires a `ContextLease`: the transcript's prefix keys
+choose the system-prompt placement → read `tools` into a `ToolCatalog` and render the instruction
+block into the *system text* (null catalog when there are no usable tools, `tool_choice: "none"` or
+`--tool-emulation off`, which is the single switch phase two reads) → render the prompt
+(`PromptTemplate`) → compute the output limits (`max_tokens`/`stop`, D53). Then
+`ChatCompletionsEndpoint` (JSON) or `ChatCompletionsStreamEndpoint` (SSE) builds a
+`ConversationSession` and acquires a `ContextLease`: the transcript's prefix keys
 (`ConversationKey`, one per assistant turn) are looked up in `ContextCache`, longest first; a hit
 checks that context out and renders only the tail (`PromptTemplate.RenderTail`), a miss creates a
 context and renders everything; where the backend has a preflight, `GetUsablePromptLength` decides
@@ -38,14 +42,28 @@ overflow before anything is generated, and `--truncate-history` drops the oldest
 (a `ChannelWriter<string>` on the stream, a `CutWatcher` on the JSON shape, never a delegate, so the
 backend's callback cannot reach the response) → `GenerationOutcome.Classify(result, cancelledByCut)`,
 the one place failure, filtered and content are told apart, with the cut's verdict passed in because
-when it is legible differs by shape (D57, D81) → settles the lease exactly once on every path:
-`Keep` after a `Complete`, uncut generation puts the context back under the new key,
-anything else disposes it in the `finally` (the stream cancels → drains → settles, D51; D72) → shapes
-the OpenAI response → logs the outcome with `cache=`, `tail_turns=` and `truncated_turns=`. Two
+when it is legible differs by shape (D57, D81) → `ToolCallReply.From` over the finished text when a
+catalog is present, which both shapes call and neither decides for itself → settles the lease exactly
+once on every path: `Keep` after a `Complete`, uncut generation puts the context back under the new
+key, anything else disposes it in the `finally` (the stream cancels → drains → settles, D51; D72)
+→ shapes the OpenAI response → logs the outcome with `cache=`, `tail_turns=` and `truncated_turns=`. Two
 concurrent requests for one conversation never share a context: the second misses. What differs
 between the shapes after the classifier is only what they write: `completion_tokens` is
 `TokensCovering` over the text the cutter released on the stream and over the content about to be
 written on the JSON shape (D80), so each assembles its own usage through `CompletionUsage.For`.
+
+A catalog changes what the stream writes and when (D83). With tools present nothing is written until
+the generation has ended — only a finished reply can be told from prose, and a delta already written
+cannot be recalled — so the deltas feed the cutter while keep-alives hold the connection, and the
+role chunk, the one chunk carrying the whole `tool_calls` array (or the whole buffered content) and
+the finish chunk all go out at the end. Two consequences: the window in which a failure is still an
+ordinary HTTP status now spans the whole generation, and the keep-alive deadline is measured from
+the last frame written rather than the last delta received. It also changes what a stored key means.
+A tool-call reply is kept under the turn the *client will send back* — the normalised `tool_calls`
+array this reply emitted, whose ids the client echoes — while the context absorbed the fence and the
+prose around it. A hit renders only the turns after the prefix, so the model never sees the
+divergence; "the key is the transcript the context holds" has stopped being true.
+
 An exception out of any of that meets the same two catch clauses on both shapes, in the same order:
 one filtered on `http.RequestAborted`, which logs `http=0` and hands back nothing because there is
 nobody to answer, then an unfiltered one that reports through `GenerationFailure` (D82). The pair is
@@ -76,6 +94,16 @@ so a cancellation that was not the client's matched no clause and became a bare 
   capability.** Forcing `--system-prompt-placement native` on a backend without native system-prompt
   support should reject only requests that actually carry a system message. The check therefore runs
   after the prompt is rendered (D50).
+- **Reading a model's reply is a trust boundary: a false positive is worse than a miss.**
+  `ToolCallParser` never throws and never errors — everything it cannot read is content — because the
+  client's answer to a tool call is to run it. The rule decides the contested cases on its own: an
+  object that never declared itself a call needs both `name` and `arguments`, `parameters` counts
+  only inside a `tool_calls` wrapper (outside one it is the tool definition echoed back), and
+  arguments that were supplied and cannot be read drop the call instead of defaulting to `{}` (D83).
+- **Check what a framework method throws, not what its name suggests.**
+  `JsonDocument.Parse(string)` transcodes to UTF-8 first and answers invalid UTF-16 with
+  `ArgumentException`, so a `catch (JsonException)` around it looks exhaustive and is not. Every
+  parse of model text is wrapped for both (D83); D58 says surrogate pairs really do arrive split.
 
 ## Backend contract (`ILanguageModelBackend`)
 - `InitializeAsync` once, possibly minutes; `BackendLifecycle` runs it in the background, owns the
@@ -110,7 +138,9 @@ so a cancellation that was not the client's matched no clause and became a bare 
   barrier is dropped, counted as `late_deltas` only when the generation had *completed* (judged at
   the barrier, not by the token, because the stream endpoint cancels the token on every path); a
   runtime text that disagrees with the deltas counts `text_mismatches`. Both counters are in `/healthz`
-  and the smoke test asserts they stay zero. The delta sink must never block (chunks 7 and 8).
+  and the smoke test asserts they stay zero. The delta sink must never block: chunk 7's buffered path
+  holds the reply in the cutter and simply writes no frame, rather than parking the sink, and chunk
+  8's queue has to keep that property.
 - A context whose generation ended in anything but `Complete` is disposed, never reused.
 
 ## Fake backend as the contract's executable spec
@@ -120,7 +150,7 @@ so a cancellation that was not the client's matched no clause and became a bare 
 (`MaxPromptChars`), and full call recording (`Calls`, per-context `History`). Tests that pass against
 it should not pass vacuously on the NPU.
 
-## Test conventions (D43, D54, D79, D81, D82)
+## Test conventions (D43, D54, D79, D81, D82, D83)
 - Never assert on wall-clock timing. Order events with the fake's gates and assert on what had or had
   not happened when the gate opened. Which gate depends on where the hold must be: `StartGate` before
   the generation decides anything at all, the prompt-length verdict included; `FirstTokenGate` after
@@ -158,6 +188,14 @@ it should not pass vacuously on the NPU.
   task while the handler is parked. Assert the exception's name on the log line, since that is what
   separates the clause from the returned-`Cancelled` branch beside it; D82's first draft asserted
   neither and passed against the filter it was written to fail against.
+- Anything the client sends back needs a test that actually sends it back. The cache stored a
+  tool-call reply under text no client would ever return, and every test passed: each one checked one
+  side of the round trip. The shape to write is "answer a request, feed the bridge's own output back
+  as the next turn's assistant message, assert the hit" (D83).
+- A test that asserts a list's *contents* passes when the list is stale and the expected value is
+  stale with it. `tools` and `tool_choice` stayed on the accepted-and-ignored list through the chunk
+  that implemented them for exactly that reason; the test now names each implemented parameter
+  individually (D83).
 - Logic that branches on a counter, a clock or any other injected behaviour gets two kinds of test: a
   stand-in whose behaviour the test can state outright (the word counters in `TokenBudgetCutTests`,
   one of which deliberately recounts a word when it grows), and a handful against the real thing
@@ -183,6 +221,13 @@ it should not pass vacuously on the NPU.
   process query is a teardown FAIL, never "nothing left". Every auxiliary server (`--truncate-history`,
   both placement runs) gets a teardown row of its own; on phi-silica those are where D37's
   child-exit half is exercised repeatedly. A parent that died on its own is reported as that.
+- A step that measures the *model* fails only on what the *bridge* guarantees. The tool probe
+  (`-ToolProbeRuns`, five by default) fails on a reply the bridge shaped wrongly (`tool_calls` with
+  non-null content, an unexpected `finish_reason`), on arguments that are not JSON, and on protocol
+  text leaking out as content, which would mean the parser missed a shape the model really produces.
+  How often the model chooses to call, and a call to a tool nobody offered, are reported instead:
+  surfacing an unoffered name is what PLAN §2.6 item 3 requires, so failing on it would fail the
+  probe for behaving as designed (D83).
 - Output goes through `Write-Host`; redirect with `6>&1`. Under package activation the child's
   console output is not in the log, so `/healthz` and the responses are the evidence. Do not
   `dotnet build` while a smoke server is up.

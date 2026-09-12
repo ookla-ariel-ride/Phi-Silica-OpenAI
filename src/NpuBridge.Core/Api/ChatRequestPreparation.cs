@@ -113,7 +113,7 @@ internal static class ChatRequestPreparer
 
         // 2. Validation. The failure carries its own param/code; bind them by name — the failure record
         // orders them (Message, Param, Code) while OpenAiError.Result takes code before param.
-        var validation = ChatCompletionRequestValidator.Validate(request);
+        var validation = ChatCompletionRequestValidator.Validate(request, options.ToolEmulation);
         if (validation.Failure is { } failure)
         {
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars: 0, ttftMs: 0, tokens: 0,

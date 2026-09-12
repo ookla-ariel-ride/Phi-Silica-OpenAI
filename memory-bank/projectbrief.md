@@ -63,7 +63,9 @@ LoRA adapters, Microsoft Store publication. Tracked in `docs/FUTURE.md`.
 6. Aion adapter. **Done, code-verified only** (this machine's OS blocks the provider load, D70). Note
    that Aion Instruct itself ships in October/November 2026 as a model swap behind the Phi Silica API,
    so the flag change in goal 2 may end up being no change at all.
-7. Tool-calling emulation.
+7. Tool-calling emulation. **Done** (2026-09-11, D83). The honest reporting goal 5 asks for is the
+   smoke script's probe: 20/20 on one tool with one required string argument, and the many-tool case
+   named as unmeasured rather than assumed (issue #21).
 8. Concurrency/queueing, `/v1/completions`, client docs.
 
 Between chunks 6 and 7 (all 2026-09-11): the OpenAI conformance pass (D77), D78 (issue #12 closed
@@ -72,7 +74,8 @@ token counts (D80; issue #13 closed), one post-generation pipeline for both resp
 (D81; issue #9 closed), which was done before chunk 7 rather than during it so the buffered
 tool-detection path would be a caller of it and not a third copy, and the three low-severity notes
 from the 2026-09-10 review (D82; issue #10 closed), taken in the same window because two of them sat
-in the files D81 had just rewritten.
+in the files D81 had just rewritten. Chunk 7 then landed the same day, leaving chunk 8 as the only
+one outstanding.
 
 ## Repository
 `https://github.com/ookla-ariel-ride/npu-bridge` (renamed from `Phi-Silica-OpenAI` on 2026-09-11; the

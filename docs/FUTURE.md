@@ -54,6 +54,29 @@ rest of both issues stays open, as does the CI job.
   rather than `Task.WhenAny` against a `Task.Delay`, so the change is to the
   `WaitAsync(TimeSpan, TimeProvider, CancellationToken)` overload; the deferral itself is unchanged.
 
+## Chunk 7 deferrals (tool-call emulation)
+
+- **Speculative streaming with tools.** PLAN §2.6 item 2 requires the whole reply to be buffered when
+  `tools` is present, because nothing can tell a call from prose until the model has stopped, and D10
+  decided against speculation for v1. The cost is real: a tool-using client sees no token until the
+  reply is complete, where a tool-free one sees the first in a few hundred milliseconds. "Stream until
+  it stops looking like JSON" — emit content while the text cannot be the start of the envelope, and
+  retract to buffering the moment it can — would recover most of that. Retraction is the hard part: a
+  delta already written cannot be recalled, so the point of no return has to be provably before the
+  first character a call could begin with.
+- **`GenerateStructuredJsonResponseAsync` instead of the tolerant parser, on Phi Silica.** Windows App
+  SDK 2.4.x carries structured JSON output in the stable Text metadata, which would make the model
+  emit the envelope by construction rather than being asked to and then read leniently. Phi Silica
+  only — Aion has no equivalent — so the parser stays either way and the two paths would have to agree
+  on every shape. Worth measuring against the 20/20 the instruction-plus-parser approach already gets
+  before adopting it.
+- **A zero-argument call without the wrapper is content** (issue #22, D83). Accepted rather than fixed:
+  the safe direction was the one that drops it, and the wrapper form — what the instruction asks for
+  and what the model produced 20 times out of 20 — carries zero-argument calls correctly.
+- **Compliance on the hard case is unmeasured** (issue #21). The probe asks one tool with one required
+  string argument; PLAN's pessimism is about 10+ tools, deep schemas and a 3K-token agent prompt, which
+  is the shape OpenCode presents.
+
 ## Chunk 5 deferrals (context cache and overflow handling)
 
 - **After a truncation, the next request in that conversation pays refused preflight rounds before it
