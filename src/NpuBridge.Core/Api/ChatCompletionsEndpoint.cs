@@ -263,10 +263,11 @@ internal sealed class ChatCompletionsEndpoint
             }
 
             // 8b. Back into the cache -- the rule is GenerationOutcome's, and the finally disposes every
-            // context it refuses (D11, D43).
+            // context it refuses (D11, D43). A tool call is stored under the transcript the client will
+            // send back, which is the array this reply emitted and not the fenced text the model wrote.
             if (outcome.KeepsContext(cut.FinishReason))
             {
-                lease.Keep(result.Text);
+                lease.Keep(result.Text, ToolCallReply.Carried(toolCalls));
             }
 
             // 9. Usage, in the backend's own count (D80): Phi-3 tokens on Phi Silica, chars/4 where the

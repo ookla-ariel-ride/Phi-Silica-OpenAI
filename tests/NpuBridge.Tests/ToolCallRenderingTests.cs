@@ -55,13 +55,18 @@ public class ToolCallRenderingTests
     }
 
     /// <summary>
-    /// The call id is deliberately absent. The model never produced one — the bridge assigns it — and
-    /// a per-request ulid in the hashed body would mean no tool-using conversation could ever hit the
-    /// cache. The id the model does need, to match a result to its call, arrives on the tool result's
-    /// own marker.
+    /// The call id is deliberately absent from the rendered body. The model never produced one — the
+    /// bridge assigns it — and the id it does need, to match a result to its call, arrives on the tool
+    /// result's own marker. Rendering it would spend tokens teaching the model a field it is never
+    /// asked to write.
+    ///
+    /// A decision about the prompt, not about the cache. The comment here used to claim the second,
+    /// and it was wrong: <c>ConversationKey</c> hashes each call's id as a field of its own whatever
+    /// this renders. An adversarial review caught it, along with the missed cache hit the mistaken
+    /// reasoning was hiding (D83).
     /// </summary>
     [Fact]
-    public void The_call_id_is_not_rendered_because_it_would_poison_the_cache_key()
+    public void The_call_id_is_not_rendered_into_the_turn_body()
     {
         var body = PromptTemplate.TurnText(AssistantCalling(null, ("get_weather", "{}")));
 

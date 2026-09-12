@@ -50,12 +50,17 @@ public static class ConversationKey
     private const byte TagToolCall = 0x03;
 
     /// <summary>
-    /// The key of the whole transcript, optionally extended by one assistant turn holding
-    /// <paramref name="assistantReply"/>. The extended form is what a context is stored under after a
-    /// successful generation: it has absorbed the prefix and the reply, so it is the context for the
-    /// transcript the client will send back next.
+    /// The key of the whole transcript, optionally extended by <paramref name="assistantReply"/>. The
+    /// extended form is what a context is stored under after a successful generation: it has absorbed
+    /// the prefix and the reply, so it is the context for the transcript the client will send back next.
+    ///
+    /// The reply is a whole <see cref="ChatMessage"/> rather than its text because that is what the
+    /// client sends back. A tool call returns as an assistant message with null content and a
+    /// <c>tool_calls</c> array, and <see cref="AppendTurn"/> hashes that array's ids, names and
+    /// arguments — so a reply stored as text could never match one, and every tool-using conversation
+    /// missed its next turn (D83).
     /// </summary>
-    public static string Compute(string? systemText, IReadOnlyList<ChatMessage> turns, string? assistantReply = null)
+    public static string Compute(string? systemText, IReadOnlyList<ChatMessage> turns, ChatMessage? assistantReply = null)
     {
         ArgumentNullException.ThrowIfNull(turns);
 
@@ -68,7 +73,7 @@ public static class ConversationKey
 
         if (assistantReply is not null)
         {
-            AppendTurn(hash, new ChatMessage("assistant", ChatMessageContent.FromText(assistantReply), null, null));
+            AppendTurn(hash, assistantReply);
         }
 
         return Convert.ToHexStringLower(hash.GetHashAndReset());

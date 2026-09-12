@@ -273,8 +273,12 @@ public static class PromptTemplate
     ///
     /// The call <c>id</c> is deliberately not rendered. The instruction's envelope has no id — the
     /// model never produced one, the bridge assigns it — and the tool *result* turn carries it in its
-    /// marker, which is where the model needs it to match a result to a call. Including it here would
-    /// also put a per-request ulid into the cache key, so no conversation could ever hit.
+    /// marker, which is where the model needs it to match a result to a call. Showing it here would
+    /// spend tokens teaching the model a field it is never asked to write.
+    ///
+    /// That is a decision about the prompt and not about the cache: <c>ConversationKey</c> hashes each
+    /// call's id, type, name and arguments as fields of their own, whatever this renders, and those
+    /// ids round-trip because the client echoes the ones it was sent.
     /// </summary>
     private static string RenderToolCalls(IReadOnlyList<ChatToolCall> calls)
     {
@@ -321,8 +325,12 @@ public static class PromptTemplate
             using var document = JsonDocument.Parse(arguments);
             document.RootElement.WriteTo(writer);
         }
-        catch (JsonException)
+        catch (Exception ex) when (ex is JsonException or ArgumentException)
         {
+            // ArgumentException is the unpaired-surrogate case: Parse(string) transcodes before it
+            // reads, and that failure is not a JsonException. Unreachable from the wire today, since
+            // the request deserializer rejects one first, but it is the same mistake the parser made
+            // and this renders text into a prompt rather than failing a request (D83).
             writer.WriteStringValue(arguments);
         }
     }

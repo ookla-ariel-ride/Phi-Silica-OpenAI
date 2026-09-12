@@ -275,16 +275,22 @@ public class ChatCompletionRequestTests
             new[]
             {
                 "temperature", "top_p", "top_k",
-                "tools", "tool_choice", "logprobs", "response_format", "seed",
+                "logprobs", "response_format", "seed",
                 "presence_penalty", "frequency_penalty", "user",
             },
             result.IgnoredParameters);
 
-        // The body above still carries all three, and they are deliberately absent from the list: the
-        // client-side cut implements them (D53), so a request that sets one is not warned about it.
+        // The body above still carries all five, and they are deliberately absent from the list,
+        // because the bridge implements them: the client-side cut for the first three (D53) and
+        // tool-call emulation for the last two (D83). This list is the operator's "is the feature on?"
+        // signal, so a parameter left here after its chunk lands says the opposite of the truth — and
+        // an assertion that only checked the list's contents would not have caught it, which is why
+        // each one is named.
         Assert.DoesNotContain("max_tokens", result.IgnoredParameters, StringComparer.Ordinal);
         Assert.DoesNotContain("max_completion_tokens", result.IgnoredParameters, StringComparer.Ordinal);
         Assert.DoesNotContain("stop", result.IgnoredParameters, StringComparer.Ordinal);
+        Assert.DoesNotContain("tools", result.IgnoredParameters, StringComparer.Ordinal);
+        Assert.DoesNotContain("tool_choice", result.IgnoredParameters, StringComparer.Ordinal);
     }
 
     [Fact]

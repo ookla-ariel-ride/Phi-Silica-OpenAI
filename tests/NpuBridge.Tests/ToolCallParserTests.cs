@@ -147,20 +147,144 @@ public class ToolCallParserTests
     }
 
     /// <summary>
-    /// Arguments that are not an object at all become <c>{}</c> rather than being passed through: the
-    /// field is typed as an object everywhere it is going, and a client doing
+    /// Arguments the model left empty are a call with no arguments, and become <c>{}</c>: the field is
+    /// typed as an object everywhere it is going, and a client doing
     /// <c>JSON.parse(arguments).path</c> should get undefined rather than a throw.
     /// </summary>
     [Theory]
     [InlineData("""{"name":"a","arguments":null}""")]
     [InlineData("""{"name":"a","arguments":""}""")]
+    public void Empty_arguments_become_an_empty_object(string reply)
+    {
+        Assert.Equal("{}", SingleCall(reply).Arguments);
+    }
+
+    /// <summary>
+    /// Arguments that were supplied and cannot be read drop the call — they do not become <c>{}</c>.
+    ///
+    /// The difference is the whole point, and the first version of this parser got it wrong in the
+    /// dangerous direction. "No arguments" and "arguments I could not read" are different facts: an
+    /// unreadable <c>{"path":</c> turned into <c>{}</c> hands the client a confident call to
+    /// <c>delete_files</c> with every optional parameter at its default, and the client's response to
+    /// a call is to run it. Dropping the call makes the reply content, which a client can still show
+    /// the user. Found by an adversarial review (D83).
+    /// </summary>
+    [Theory]
     [InlineData("""{"name":"a","arguments":"not json at all"}""")]
     [InlineData("""{"name":"a","arguments":[1,2]}""")]
     [InlineData("""{"name":"a","arguments":7}""")]
     [InlineData("""{"name":"a","arguments":"[1,2]"}""")]
-    public void Arguments_that_are_not_an_object_become_an_empty_object(string reply)
+    [InlineData("""{"name":"delete_files","arguments":"{\"path\":"}""")]
+    public void Arguments_that_were_supplied_and_cannot_be_read_drop_the_call(string reply)
     {
-        Assert.Equal("{}", SingleCall(reply).Arguments);
+        Assert.Null(ToolCallParser.Parse(reply));
+    }
+
+    /// <summary>
+    /// An object that never said it was a call needs both a name and arguments. Without that, a reply
+    /// explaining a person and quoting <c>{"name":"Ada"}</c> — in a fence, which is exactly where the
+    /// instruction tells the model to put a call — became a call to a tool named Ada. A false positive
+    /// is worse than a miss here for the same reason as above: the client runs it. Found by an
+    /// adversarial review (D83).
+    /// </summary>
+    [Theory]
+    [InlineData("```json\n{\"name\":\"Ada\"}\n```")]
+    [InlineData("""Here is the record: {"name":"Ada"}.""")]
+    [InlineData("""The staff list is [{"name":"Ada"},{"name":"Grace"}].""")]
+    [InlineData("""The staff list is [{'name':'Ada'}].""")]
+    public void An_object_that_did_not_declare_itself_a_call_needs_name_and_arguments(string reply)
+    {
+        Assert.Null(ToolCallParser.Parse(reply));
+    }
+
+    /// <summary>
+    /// Inside a <c>tool_calls</c> wrapper the model has already said these are calls, so a missing
+    /// <c>arguments</c> is a call with none rather than a reason to doubt it. This is the other half of
+    /// the rule above, and it is what keeps a zero-argument tool callable.
+    /// </summary>
+    [Fact]
+    public void A_declared_call_may_omit_its_arguments()
+    {
+        var call = SingleCall("""{"tool_calls":[{"name":"ping"}]}""");
+
+        Assert.Equal("ping", call.Name);
+        Assert.Equal("{}", call.Arguments);
+    }
+
+    /// <summary>
+    /// Unpaired surrogates are content, not exceptions, whichever way they arrive.
+    ///
+    /// Two different failures hide here and both were live. An escaped <c>\uD800</c> parses into a
+    /// document and throws when the string is unescaped; a *raw* lone surrogate char fails earlier and
+    /// differently, because <c>JsonDocument.Parse(string)</c> transcodes UTF-16 to UTF-8 before it
+    /// reads anything and rejects invalid input with an <c>ArgumentException</c>, which the obvious
+    /// <c>catch (JsonException)</c> does not catch. That one escaped the parser entirely and answered
+    /// a perfectly successful generation with a 502 blaming the backend.
+    ///
+    /// Not a theoretical input on this runtime: D58 exists because it splits surrogate pairs across
+    /// callbacks, and the cutter does not step back from a trailing high surrogate at the end of the
+    /// text. Both found by an adversarial review (D83).
+    /// </summary>
+    [Fact]
+    public void An_unpaired_surrogate_is_content_rather_than_a_throw()
+    {
+        // Built here rather than in [InlineData]: a lone surrogate in an attribute argument does not
+        // survive the round trip through assembly metadata, and arrives as U+FFFD — which is valid
+        // text and tests nothing. That is itself worth knowing; the first version of this test passed
+        // for that reason while the input it named still threw.
+        var lone = ((char)0xD83D).ToString();
+
+        // Escaped: parses, then throws when the name is unescaped.
+        Assert.Null(ToolCallParser.Parse("{\"name\":\"\\uD800\",\"arguments\":{}}"));
+
+        // Raw: fails transcoding before the parse, with an ArgumentException rather than a JsonException.
+        Assert.Null(ToolCallParser.Parse($"{{\"name\":\"a\",\"arguments\":{{\"x\":\"{lone}\"}}}}"));
+        Assert.Null(ToolCallParser.Parse($"{{\"tool_calls\":[{{\"name\":\"a\",\"arguments\":{{\"x\":\"{lone}\"}}}}]}}"));
+        Assert.Null(ToolCallParser.Parse($"Here you go: {{\"name\":\"a\",\"arguments\":{{\"x\":\"{lone}\"}}}}"));
+    }
+
+    /// <summary>
+    /// A tool definition echoed back is not a call. <c>parameters</c> is the JSON Schema word, and it
+    /// is the word the injected block itself uses, so a model asked what it can do writes exactly this
+    /// — and accepting it produced a confident call whose arguments were the schema, which the client
+    /// then runs. Outside a <c>tool_calls</c> wrapper the parser now wants <c>arguments</c> by name.
+    /// Found by an adversarial review (D83).
+    /// </summary>
+    [Theory]
+    [InlineData("""The tool is {"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}.""")]
+    [InlineData("```json\n{\"name\":\"get_weather\",\"parameters\":{\"type\":\"object\"}}\n```")]
+    public void A_tool_definition_echoed_back_is_not_a_call(string reply)
+    {
+        Assert.Null(ToolCallParser.Parse(reply));
+    }
+
+    /// <summary>
+    /// Inside a wrapper the model has said these are calls, so <c>parameters</c> is still accepted as
+    /// the name of the arguments field — some models write it there having read the schema. This is
+    /// the other side of the rule above, and the reason the rule is about declaration rather than
+    /// about the word.
+    /// </summary>
+    [Fact]
+    public void A_declared_call_may_still_name_its_arguments_parameters()
+    {
+        var call = SingleCall("""{"tool_calls":[{"name":"f","parameters":{"a":1}}]}""");
+
+        Assert.Equal("f", call.Name);
+        Assert.Equal("""{"a":1}""", call.Arguments);
+    }
+
+    /// <summary>
+    /// A comma before the object is English, not an array separator. The scanner deferred such a call
+    /// to the bare-array strategy, which found no array and dropped it — so "Sure, {call}", a
+    /// thoroughly ordinary reply from this model class, silently called nothing. Found by an
+    /// adversarial review (D83).
+    /// </summary>
+    [Theory]
+    [InlineData("""Sure, {"name":"get_time","arguments":{"tz":"UTC"}}""")]
+    [InlineData("Right,\n{\"name\":\"get_time\",\"arguments\":{\"tz\":\"UTC\"}}")]
+    public void A_comma_in_the_prose_before_a_call_does_not_drop_it(string reply)
+    {
+        Assert.Equal("get_time", SingleCall(reply).Name);
     }
 
     /// <summary>

@@ -311,21 +311,24 @@ internal sealed class ChatCompletionsStreamEndpoint
             // something it reads for itself.
             var finishReason = outcome.FinishReason(cutter.FinishReason);
 
-            // Back into the cache, by the shared rule. The generation task has already ended (awaited
-            // above), so the context is idle; the finally's drain finds nothing to wait for and its
-            // Dispose finds the lease already settled (D51).
-            if (outcome.KeepsContext(cutter.FinishReason))
-            {
-                lease.Keep(result.Text);
-            }
-
             // Tool calls (chunk 7), over the whole buffered reply rather than the held tail: while
             // tools are present nothing has gone out, so the cutter holds everything the client is
             // owed and the parse sees the reply entire. A filtered reply is not parsed, for the reason
-            // ToolCallReply gives.
+            // ToolCallReply gives. Decided before the cache is written, because what is stored depends
+            // on it.
             var toolCalls = buffering
                 ? ToolCallReply.From(prepared.Tools, outcome, outcome.Filtered ? null : cutter.EmittedText)
                 : null;
+
+            // Back into the cache, by the shared rule. The generation task has already ended (awaited
+            // above), so the context is idle; the finally's drain finds nothing to wait for and its
+            // Dispose finds the lease already settled (D51). A tool call is stored under the transcript
+            // the client will send back — the array this reply emitted, not the fenced text the model
+            // wrote — so the next turn of an agent loop can hit.
+            if (outcome.KeepsContext(cutter.FinishReason))
+            {
+                lease.Keep(result.Text, ToolCallReply.Carried(toolCalls));
+            }
 
             if (toolCalls is not null)
             {
@@ -365,9 +368,16 @@ internal sealed class ChatCompletionsStreamEndpoint
             // exactly what reached the client. The prompt side is the whole transcript the model holds,
             // not the tail sent on a cache hit, as on the JSON path.
             var promptTokens = lease.TranscriptTokens;
-            // The tokens the model produced to reach what was sent, in the tokenization of everything the
-            // cutter saw (D80): a prefix counted on its own can tokenize differently.
-            var completionTokens = prepared.Backend.TokenCounter.TokensCovering(cutter.AllText, cutter.ContentLength);
+
+            // The tokens the model produced to reach what was sent, in the tokenization of everything
+            // the cutter saw (D80): a prefix counted on its own can tokenize differently.
+            //
+            // A buffered reply that was filtered is the one case where the cutter's length is not what
+            // reached the client: nothing was written, because nothing is written until the parse
+            // decides, and by then the answer was withheld. Counting it would report tokens for text
+            // the client never saw, and the non-streaming shape reports none for the same generation.
+            var deliveredChars = buffering && outcome.Filtered ? 0 : cutter.ContentLength;
+            var completionTokens = prepared.Backend.TokenCounter.TokensCovering(cutter.AllText, deliveredChars);
 
             if (includeUsage)
             {
@@ -561,6 +571,13 @@ internal sealed class ChatCompletionsStreamEndpoint
         var cancelled = false;
         var more = true;
 
+        // The keep-alive is due a fixed time after the last frame went out, not a fixed time after the
+        // last delta arrived. Waiting a fresh interval on every lap is what a naive loop does, and it
+        // starves: a model producing a delta a second with a fifteen-second interval completes every
+        // wait before its timer, so no keep-alive is ever written and a buffered reply is a response
+        // that says nothing for its entire length — exactly the silence buffering needs them for.
+        var due = Stopwatch.GetTimestamp() + (long)(streaming.KeepAliveInterval.TotalSeconds * Stopwatch.Frequency);
+
         while (more)
         {
             while (reader.TryRead(out var delta))
@@ -582,8 +599,28 @@ internal sealed class ChatCompletionsStreamEndpoint
                 break;
             }
 
-            more = await WaitForDeltaAsync(sse, reader, streaming, streaming.KeepAliveInterval, cancellationToken)
-                .ConfigureAwait(false);
+            if (streaming.KeepAliveInterval <= TimeSpan.Zero)
+            {
+                more = await reader.WaitToReadAsync(CancellationToken.None).ConfigureAwait(false);
+                continue;
+            }
+
+            var remaining = TimeSpan.FromSeconds((due - Stopwatch.GetTimestamp()) / (double)Stopwatch.Frequency);
+            if (remaining <= TimeSpan.Zero)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await sse.WriteAsync(KeepAliveFrame, cancellationToken).ConfigureAwait(false);
+                due = Stopwatch.GetTimestamp() + (long)(streaming.KeepAliveInterval.TotalSeconds * Stopwatch.Frequency);
+                continue;
+            }
+
+            // WaitForDeltaAsync writes its own keep-alive if this wait runs the whole way out, so the
+            // deadline is reset whenever it does — hence the assignment on both branches.
+            more = await WaitForDeltaAsync(sse, reader, streaming, remaining, cancellationToken).ConfigureAwait(false);
+            if (!more || Stopwatch.GetTimestamp() >= due)
+            {
+                due = Stopwatch.GetTimestamp() + (long)(streaming.KeepAliveInterval.TotalSeconds * Stopwatch.Frequency);
+            }
         }
 
         return cancelled;

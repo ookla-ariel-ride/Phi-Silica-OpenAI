@@ -848,11 +848,14 @@ try {
             if ($badArguments -gt 0) { throw "$badArguments call(s) carried arguments that are not JSON" }
             if ($leaked -gt 0) { throw "$leaked repl(y|ies) leaked tool-call JSON as content; the parser missed a real shape" }
 
+            # A tool nobody offered is the model's mistake and the bridge is *required* to surface it
+            # for the client to decide (PLAN §2.6 item 3), so it is counted and reported rather than
+            # failed. Failing here would fail the probe for behaving as designed.
             $unexpected = @($names.Keys | Where-Object { $_ -ne 'get_weather' })
-            if ($unexpected.Count -gt 0) { throw "called tool(s) that were never offered: $($unexpected -join ', ')" }
+            $unexpectedNote = if ($unexpected.Count -gt 0) { "; surfaced unoffered tool(s): $($unexpected -join ', ')" } else { '; no unoffered tool' }
 
             $rate = [math]::Round(100.0 * $called / $ToolProbeRuns, 0)
-            "$called/$ToolProbeRuns called the tool ($rate %), $prose answered in prose; no leaked protocol, no unoffered tool, all arguments valid JSON. PLAN expects 60-80 % on this model size."
+            "$called/$ToolProbeRuns called the tool ($rate %), $prose answered in prose; no leaked protocol$unexpectedNote, all arguments valid JSON. PLAN expects 60-80 % on this model size."
         }
     }
 

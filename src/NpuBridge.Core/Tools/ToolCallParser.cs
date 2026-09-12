@@ -60,6 +60,12 @@ internal static class ToolCallParser
     };
 
     /// <summary>
+    /// How many balanced-span candidates one strategy will try before giving up and calling the reply
+    /// content. See <see cref="FirstCandidate"/> for why a bound is needed at all.
+    /// </summary>
+    private const int MaxCandidates = 128;
+
+    /// <summary>
     /// Non-ASCII is written through rather than escaped, so an emoji or a CJK argument stays legible
     /// in logs and in the arguments string itself. It is still escaped once on the wire, where this
     /// text becomes a JSON string value, so the client decodes the same characters either way.
@@ -109,7 +115,7 @@ internal static class ToolCallParser
         }
 
         return FirstCandidate(text, '{', preferEnclosingArray: false, "\"tool_calls\"")
-            ?? FirstCandidate(text, '{', preferEnclosingArray: true, "\"name\"", "\"arguments\"", "\"parameters\"")
+            ?? FirstCandidate(text, '{', preferEnclosingArray: true, "\"name\"", "\"arguments\"")
             ?? FirstCandidate(text, '[', preferEnclosingArray: false, "\"name\"");
     }
 
@@ -175,8 +181,20 @@ internal static class ToolCallParser
     private static List<ParsedToolCall>? FirstCandidate(
         string text, char opener, bool preferEnclosingArray, string marker, params string[] anyOf)
     {
+        // Each candidate is scanned to its closing brace, so a reply that is nothing but openers costs
+        // one scan per opener -- quadratic in a reply the model controls the length of. A call the
+        // model actually meant is among the first few openers; the hundredth is a reply that is not
+        // one. Bounding the attempts keeps a pathological reply from spending real CPU after the
+        // generation has already finished, and costs nothing on any reply that parses.
+        var attempts = 0;
+
         for (var start = text.IndexOf(opener); start >= 0; start = text.IndexOf(opener, start + 1))
         {
+            if (++attempts > MaxCandidates)
+            {
+                return null;
+            }
+
             var end = MatchingBrace(text, start);
             if (end < 0)
             {
@@ -211,9 +229,14 @@ internal static class ToolCallParser
 
     /// <summary>
     /// Whether the opener at <paramref name="start"/> is an element of an array rather than a value
-    /// standing on its own. The nearest non-whitespace character before it decides: <c>[</c> makes it
-    /// the first element, <c>,</c> a later one. A comma cannot mean anything else in front of an
-    /// object — an object that is a property's value follows a colon.
+    /// standing on its own. <c>[</c> immediately before it makes it the first element; a <c>,</c>
+    /// makes it a later one, but only if an array is actually open at that point.
+    ///
+    /// The bracket check is the part that matters, because this scans prose and not JSON. "A comma in
+    /// front of an object means an array element" holds inside a document and nowhere else: the model
+    /// writes <c>Sure, {"name":…}</c>, and reading that comma as an array separator deferred the call
+    /// to the array strategy, which then found no array and dropped it. The reply became content and
+    /// the tool was never called.
     /// </summary>
     private static bool IsArrayElement(string text, int start)
     {
@@ -224,10 +247,58 @@ internal static class ToolCallParser
                 continue;
             }
 
-            return text[i] is '[' or ',';
+            return text[i] switch
+            {
+                '[' => true,
+                ',' => HasOpenBracketBefore(text, i),
+                _ => false,
+            };
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Whether an unclosed <c>[</c> stands before <paramref name="from"/>, ignoring brackets inside
+    /// string literals. Cheap and only asked when a comma has already been seen, which is rare.
+    /// </summary>
+    private static bool HasOpenBracketBefore(string text, int from)
+    {
+        var depth = 0;
+        var inString = false;
+
+        for (var i = 0; i < from; i++)
+        {
+            var c = text[i];
+            if (inString)
+            {
+                if (c == '\\')
+                {
+                    i++;
+                }
+                else if (c == '"')
+                {
+                    inString = false;
+                }
+
+                continue;
+            }
+
+            switch (c)
+            {
+                case '"':
+                    inString = true;
+                    break;
+                case '[':
+                    depth++;
+                    break;
+                case ']':
+                    depth--;
+                    break;
+            }
+        }
+
+        return depth > 0;
     }
 
     /// <summary>
@@ -296,7 +367,13 @@ internal static class ToolCallParser
         {
             document = JsonDocument.Parse(json, DocumentOptions);
         }
-        catch (JsonException)
+        // ArgumentException as well as JsonException: Parse(string) transcodes UTF-16 to UTF-8 before
+        // it reads anything, and an unpaired surrogate fails that with "Cannot transcode invalid
+        // UTF-16 string to UTF-8 JSON text" — an ArgumentException, which the obvious catch misses.
+        // Not hypothetical on this runtime: D58 exists because it splits surrogate pairs across
+        // callbacks, and a cut can leave a lone half in the final text. Escaping here answered a
+        // perfectly successful generation with a 502 that blamed the backend for the parser.
+        catch (Exception ex) when (ex is JsonException or ArgumentException)
         {
             return null;
         }
@@ -308,7 +385,7 @@ internal static class ToolCallParser
 
             if (root.ValueKind == JsonValueKind.Array)
             {
-                ReadCalls(root, calls);
+                ReadCalls(root, calls, declared: false);
             }
             else if (root.ValueKind == JsonValueKind.Object)
             {
@@ -317,14 +394,14 @@ internal static class ToolCallParser
                     // A model that emits one call sometimes drops the array and leaves the object.
                     if (wrapped.ValueKind == JsonValueKind.Array)
                     {
-                        ReadCalls(wrapped, calls);
+                        ReadCalls(wrapped, calls, declared: true);
                     }
-                    else if (wrapped.ValueKind == JsonValueKind.Object && ReadCall(wrapped) is { } single)
+                    else if (wrapped.ValueKind == JsonValueKind.Object && ReadCall(wrapped, declared: true) is { } single)
                     {
                         calls.Add(single);
                     }
                 }
-                else if (ReadCall(root) is { } bare)
+                else if (ReadCall(root, declared: false) is { } bare)
                 {
                     calls.Add(bare);
                 }
@@ -334,11 +411,11 @@ internal static class ToolCallParser
         }
     }
 
-    private static void ReadCalls(JsonElement array, List<ParsedToolCall> into)
+    private static void ReadCalls(JsonElement array, List<ParsedToolCall> into, bool declared)
     {
         foreach (var element in array.EnumerateArray())
         {
-            if (element.ValueKind == JsonValueKind.Object && ReadCall(element) is { } call)
+            if (element.ValueKind == JsonValueKind.Object && ReadCall(element, declared) is { } call)
             {
                 into.Add(call);
             }
@@ -355,7 +432,16 @@ internal static class ToolCallParser
     /// history) reproduces; <c>parameters</c> is the JSON Schema word for the same field and the
     /// model reads the word in the schema it was handed.
     /// </summary>
-    private static ParsedToolCall? ReadCall(JsonElement call)
+    /// <param name="declared">
+    /// True when a <c>tool_calls</c> wrapper has already said these objects are calls. Only then may
+    /// <c>arguments</c> be missing, and then it becomes <c>{}</c>.
+    ///
+    /// Without a wrapper the object has declared nothing, and requiring both keys is what stops an
+    /// ordinary record becoming an executable call: a reply that explains a person and happens to put
+    /// <c>{"name":"Ada"}</c> in a JSON fence produced a call to a tool named Ada. A false positive is
+    /// far worse than a miss here, because the client's answer to a call is to run it.
+    /// </param>
+    private static ParsedToolCall? ReadCall(JsonElement call, bool declared)
     {
         var body = TryGet(call, "function", out var function) && function.ValueKind == JsonValueKind.Object
             ? function
@@ -366,38 +452,85 @@ internal static class ToolCallParser
             return null;
         }
 
-        var tool = name.GetString()?.Trim();
+        // GetString unescapes, and an unpaired surrogate that JsonDocument.Parse accepted throws here
+        // rather than returning text. That is a malformed reply, which is content.
+        string? tool;
+        try
+        {
+            tool = name.GetString()?.Trim();
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+
         if (string.IsNullOrEmpty(tool))
         {
             return null;
         }
 
-        if (!TryGet(body, "arguments", out var arguments))
+        // `parameters` is the JSON Schema word for the same field, and a model that has read the block
+        // it was handed writes it — but only inside a wrapper that has already said these are calls.
+        // Undeclared, it is the giveaway of the opposite thing: an object carrying `name` and
+        // `parameters` is the *tool definition*, echoed back, which a model asked "what can you do?"
+        // produces readily. Accepting it turned that answer into a confident call whose arguments were
+        // the JSON Schema, and the client runs what it is handed.
+        var supplied = TryGet(body, "arguments", out var arguments)
+            || (declared && TryGet(body, "parameters", out arguments));
+
+        if (!supplied && !declared)
         {
-            TryGet(body, "parameters", out arguments);
+            return null;
         }
 
-        return new ParsedToolCall(tool, Arguments(arguments));
+        var text = Arguments(supplied ? arguments : default);
+        if (text is null)
+        {
+            // Arguments were supplied and could not be read. Inventing {} for them would turn an
+            // unreadable call into a confident one with every parameter defaulted, and a tool whose
+            // parameters are all optional would then run on defaults the model never asked for.
+            return null;
+        }
+
+        return new ParsedToolCall(tool, text);
     }
 
     /// <summary>
-    /// The arguments as compact JSON object text. Anything that is not an object becomes <c>{}</c>
-    /// rather than being passed through, because the field is typed as an object everywhere it is
-    /// going and a client that does <c>JSON.parse(arguments).x</c> should get undefined, not a throw.
+    /// The arguments as compact JSON object text, or null when the model supplied something that
+    /// cannot be read as arguments — which drops the call rather than substituting <c>{}</c>. The
+    /// difference matters: absent arguments are a call with none, while unreadable arguments are a
+    /// call whose parameters are unknown, and defaulting those to empty hands the client a confident
+    /// call it can run with every optional parameter at its default.
     ///
     /// The encoded-string form is the case worth having: <c>"arguments": "{\"a\":1}"</c> is what a
     /// model imitating OpenAI's wire format produces, where the field really is a string, and it
     /// carries the same arguments as the object form.
     /// </summary>
-    private static string Arguments(JsonElement arguments)
+    private static string? Arguments(JsonElement arguments)
     {
         switch (arguments.ValueKind)
         {
+            // Undefined is the absent case: no arguments key at all, which only a declared call
+            // reaches, and which means a call with no arguments.
+            case JsonValueKind.Undefined:
+            case JsonValueKind.Null:
+                return "{}";
+
             case JsonValueKind.Object:
                 return Compact(arguments);
 
             case JsonValueKind.String:
-                var inner = arguments.GetString();
+                string? inner;
+                try
+                {
+                    inner = arguments.GetString();
+                }
+                catch (InvalidOperationException)
+                {
+                    // An unpaired surrogate the document reader accepted but cannot unescape.
+                    return null;
+                }
+
                 if (string.IsNullOrWhiteSpace(inner))
                 {
                     return "{}";
@@ -408,15 +541,17 @@ internal static class ToolCallParser
                     using var nested = JsonDocument.Parse(inner, DocumentOptions);
                     return nested.RootElement.ValueKind == JsonValueKind.Object
                         ? Compact(nested.RootElement)
-                        : "{}";
+                        : null;
                 }
-                catch (JsonException)
+                catch (Exception ex) when (ex is JsonException or ArgumentException)
                 {
-                    return "{}";
+                    // ArgumentException for the same reason as above: an unpaired surrogate inside the
+                    // encoded arguments string fails transcoding rather than parsing.
+                    return null;
                 }
 
             default:
-                return "{}";
+                return null;
         }
     }
 

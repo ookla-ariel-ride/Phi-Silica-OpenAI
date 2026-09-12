@@ -301,6 +301,99 @@ public class ToolCallEndpointTests
         host.AssertNoLeak();
     }
 
+    /// <summary>
+    /// The next turn of an agent loop hits the cache. This is the case the context cache exists for
+    /// and the one a tool-using client is always in: call, result, call again.
+    ///
+    /// It did not work at first. The reply was stored under the raw text the model wrote — fence,
+    /// prose and all — while the client sends back the <c>tool_calls</c> array the bridge emitted, so
+    /// the two could never key the same and every tool-using conversation missed on every turn. Found
+    /// by an adversarial review (D83); the fix stores the transcript form, built through the same
+    /// <c>PromptTemplate.TurnText</c> that renders it back.
+    /// </summary>
+    [Fact]
+    public async Task The_turn_after_a_tool_call_hits_the_cached_context()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => [FencedCall] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var first = await PostAsync(host, Body(stream: false, tools: Weather));
+        var call = first.GetProperty("choices")[0].GetProperty("message").GetProperty("tool_calls")[0];
+
+        // Exactly what a client sends next: our own assistant message back, then the tool's result.
+        var followUp = new
+        {
+            model = "fake",
+            tools = Weather,
+            messages = new object[]
+            {
+                new { role = "user", content = "weather in paris?" },
+                new
+                {
+                    role = "assistant",
+                    content = (string?)null,
+                    tool_calls = new[]
+                    {
+                        new
+                        {
+                            id = call.GetProperty("id").GetString(),
+                            type = "function",
+                            function = new
+                            {
+                                name = call.GetProperty("function").GetProperty("name").GetString(),
+                                arguments = call.GetProperty("function").GetProperty("arguments").GetString(),
+                            },
+                        },
+                    },
+                },
+                new { role = "tool", name = "get_weather", tool_call_id = call.GetProperty("id").GetString(), content = "18C, clear" },
+                new { role = "user", content = "and tomorrow?" },
+            },
+        };
+
+        var before = host.Cache.Hits;
+        await PostAsync(host, followUp);
+
+        Assert.Equal(before + 1, host.Cache.Hits);
+
+        // And the model was sent only the new turns, not the whole conversation again.
+        Assert.Equal(2, fake.Calls.Count);
+        Assert.DoesNotContain("weather in paris?", fake.Calls[1].Prompt, StringComparison.Ordinal);
+        Assert.Contains("and tomorrow?", fake.Calls[1].Prompt, StringComparison.Ordinal);
+        host.AssertNoLeak();
+    }
+
+    /// <summary>
+    /// A buffered reply still says something on the wire while it generates. Nothing of the reply can
+    /// go out until the parse decides, so the keep-alive comment is the only thing standing between a
+    /// long tool-call generation and a client or proxy calling the connection dead.
+    ///
+    /// The first version starved: it waited a fresh interval after every delta, so a model producing
+    /// deltas faster than the interval completed every wait before its timer and the response said
+    /// nothing at all for the whole generation — the exact silence buffering needs keep-alives for.
+    /// The deadline now runs from the last frame written, not the last delta received. Found by an
+    /// adversarial review (D83).
+    /// </summary>
+    [Fact]
+    public async Task A_buffered_reply_keeps_the_connection_alive_while_deltas_keep_arriving()
+    {
+        // Deltas arrive steadily and forever-ish; the keep-alive interval is shorter than the reply is
+        // long, so a correct implementation must emit at least one comment during the drain.
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => Enumerable.Repeat("word ", 40),
+            TokenDelay = TimeSpan.FromMilliseconds(5),
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake,
+            keepAliveInterval: TimeSpan.FromMilliseconds(20),
+            firstKeepAliveDelay: TimeSpan.FromMilliseconds(20));
+
+        var text = await (await host.Client.PostAsJsonAsync(Path, Body(stream: true, tools: Weather))).Content.ReadAsStringAsync();
+
+        Assert.Contains(": keep-alive", text, StringComparison.Ordinal);
+        Assert.EndsWith("data: [DONE]\n\n", text, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task A_tool_call_leaks_no_context_on_either_shape()
     {

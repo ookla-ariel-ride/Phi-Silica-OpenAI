@@ -77,7 +77,14 @@ internal sealed class ContextLease : IDisposable
     /// uncut, so the context's state is exactly the transcript plus this reply: store it under that
     /// transcript's key. Call after the generation task has ended and never touch the context again.
     /// </summary>
-    public void Keep(string reply)
+    /// <param name="toolCalls">
+    /// The calls the reply was reshaped into, when it was one (chunk 7). The stored key has to
+    /// describe the turn as the *client* will send it back, and for a tool call that is an assistant
+    /// message with null content and this array — not the fenced text the model wrote. Keying it by
+    /// that text instead made every tool-using conversation miss on its next turn, which is every turn
+    /// of an agent loop and exactly what the cache is for (D83).
+    /// </param>
+    public void Keep(string reply, IReadOnlyList<ChatToolCall>? toolCalls = null)
     {
         ArgumentNullException.ThrowIfNull(reply);
         if (_settled)
@@ -86,7 +93,12 @@ internal sealed class ContextLease : IDisposable
         }
 
         _settled = true;
-        _cache.Store(ConversationKey.Compute(_systemText, _turns, reply), Context);
+
+        var turn = toolCalls is { Count: > 0 }
+            ? new ChatMessage("assistant", null, null, null, toolCalls)
+            : new ChatMessage("assistant", ChatMessageContent.FromText(reply), null, null);
+
+        _cache.Store(ConversationKey.Compute(_systemText, _turns, turn), Context);
     }
 
     /// <summary>

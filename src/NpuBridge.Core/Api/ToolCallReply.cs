@@ -1,3 +1,4 @@
+using NpuBridge.Prompting;
 using NpuBridge.Tools;
 
 namespace NpuBridge.Api;
@@ -54,4 +55,24 @@ internal static class ToolCallReply
 
         return calls;
     }
+
+    /// <summary>
+    /// The emitted calls in the request-side shape a client sends back, for the context cache's key,
+    /// or null when the reply was not a call.
+    ///
+    /// The raw model text will not do as the stored key. It is what the context holds — the fence, the
+    /// prose around the JSON, whatever the model actually wrote — but that is not what comes back; the
+    /// client returns an assistant message with null content and the <c>tool_calls</c> array this
+    /// reply emitted, and <c>ConversationKey</c> hashes that array's ids, names and arguments. Keyed
+    /// by the text instead, a tool-using conversation missed on its next turn, which is every turn of
+    /// an agent loop and the case the cache exists for (D83).
+    ///
+    /// The ids round-trip because they are ours: the client echoes what it was sent.
+    /// </summary>
+    public static IReadOnlyList<ChatToolCall>? Carried(IReadOnlyList<ChatCompletionToolCall>? calls) =>
+        calls is null
+            ? null
+            : calls
+                .Select(c => new ChatToolCall(c.Id, c.ToolType, new ChatFunctionCall(c.Function.Name, c.Function.Arguments)))
+                .ToArray();
 }

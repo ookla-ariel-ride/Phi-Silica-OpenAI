@@ -150,6 +150,9 @@ public static class ChatCompletionRequestValidator
         // an error (D46 recorded the rejection as temporary) nor an ignored parameter. `stream_options`
         // rides with it and is likewise honoured, not ignored. So are `max_tokens`,
         // `max_completion_tokens` and `stop` since chunk 4 task 4 (D53); OutputLimits applies them.
+        // And `tools` and `tool_choice` since chunk 7 (D83): the emulation reads both. The warning is
+        // the operator's signal for "is this feature on?", so leaving them listed would have said the
+        // opposite of the truth the moment the feature shipped.
         return ChatCompletionValidationResult.Valid(CollectIgnoredParameters(request));
     }
 
@@ -168,8 +171,6 @@ public static class ChatCompletionRequestValidator
         AddIfPresent(request.Temperature is not null, "temperature");
         AddIfPresent(request.TopP is not null, "top_p");
         AddIfPresent(request.TopK is not null, "top_k");
-        AddIfPresent(request.Tools is not null, "tools");
-        AddIfPresent(request.ToolChoice is not null, "tool_choice");
         AddIfPresent(request.Logprobs is not null, "logprobs");
         AddIfPresent(request.ResponseFormat is not null, "response_format");
         AddIfPresent(request.Seed is not null, "seed");

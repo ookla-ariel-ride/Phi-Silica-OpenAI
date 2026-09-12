@@ -89,7 +89,7 @@ public class ConversationKeyTests
         var reply = ConversationKey.Compute(null, [User("hi"), Assistant("hello")]);
 
         Assert.Equal(reply, ConversationKey.Compute(null, [User("hi"), Assistant("hello  \n")]));
-        Assert.Equal(reply, ConversationKey.Compute(null, [User("hi")], assistantReply: "hello\n"));
+        Assert.Equal(reply, ConversationKey.Compute(null, [User("hi")], assistantReply: Assistant("hello\n")));
         Assert.NotEqual(reply, ConversationKey.Compute(null, [User("hi"), Assistant(" hello")]));
     }
 
@@ -160,7 +160,7 @@ public class ConversationKeyTests
     {
         // What a request stores under after generating "b" for [a] is exactly what the next request,
         // carrying [a, b, c], computes for its two-turn prefix.
-        var stored = ConversationKey.Compute(null, [User("a")], assistantReply: "b");
+        var stored = ConversationKey.Compute(null, [User("a")], assistantReply: Assistant("b"));
         var next = ConversationKey.PrefixKeys(null, [User("a"), Assistant("b"), User("c")]);
 
         Assert.Equal(stored, Assert.Single(next).Key);
