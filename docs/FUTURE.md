@@ -45,6 +45,14 @@ land here instead of widening the chunk. Each entry says where it came from and 
   line explaining why rather than a silent difference. Implementing it for real is a small, self-
   contained change to `CompletionsEndpoint`/`CompletionsStreamEndpoint` (prepend `prompt` to the first
   chunk of text, or to the whole reply on the JSON shape) whenever it is worth a task of its own.
+- **`StreamingPipeline.WaitForDeltaAsync`'s stale-timeout guard (`if (wait.IsCompleted) return await
+  wait;`) has no dedicated test**, on either streaming shape (task 3b review, fix round 1, Finding 2).
+  It is not intrinsically untestable: `Task.WaitAsync(TimeSpan, TimeProvider, CancellationToken)` plus a
+  `FakeTimeProvider` would let a test complete the channel first and then advance the clock so the timer
+  fires with `wait` already complete -- the guard's exact case, deterministically, with no wall-clock
+  assertion (D54). That needs `_time` threaded into `WaitForDeltaAsync` in place of the real clock
+  `Task.WaitAsync` uses today, which is a production change and so out of scope for a coverage-only
+  task. A genuine client-disconnect mid-stream is covered on both endpoints as of task 3b (fix round 1).
 
 ## 2026-09-11 test coverage audit
 

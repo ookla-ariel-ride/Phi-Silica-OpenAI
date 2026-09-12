@@ -1,6 +1,8 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using NpuBridge.Backends.Fake;
 
 namespace NpuBridge.Tests;
@@ -146,6 +148,130 @@ public class CompletionsStreamingTests
         host.AssertNoLeak();
         Assert.Equal(1, host.Cache.Count);
     }
+
+    /// <summary>
+    /// Task 3b review fix round 1, Finding 2: this endpoint's own <c>catch (Exception ex) when
+    /// (aborted.IsCancellationRequested)</c> clause and its cancel-drain-settle <c>finally</c>
+    /// (<c>CompletionsStreamEndpoint.cs</c>) were not part of the extraction -- they are per-endpoint
+    /// copies chat's suite never touches -- so a client disconnect had zero coverage on
+    /// <c>/v1/completions</c> even though <c>StreamingPipeline</c> now covers the wire framing. Ported
+    /// from <see cref="ChatCompletionsStreamingTests.A_client_that_disconnects_mid_stream_is_drained_before_the_context_is_disposed"/>
+    /// unchanged apart from the request body: gate-based throughout (D54), no wall-clock assertion.
+    /// </summary>
+    [Fact]
+    public async Task A_client_that_disconnects_mid_stream_is_drained_before_the_context_is_disposed()
+    {
+        var gate = new TaskCompletionSource();
+        FakeBackend fake = null!;
+        var disposedDuringGeneration = false;
+
+        IEnumerable<string> Tokens()
+        {
+            for (var i = 0; i < 200; i++)
+            {
+                // Read from inside the generation: if the context was released while this was still
+                // producing, the handler disposed something the backend was still using.
+                disposedDuringGeneration |= fake.ContextsDisposed > 0;
+                yield return $"token{i.ToString(CultureInfo.InvariantCulture)} ";
+            }
+        }
+
+        fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => Tokens(),
+            TokenDelay = TimeSpan.FromMilliseconds(10),
+            CancellationGate = gate,
+        });
+
+        var capture = new CapturingLoggerProvider();
+        await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture);
+
+        try
+        {
+            using var cts = new CancellationTokenSource();
+            using var request = new HttpRequestMessage(HttpMethod.Post, Path)
+            {
+                Content = JsonContent.Create(Body(model: "fake", stream: true, includeUsage: null, maxTokens: null, stop: null)),
+            };
+
+            var response = await host.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            await using (var stream = await response.Content.ReadAsStreamAsync(cts.Token))
+            {
+                var buffer = new byte[128];
+                Assert.True(await stream.ReadAsync(buffer, cts.Token) > 0);
+            }
+
+            // The client goes away mid-generation.
+            await cts.CancelAsync();
+
+            // http=0 is the handler saying there is nobody left to write to: it is done with the client
+            // and is now in the drain. The generation has not finished, so the context must still exist.
+            await TestWait.UntilAsync(() => capture.Records.Any(r => r.Message.Contains("http=0", StringComparison.Ordinal)));
+            Assert.Equal(1, fake.ContextsCreated);
+            Assert.Equal(0, fake.ContextsDisposed);
+        }
+        finally
+        {
+            gate.SetResult();
+        }
+
+        // Only now, once the generation can end, is the context released.
+        await TestWait.UntilAsync(() => fake.ActiveContexts == 0);
+        Assert.Equal(1, fake.ContextsCreated);
+        Assert.Equal(1, fake.ContextsDisposed);
+        Assert.False(disposedDuringGeneration, "the context was disposed while the backend was still generating");
+
+        // Nothing escaped as an unhandled request exception.
+        Assert.DoesNotContain(capture.Records, r => r.Level >= LogLevel.Error);
+    }
+
+    /// <summary>
+    /// The disconnect case for a generation that does stop when told to: the context balances, and the
+    /// per-request line reports http=0 rather than a status nobody received. Ported from
+    /// <see cref="ChatCompletionsStreamingTests.A_disconnected_client_is_logged_as_http_0_and_leaks_no_context"/>
+    /// (task 3b review fix round 1, Finding 2) unchanged apart from the request body.
+    /// </summary>
+    [Fact]
+    public async Task A_disconnected_client_is_logged_as_http_0_and_leaks_no_context()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => LongReply,
+            TokenDelay = TimeSpan.FromMilliseconds(10),
+        });
+        var capture = new CapturingLoggerProvider();
+        await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture);
+
+        using var cts = new CancellationTokenSource();
+        using var request = new HttpRequestMessage(HttpMethod.Post, Path)
+        {
+            Content = JsonContent.Create(Body(model: "fake", stream: true, includeUsage: null, maxTokens: null, stop: null)),
+        };
+
+        var response = await host.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+        await using (var stream = await response.Content.ReadAsStreamAsync(cts.Token))
+        {
+            var buffer = new byte[128];
+            Assert.True(await stream.ReadAsync(buffer, cts.Token) > 0);
+        }
+
+        await cts.CancelAsync();
+
+        await TestWait.UntilAsync(() => fake.ActiveContexts == 0);
+        Assert.Equal(1, fake.ContextsCreated);
+        Assert.Equal(1, fake.ContextsDisposed);
+
+        // The completions endpoint's request id carries the same chatcmpl- prefix chat's does
+        // (docs/FUTURE.md), so the log line's prefix check is unchanged from the ported test.
+        var line = Assert.Single(capture.Records, r => r.Message.StartsWith("req=chatcmpl-", StringComparison.Ordinal));
+        Assert.Contains("http=0", line.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(capture.Records, r => r.Level >= LogLevel.Error);
+    }
+
+    /// <summary>Long enough to span many deltas, same as the chat shape's copy.</summary>
+    private static IReadOnlyList<string> LongReply { get; } = FakeBackend.Tokenize(string.Join(
+        ' ',
+        Enumerable.Range(0, 200).Select(i => $"token{i.ToString(CultureInfo.InvariantCulture)}")));
 
     private static object Body(string? model, bool? stream, bool? includeUsage, int? maxTokens, string? stop) => new
     {
