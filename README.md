@@ -11,7 +11,8 @@ decodes at about 27 tokens per second. Those counts are the model's own: the bri
 Phi-3.5-mini's vocabulary, having measured that the runtime's prompt-length limit agrees with it.
 Short conversations work well, and a continuing one is cheap because the bridge keeps the model's
 context between turns. Long agent loops with a dozen tools will not fit — a real terminal agent's
-toolset alone measured three to seven times the whole window — and the bridge answers with OpenAI's
+toolset alone measured nearly three times the whole window, and its whole fixed prompt three to
+seven times — and the bridge answers with OpenAI's
 `context_length_exceeded` error instead of dropping turns on its own.
 
 ## Backends
@@ -279,11 +280,14 @@ conversation as far as the cache is concerned, since the instruction block is pa
 How well the model follows the protocol is its own business, and it is now measured rather than
 guessed. Across 114 generations on Phi Silica — tool counts from 1 to 25, flat and nested schemas,
 agent system prompts up to 1,501 tokens, and tool blocks filling half to 85 % of the context window —
-every call named a tool that was offered and carried valid JSON arguments, and the argument values
-were right wherever the model picked the right tool. No prose-wrapped protocol reached a client, no
-tool was invented, and the bridge produced no malformed reply. An earlier run suggested accuracy
-sagged as the window filled; that was sampling noise, and it did not survive deterministic decoding
-(`docs/DECISIONS.md` D96).
+arguments parsed as valid JSON in every call that checked them, the values were right wherever the
+model picked the right tool, no prose-wrapped protocol reached a client, and the bridge produced no
+malformed reply. One exception worth stating plainly: in a run using stochastic sampling, three
+generations called a tool name that was never offered (`weather` for `get_weather`). It did not
+recur under deterministic decoding, but it is the failure a client acts on by *running* the call, so
+a client should reject unknown names rather than assume they cannot happen. An earlier run also
+suggested accuracy sagged as the window filled; it did not reproduce once the sweep was rerun with
+deterministic decoding and the position control the other dimensions use (`docs/DECISIONS.md` D96).
 
 The limit is not the model's protocol discipline. It is the window. A real agent's tool schemas are
 larger than everything Phi Silica can hold: one terminal agent measured here presents about 40 KB of
@@ -293,10 +297,13 @@ reliable; offer an agent framework's whole toolbox and the conversation will not
 `docs/CLIENTS.md` has the measured table, and `--tool-emulation off` turns the feature off for the
 process, `tool_choice: "none"` for one request.
 
-One safety note for anyone probing these limits: a system prompt over about 44,000 characters does
-not merely overflow, it crashes the Windows model host and leaves the NPU unusable for several
-minutes (`docs/DECISIONS.md` D94, issue #29). Find the boundary with `POST /debug/tokenize` rather
-than by sending the request.
+One safety note for anyone probing these limits. A system prompt much over 40,000 characters does not
+merely overflow: it crashes the Windows model host and leaves the NPU unusable for the whole machine
+for several minutes (`docs/DECISIONS.md` D94, issue #29). Two things make that worse than it sounds —
+`/healthz` keeps reporting `ready` the entire time, so the bridge looks healthy while nothing can
+generate, and a client that retries on 502 turns one impossible request into 30 to 40 seconds of NPU
+time. Treat 40,000 as the ceiling rather than the 44,000 where it was first seen to break, and find
+the boundary with `POST /debug/tokenize` rather than by sending the request.
 
 ## Configuration
 

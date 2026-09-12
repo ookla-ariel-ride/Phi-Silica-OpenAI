@@ -120,9 +120,13 @@ No chunk is outstanding. What remains is issues.
 - **#19:** two `identity.ps1` defects, both unreachable while the manifest stays at 0.1.0.0. Note that
   the folder rename has made `-Install` newly relevant even though the version has not moved. It was
   closed twice by accidental closing keywords in commit messages; check it is still open.
-- **#21:** tool-call compliance on the hard case (10-plus tools, nested schemas, a 3K-token agent
-  system prompt) is still unmeasured; the 20/20 is the easy end. Its answer decides whether
-  `--tool-schema full` or structured JSON output is worth building.
+- **#21:** measured 2026-09-12 (D93 to D96), closes when PR #32 lands. Compliance was not the problem —
+  40/40 across 1 to 25 tools, 32/32 at up to 85 % occupancy deterministically. The hard case fails
+  because a real agent's tool schemas alone are nearly three times the window. **Both design questions
+  are answered: do not build `--tool-schema full`, and structured JSON output is not indicated for
+  parsing.** It exposed #29 (an over-large system prompt fail-fasts the Windows model host and wedges
+  the NPU machine-wide), #30 (`/healthz` says ready throughout) and #31 (the streamed shape is
+  unmeasured).
 - **#22:** an unwrapped zero-argument call reads as content. Accepted in D83, not a defect.
 - **#11:** Aion 1.0 Plan — native tool calling would bypass chunk 7's emulation; still no SDK.
 - **#2:** the Aion hardware half, blocked on the OS (D70).

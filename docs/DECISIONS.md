@@ -1754,29 +1754,59 @@ the prediction was wrong in both directions: compliance is far better than 60 to
 case is unreachable for a different reason than compliance.
 
 **D93. The hard case does not fit, and what does not fit is the tool schemas.** A real agent client
-(Hermes Agent v0.21.2, the first ever driven against this bridge) presents ~40 KB of tool-schema JSON
-for its 25 tools. Phi Silica's usable window is 3,581 tokens. Measured with `hermes prompt-size`,
-which is offline and makes no API call: the default configuration is ~102 KB of fixed prompt
-(~25,000 tokens, 7x the window); stripped to a fresh config root in an empty directory it is still
-~48 KB (~12,000 tokens, 3x). No Hermes configuration fits. Restricted to one toolset (`-t clarify`)
-it works and answers correctly in 13.1 s, from inside this repository as well as from an empty
-directory — so the binding constraint is the **toolset**, not the working directory and not the
-system prompt. The `AGENTS.md`/cwd context tier, at 46 KB the obvious suspect, turned out not to be
-what pushed it over. `docs/CLIENTS.md` carries the four-row table.
+(Hermes Agent v0.21.2, the first ever driven against this bridge) puts **23 tools and 37,069 bytes of
+tool-schema JSON on the wire** — measured from the client's own captured request dumps, not estimated.
+`hermes prompt-size` reports 25 tools and ~40 KB; it counts every toolset regardless of what a run
+actually sends, so it overstates, and the wire figure is the one to quote.
+
+Phi Silica's usable window is 3,581 tokens, and the tool schemas alone are ~10,000 — **nearly three
+times the window on their own**. The whole fixed prompt is three to seven times it: `prompt-size`
+gives ~102 KB (~25,000 tokens) for the default configuration and ~48 KB (~12,000) stripped to a fresh
+config root in an empty directory. **No full-toolset configuration fits** — the earlier phrasing "no
+Hermes configuration fits" was wrong, since `-t clarify` demonstrably does.
+
+Restricted to one toolset it works and answers correctly in about 13 s, from inside this repository as
+well as from an empty directory, so the binding constraint is the **toolset** rather than the working
+directory: the `AGENTS.md`/cwd context tier, at 46 KB the obvious suspect, is not what pushed it over.
+That much is a designed 2x2 comparison. "Not the system prompt" is weaker — the two failing requests
+carried 55,663 and 8,061 characters of system message and both failed, which is consistent with it,
+but nothing captured what the successful `-t clarify` runs sent. `docs/CLIENTS.md` carries the table.
+
+One thing the wire dumps settle that the prose had guessed at: **neither captured request set
+`stream`**, so nothing on this branch exercised the buffered streaming branch on hardware (issue #31).
+And because the rendered system-text length of those requests was never logged, whether they crossed
+D94's 44,000-character boundary is inferred from the identical `COMException` and crash signature,
+not shown — the empty-cwd request in particular may have sat below it and crashed anyway.
 
 **D94. An over-large system prompt crashes a Windows system component, and that reframes the fix.**
 Native placement sends the system text — which is where tool emulation (D83) renders the tool block —
-to `CreateContext`. Up to 40,000 characters the preflight answers correctly and the request is a
-clean 400 `context_length_exceeded` in 0.45 to 1.2 s. At 44,000 and above, `CreateContext` throws,
-and the throw is the client-side symptom of `WorkloadsSessionHost.exe` fail-fasting with exception
-`0xc0000409` (STATUS_STACK_BUFFER_OVERRUN) in `ntdll`. 36 crashes were logged in two hours, clustered
-exactly on the intervals when oversized prompts were sent. Repeated crashes wedge Phi Silica for the
-whole machine: every generation afterwards, including a bare "reply PONG" with no tools and no system
-text, returns 502 `The RPC server is unavailable` in 3 to 17 ms; `/healthz` keeps reporting
-`status: ready`; the wedge lasts minutes; a bridge restart alone does not clear it; the host
-processes are protected and survive `Stop-Process -Force`. It self-heals after several minutes
-(verified recovered, 6/6 at 413 to 619 ms). The same volume sent as a *user* message is refused
-correctly at every size to 96,000 characters, so this is specific to the system text.
+to `CreateContext`. Below about 8,000 characters the request simply succeeds. From 16,000 to 40,000
+the preflight answers correctly and the request is a clean 400 `context_length_exceeded` in 0.45 to
+1.2 s. At 44,000 and above, `CreateContext` throws, and the throw is the client-side symptom of
+`WorkloadsSessionHost.exe` fail-fasting with exception `0xc0000409` (STATUS_STACK_BUFFER_OVERRUN) in
+`ntdll`.
+
+**Eighteen** `0xc0000409` fail-fasts were logged, all inside 12:22:18 to 12:26:56 — the interval when
+oversized prompts were being sent — and **none in the preceding three days** of ordinary Phi Silica
+use. That is the evidence for the causal claim, and it is narrower and stronger than the "36 crashes"
+this entry first recorded: 36 was the count of *all* `WorkloadsSessionHost` faults in that hour, which
+lumps in 12 `0xc0000374` heap-corruption faults in `ntdll` and 6 `0xc0000005` access violations in
+`tokapi.dll`. The tokapi signature recurs daily with no probe running (103 in the same three days) and
+is not attributed here.
+
+Repeated crashes wedge Phi Silica for the whole machine: every generation afterwards, including a bare
+"reply PONG" with no tools and no system text, returns 502 `The RPC server is unavailable` in 3 to
+17 ms; `/healthz` keeps reporting `status: ready`; the host processes are protected and survive
+`Stop-Process -Force`. The same volume sent as a *user* message is refused correctly at every size to
+96,000 characters, so this is specific to the system text.
+
+**Recovery behaved differently in the two episodes seen, and this entry does not pretend otherwise.**
+In the crash-induced wedge, a bridge restart produced one successful generation and then failed again;
+it cleared on its own several minutes later (verified recovered, 6/6 at 413 to 619 ms). A separate RPC
+wedge earlier the same day arrived after roughly 86 successful generations with no oversized prompt,
+did *not* self-clear across 24 consecutive calls, and *was* cleared by a process restart (issue #30).
+Whether these are one fault with different timing or two faults is unresolved. A reader hitting either
+should try a restart, and wait several minutes before concluding the machine is broken.
 
 So the guard proposed in issue #29 — count the system text with the backend's `ITokenCounter` before
 calling `CreateContext`, refuse with 400 when it alone cannot fit — is not wire-conformance tidiness.
@@ -1787,20 +1817,45 @@ the boundary offline with the token counter instead. A Feedback Hub report is wa
 a user-supplied string length reaching `__fastfail` in a system service is a Windows defect.
 
 **D95. Compliance is not the problem, and the two design options PLAN left open are both closed.**
-`scripts/tool-probe.ps1` (new) measured five dimensions over 114 real generations with zero bridge
+`scripts/tool-probe.ps1` (new) measured five dimensions over 115 recorded calls with zero bridge
 defects — no malformed body, no non-null content beside `tool_calls`, no invalid JSON arguments, no
 protocol leaking into content. Tool count 1 to 25 at 5 runs each: 40/40 right tool, correct
 arguments. System prompt at 0, 526 and 1,501 tokens: 9/9. Multi-step, the first hardware exercise of
-`PromptTemplate`'s tool rendering: turn 2 answered in prose with `finish_reason: stop` rather than
-repeating the call. Window occupancy at 50 %, 70 %, 70 %-reversed and 85 % of the window, 8 runs each
+`PromptTemplate`'s tool rendering: turn 2 did not repeat the call and finished `stop`. It answered
+inside a JSON envelope (`{"reply":"Yes, it may be better to carry an umbrella as it is cloudy."}`),
+not in prose as this entry first said — which the parser correctly read as content, because the
+object declares neither `name` nor `arguments`. That is a near-miss on D83's "a false positive is
+worse than a miss" rule and worth knowing.
+
+The 115 recorded calls break down as 40 tool-count + 6 schema-depth (corrected re-run) + 9
+system-prompt pressure + 1 multi-step record covering 2 generations + 32 occupancy validation, plus
+the 21 of the retracted first sweep and the 6 of the superseded schema-depth run. Earlier drafts said
+"114" and the working report said "82"; neither reconciled to the evidence files, and this does. Window occupancy at 50 %, 70 %, 70 %-reversed and 85 % of the window, 8 runs each
 under `temperature: 0`: **32/32**, every call the right tool with correct arguments.
 
 PLAN predicted "frequent argument hallucination, prose-wrapped JSON, calling tools that weren't
-offered". None occurred: arguments were valid JSON in every call, no unoffered tool was ever called,
-the parser never leaked protocol. So **`--tool-schema full` should not be built** — compact rendering
-already consumes the window and a fuller form moves the boundary the wrong way — and **structured
-JSON output** (2.4.x stable, Phi Silica only) **is not indicated**, because parsing was never the
-failure and it would buy back no window. Both are closed on issues #3 and #1.
+offered". Mostly it did not happen, but **one of the three did, and the first draft of this entry
+erased it.** In the retracted stochastic sweep's 70 % cell, all three runs called `weather` — a name
+that was never offered; the catalog holds `get_weather`. It did not recur under `temperature: 0`
+(32/32 correct), so it is not a property of occupancy, but it is the one model-side compliance
+failure in the whole dataset and it is exactly the failure PLAN named. Arguments parsed as valid
+JSON in every call that recorded them, and the parser never leaked protocol.
+
+Scope, because the catalog matters: the probe's tools average ~237 characters each against a real
+agent's ~1,616, every request was `stream: false`, and no positive claim here extends past 85 %
+occupancy. The `SystemPromptPressure` dimension recorded only "called" and "right tool", so the
+argument claim covers the 96 calls where arguments were actually checked, not all of them. The
+schema-depth dimension is part of this: its first run recorded `Fidelity = False` across all six
+calls because of a probe bug (`param($args)` shadowing PowerShell's automatic variable), and the
+corrected re-run is what the 3/3 above refers to.
+
+So **`--tool-schema full` should not be built** — compact rendering already consumes the window and a
+fuller form moves the boundary the wrong way. **Structured JSON output** (2.4.x stable, Phi Silica
+only) **is not indicated for parsing** — parsing was never the failure and it buys back no window —
+but the ruling is narrower than the first draft claimed: constraining emission to an enum of offered
+tool names is precisely what it would be good for, and the `weather` hallucination is the one thing
+it would have prevented. Revisit if that recurs. Issues #3 and #1 close on the parsing question, not
+on tool-name fidelity.
 
 **D96. A retraction, and why the first run said otherwise.** The first occupancy sweep reported
 compliance degrading at ~70 % of the window (0/3, a hallucinated tool *name*), recovering at 85 %,

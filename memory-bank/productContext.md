@@ -63,10 +63,12 @@ so those tools can run fully local, offline, and free.
   and arrives in one chunk, because nothing can tell a call from prose until the model has stopped.
   `--tool-emulation off` turns the feature off for the process, and only then are `tools` and
   `tool_choice` reported as accepted-and-ignored with one warning each; `tool_choice: "none"` turns
-  it off for a single request and reports nothing. Measured on Phi Silica: twenty runs of a one-tool,
-  one-argument request called the tool twenty times; the many-tool agent case is unmeasured (issue
-  #21), and a zero-argument call written without the `tool_calls` wrapper reads as content (issue
-  #22).
+  it off for a single request and reports nothing. Measured on Phi Silica: 20/20 on the one-tool case,
+  and the many-tool agent case measured 2026-09-12 (issue #21, D93 to D96) at 40/40 over 1 to 25 tools
+  and 32/32 at up to 85 % window occupancy. The limit is the window, not the model's protocol
+  discipline: a real agent's tool schemas alone are nearly three times it, and the tool block goes into
+  the system text, where over ~40,000 characters it crashes the Windows model host (issue #29). A
+  zero-argument call written without the `tool_calls` wrapper reads as content (issue #22).
 - A continuing conversation hits the context cache (`--context-cache-size`, default 4) and sends only
   its newest turns. The reply is the one a replay would give, sooner. Context overflow returns
   HTTP 400 `context_length_exceeded`, decided by the backend's preflight before any generation where

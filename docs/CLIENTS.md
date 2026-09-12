@@ -196,12 +196,18 @@ request costs 30–40 s of NPU time.
 
 Measured on 2026-09-12, same prompt each time:
 
-| Hermes configuration | Tools offered | Result |
+| Hermes configuration | Tools on the wire | Result |
 |---|---|---|
-| Default config, in a repo | 25 (~40 KB) | 502 `backend_error` after 3 retries, 38.9 s |
-| Fresh config root, empty cwd, all toolsets | 25 (~40 KB) | 502 `backend_error` after 3 retries, 33.6 s |
-| Fresh config root, `-t clarify` | 1 | **answered correctly, 13.1 s** |
-| Default config in a repo, `-t clarify` | 1 | **answered correctly, 13.1 s** |
+| Default config, in a repo | 23 (37.1 KB) | 502 `backend_error` after 3 retries, ~37 s |
+| Fresh config root, empty cwd, all toolsets | 23 (37.1 KB) | 502 `backend_error` after 3 retries, ~32 s |
+| Fresh config root, `-t clarify` | 1 | **answered correctly, ~13 s** |
+| Default config in a repo, `-t clarify` | 1 | **answered correctly, ~13 s** |
+
+The tool counts and byte figures are read from Hermes's own captured request dumps, which is why they
+differ from `hermes prompt-size`: that command reports every toolset's schema regardless of `-t` and
+regardless of Hermes's own tool-search tiering, so it says 25 tools and ~40 KB where the wire carries
+23 and 37.1 KB. Neither failing request set `stream`, so the bridge's buffered streaming path was not
+exercised by these runs (issue #31).
 
 So the binding constraint is the **toolset**, not the working directory and not the system prompt:
 restricting tools with `-t` is what makes Hermes work here, and the `AGENTS.md`/cwd context tier

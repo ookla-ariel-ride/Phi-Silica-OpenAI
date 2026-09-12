@@ -1,242 +1,159 @@
-# Session handoff, 2026-09-12, after the chunk 8 merge (D84 to D92)
+# Session handoff, 2026-09-12 (afternoon), issue #21 measured — PR #32 open and NOT ready to merge
 
-Supersedes the handoff written after the chunk 7 merge (in git history). Chunk 8 was the last chunk:
-**`docs/PLAN.md` is now fully built.** Everything below was verified at write time.
+Supersedes the handoff written after the chunk 8 merge (in git history). All eight chunks remain
+merged; this session did no product-code work at all. It measured issue #21 on hardware, drove a real
+agent client against the bridge for the first time, and found an OS-level crash on the way.
 
-A note on how this file came to be written: the session that merged chunk 8 crashed immediately after
-filing issues #24 to #28, at the moment it announced the state-doc pass. The merge, the push and the
-issues had all completed; none of the state docs had been touched. This file, `CLAUDE.md`,
-`docs/PLAN.md` and `memory-bank/` were brought up to date in a following session from the transcript,
-the commits and a fresh survey. If something here reads as thinner than the chunk-7 handoff, that is
-why — the detail is in `docs/DECISIONS.md` D84 to D92, which the crashed session did finish.
+**Read the "Stop here first" section before doing anything with PR #32.**
 
-## Where things stand
+## Stop here first
 
-- `main` is at `2114c36`, the only branch, in sync with origin, tree clean. Chunk 8 merged as a
-  fast-forward of `feat/chunk-8-scheduler`, 38 commits, `84f6bf3..2114c36`; the branch is deleted.
-- **All eight chunks are merged.** Chunk 6 remains the only one code-verified rather than
-  hardware-verified (D70; issue #2 open). Work from here is GitHub issues, not chunks.
-- 932 tests pass, 0 skipped — re-run and confirmed on 2026-09-12 after the merge.
-- `smoke.ps1 -Backend phi-silica` passed at the chunk 8 merge (28 PASS / 0 FAIL / 0 SKIP / 5 INFO,
-  first attempt, no RPC flake) **and again on 2026-09-12 after the folder rename and the identity
-  re-register**: `All steps passed (0 skipped, 5 informational)`, no FAIL and no WARN rows, no RPC
-  flake. The rows that matter:
-  - `identity=True`, `bootstrap: ok`, `ready_state: Ready`, `text_mismatches: 0`, `late_deltas: 0`,
-    `package_family_name: NpuBridge_jtas4mnxdyzpe` — so the re-registration took.
-  - Two concurrent requests: both completed, `queue_depth` peaked at 1 while both were outstanding,
-    proving the second waited on the scheduler rather than taking its own context (D84).
-  - `--queue-capacity 1`, three concurrent requests: 1 admitted (200), 2 rejected (429,
-    `Retry-After=1s`, `error.type=rate_limit_error`, `error.code=queue_full`).
-  - `/v1/completions` on both shapes: `id=chatcmpl-…` (D91's kept prefix, visible on the wire),
-    `text='PONG'`, and the streamed shape 4 chunks, ttft 306.6 ms, total 473.9 ms.
-  - Tokenizer boundaries unchanged from D80: 3581 / 3543 / 3581 phi-3 tokens for the fox, JSON and
-    CJK texts, spread 38 tokens.
-- Open issues: #2, #11, #14, #15, #16, #17, #19, #21, #22, and #24 to #28 filed by chunk 8. #4 is
-  closed by this chunk. #19 was closed twice by the closing-keyword accident described below and has
-  been reopened both times; check it is still open.
+`main` is unchanged at `fb6e8b4`. All of this session's work is on branch
+**`probe/issue-21-hard-case`**, pushed, with **PR #32 open**. The PR is **not ready to merge**, for a
+reason that matters more than the usual "needs review":
 
-## Read this before touching the machine
+A whole-branch adversarial review (a separate agent, which did not write any of it) found that the
+documentation systematically overstated the result. Its summary was blunt and correct: *every
+discrepancy makes the result look cleaner than the evidence does.* The measurements themselves held
+up; the write-up of them did not.
 
-**The local folder was renamed to `npu-bridge` on 2026-09-12, after the merge.** `identity.ps1`
-registers the sparse package with `Add-AppxPackage -ExternalLocation $BinDir`, so the registration
-made under the old `Phi-Silica-OpenAI` path no longer points anywhere real.
+**About half of its findings are fixed; the rest are not.** The session was paused mid-correction.
+Do not merge until the outstanding list below is closed, and do not trust any number in the PR body,
+which has not been corrected at all.
 
-- **Done on 2026-09-12**: `.\scripts\identity.ps1 -Install` was re-run and succeeded. If you rename
-  the folder again, this is the step.
-- `identity.ps1 -Status` will **not** tell you this. It prints the WindowsApps `InstallLocation`,
-  which is the sparse package's own location and unchanged; the external location is what broke, and
-  the script does not print it. The symptom is the relaunch failing with "registered for
-  \<other folder\>".
-- That re-run exercised a path nothing had before, which settles a question the chunk-7 handoff had
-  left as an assumption. `Add-AppxPackage` **refused** the in-place update —
-  `HRESULT 0x80073D0B`, "already installed with a different external location" — and D82's
-  remove-then-add fallback took over and succeeded. So "a re-run after a rebuild removes nothing,
-  because `Add-AppxPackage` updates a same-identity registration in place" is true only while the
-  external location is unchanged. A folder rename is the case that refuses, and the fallback D82 kept
-  as merely defensive is the only reason `-Install` still worked. It also means issue #19's unguarded
-  superseded-removal is on a live path, not a hypothetical one.
+## What was actually measured (this part is solid)
 
-## What chunk 8 did
+- **The hard case does not fit, and what does not fit is the tool schemas.** Hermes Agent v0.21.2 puts
+  23 tools and 37,069 bytes of tool JSON on the wire (read from its own captured request dumps under
+  the scratchpad, not estimated). Phi Silica's window is 3,581 tokens; the schemas alone are ~10,000,
+  nearly 3x. The whole fixed prompt is 3 to 7x. Restricted to one toolset (`-t clarify`) Hermes works
+  and answers correctly in about 13 s — **the first time any real agent client has run against this
+  bridge.**
+- **Compliance is not the problem.** 115 recorded calls, zero bridge defects. 40/40 across 1 to 25
+  tools; 3/3 flat and 3/3 deep schemas; 9/9 under system-prompt pressure; 32/32 at 50/70/70-reversed/85
+  % window occupancy under `temperature: 0`; a multi-step round trip that did not repeat the call.
+- **Both open design questions are closed.** Do not build `--tool-schema full`. Structured JSON output
+  is not indicated *for parsing*. See the caveat in D95 — the ruling is narrower than it first read.
+- **One real compliance failure exists and must not be erased again.** In the retracted stochastic
+  sweep, three generations called `weather`, a tool never offered. It did not recur at
+  `temperature: 0`. The first draft of D95 said "no unoffered tool was ever called", which was false
+  and deleted the single most decision-relevant observation in the dataset. It is now recorded.
+- **A retraction, not a caveat (D96).** The first occupancy sweep reported degradation at ~70 % of the
+  window. The probe hardcoded n=3 ignoring `-Runs`, set no `temperature`, and left the target tool in
+  the easiest catalog position. Re-run deterministically with the position control, that cell is 8/8
+  and a reversed-content control is 8/8. Both corrections landed together, so **neither can be singled
+  out as the cause** — say so rather than guessing.
 
-Five tasks, each reviewed on landing, then a whole-branch review. The decisions are D84 to D92; what
-follows is why each exists rather than what it says.
+## The dangerous finding: do not rediscover this the hard way
 
-1. **The scheduler** (`Api/GenerationScheduler.cs`): one worker on a bounded `Channel<GenerationJob>`,
-   `--queue-capacity` (default 4) read for the first time since chunk 1 accepted it.
-2. **D84 is the chunk's real content, and a review found it.** The task brief instructed the
-   implementer to put the queue wait *after* the cache lookup and the preflight. That contradicts
-   PLAN §2.7, and it would have shipped a scheduler that serialized `GenerateAsync` while
-   `CreateContext` and `GetUsablePromptLength` — calls on the same single `LanguageModel` handle —
-   still raced across request threads. The bug the chunk exists to fix would have survived the chunk.
-   The implementer could not have found this: it built exactly what it was told. The reviewer, which
-   had not written the code, did. The ruling was that the spec beats the brief.
-3. **`/v1/completions`** (D91): `prompt` wrapped into one user message, then the identical pipeline
-   from the model-id check onward. Four wire rulings PLAN had left open are recorded there.
-4. **`Api/StreamingPipeline.cs`**: the ~160 lines of SSE plumbing the two streamed endpoints had
-   duplicated, extracted as a byte-identical move before `/v1/completions` could make it a third copy.
-   The two copies had never drifted, which is the only reason the move was safe to do mechanically.
-5. **`docs/CLIENTS.md`**: OpenCode, Hermes, `curl` and the Python `openai` SDK, with the five things
-   that catch every client on the first try. The Hermes identity is explicitly hedged in the document
-   as matched on best-fit grounds and not verified against a running instance — leave that hedge in
-   until someone runs it.
+**A system prompt much over 40,000 characters crashes a Windows system component** (issue #29, D94).
+It does not merely throw. `WorkloadsSessionHost.exe` fail-fasts with `0xc0000409`
+(STATUS_STACK_BUFFER_OVERRUN) in `ntdll`. Eighteen such fail-fasts were logged, all inside the
+4½-minute interval when oversized prompts were being sent, and none in the preceding three days of
+ordinary use.
 
-The whole-branch review's catch, fixed in the final commit `2114c36`: the streamed shapes' first-frame
-hook could stamp a *partial* truncated-turns count as permanent if a keep-alive landed in the middle
-of the truncation loop, plus a sibling window in the status-driven retry path that the review's own
-write-up had incorrectly called safe.
+Consequences, all observed:
+
+- Every generation afterwards — including a bare "reply PONG" with no tools and no system text —
+  returns 502 `The RPC server is unavailable` in 3 to 17 ms.
+- `/healthz` keeps reporting `status: ready` throughout (issue #30). The bridge looks healthy while
+  nothing can generate.
+- The host processes are protected: `Stop-Process -Force` does not touch them.
+- Recovery differed between the two episodes seen. The crash-induced wedge gave one successful
+  generation after a bridge restart and then failed again, clearing on its own minutes later. A
+  separate wedge earlier the same day, arriving after ~86 successful generations with no oversized
+  prompt, did not self-clear over 24 calls and *was* fixed by a restart. Whether these are one fault
+  is unresolved.
+
+This cost two entire probe runs before the cause was found. **Tool emulation renders the tool block
+into the system text**, so this is reachable by ordinary work, not just by deliberate probing. Find
+limits with `POST /debug/tokenize`, never by sending the request.
+
+## Outstanding review findings — the merge blockers
+
+Fixed already: the `weather` erasure (D95), the crash-count conflation (D94 now says 18 `0xc0000409`
+rather than 36 mixed signatures), the restart/self-heal contradiction (D94 now records both episodes),
+the 400-regime floor (16,000 not 0), the Hermes wire figures (23 tools / 37,069 B, not 25 / 40 KB),
+"no Hermes configuration fits" (now: no *full-toolset* configuration), the `stream` claim (neither
+captured request set it, so nothing exercised the buffered branch), the 114 → 115 count with its
+breakdown, "turn 2 answered in prose" (it answered in a JSON envelope), the toolset 3-7x → nearly 3x
+in README and CLAUDE.md, the README safety ceiling 44,000 → 40,000 plus the `/healthz`-and-retry-storm
+consequences, and the CLIENTS.md wire table.
+
+**Still to do:**
+
+1. **The PR #32 body is uncorrected** and repeats the original overstatements — "no unoffered tool was
+   ever called", "114 real generations", the 3-7x toolset claim, 25 tools / ~40 KB. Rewrite it from
+   the corrected D93 to D96 before merging. This is the most visible wrong text remaining.
+2. **`report-tool-probe.md`** (in the scratchpad, not the repo) still says "82 real generations".
+   Either correct it or stop citing it.
+3. **Hermes timing provenance.** 13.1 s appears for two independent runs to a tenth of a second, and
+   38.9/33.6 s do not match the request dumps' own stamps (~36 s and ~31 s). CLIENTS.md now rounds to
+   "about 13 s" / "~37 s"; D93 should match, or state that the figures are process wall-clock.
+4. **`CLAUDE.md` says "932 tests pass"** in bare present tense with no date, and the suite was **not
+   run this session** — a live bridge held the exe locked, which is the `dotnet test` trap this branch
+   documents. CI on PR #32 is the check; confirm it before trusting the line.
+5. **`memory-bank/projectbrief.md`** (lines ~68, ~82) still lists #21 as unmeasured and open.
+   `progress.md` line ~39 still lists it among open work. Both need the same treatment the other
+   memory-bank files got.
+6. **D95 does not mention the schema-depth dimension** even though it is one of the five and the only
+   one whose first run was invalidated by a probe bug. Conspicuous omission in the permanent record.
+7. **The committed `scripts/tool-probe.ps1` is not the script that produced the dimensions 1-4
+   evidence** — it gained rendered-char reporting afterwards. D95 reads as though one script produced
+   everything.
+
+## Where the evidence lives
+
+Scratchpad (session-local, will not survive indefinitely — copy anything you need):
+`...\6e644ee2-fc68-498c-aa73-fa9bed83cbbe\scratchpad\`
+
+- `report-tool-probe.md` — the consolidated report (see item 2 above)
+- `tool-probe-result.json` (56 calls, dimensions 1-4) and its transcript
+- `tool-probe-schemadepth-rerun-result.json` (6 calls, corrected dimension 2)
+- `tool-probe-windowocc-result.json` (21 calls — **the retracted sweep**)
+- `tool-probe-windowocc-validation-result.json` (32 calls — the deterministic re-run that stands)
+- `hermes-home\sessions\request_dump_*.json` — the two failing Hermes requests, wire-level. These are
+  the primary source for the 23-tools/37,069-byte figures and for the absent `stream` key.
+
+The crash evidence is in the Windows Application event log, provider "Application Error", filtered to
+`WorkloadsSessionHost`. Note that `0xc0000005` in `tokapi.dll` recurs daily and is unrelated — 103 in
+three days with no probe running. Only the 18 `0xc0000409` events correlate.
+
+## Issues filed this session
+
+- **#29** — over-large system prompt fail-fasts the model host. Has a severity-upgrade comment with
+  the crash evidence. Its guard (count the system text before `CreateContext`, refuse with 400) is the
+  fix, and it should sit well below 40,000 characters rather than at the observed edge.
+- **#30** — `/healthz` reports ready while every generation fails.
+- **#31** — the streamed shape and the tool-call cache round trip are unmeasured on hardware.
+- **#21** — has a results comment; `closes #21` is in commit `2be3d62`, so it closes when PR #32 lands.
 
 ## Do this next
 
-There is no next chunk. In rough order of value:
+1. **Finish the outstanding list above, then merge PR #32.** Start with the PR body (item 1).
+2. **Issue #29's guard** is the highest-value code change available. It stops this bridge from crashing
+   an OS service, and the pieces exist (`Phi3TokenCounter`, the 3,581 figure).
+3. **Issue #31** if you want the tool-calling story complete: a `-Stream` switch on `tool-probe.ps1`
+   re-running two cells and asserting the assembled `tool_calls` match the JSON shape byte for byte.
+   Determinism makes that comparison meaningful now, which it was not before D96's fix.
+4. **A Feedback Hub report to Microsoft** for the `__fastfail`. A user-supplied string length reaching
+   `__fastfail` in a system service is a Windows defect independent of what this bridge does about it.
+5. The older queue stays as it was: #24 to #28 (chunk 8 leftovers, #25 is the only client-visible one),
+   then #14, #15, #17, #19.
 
-1. **Issue #21**, the tool-call compliance measurement the smoke probe does not make: 10-plus tools,
-   nested schemas and a 3K-token agent system prompt, which is the shape OpenCode actually presents.
-   It needs hardware and about an hour, and its answer decides whether `--tool-schema full`, structured
-   JSON output (2.4.x stable, Phi Silica only) or nothing at all is worth building. This is the one
-   open question that could still change the product.
-2. **Drive a real client.** `docs/CLIENTS.md` is written but nothing in it has been exercised end to
-   end by OpenCode or Hermes against this bridge — the "verifiable only on the laptop" column of
-   PLAN's row 8 is still unticked. That is the honest completion of chunk 8.
-3. **Chunk 8's own leftovers**, #24 to #28. #25 is the only one a client can hit (a foreign
-   `OperationCanceledException` escaping `/debug/generate` as a bare 500); #26's first item is the
-   ~60-line JSON duplicate, which is the D56/D57/D81 shape recurring for the fourth time and worth
-   closing before it drifts; #28 is the unbounded drain wait, whose correct fix is "leak and reap
-   later", never a bounded timeout-then-dispose (that reinstates the race D51 removed).
-4. **Issues #14, #15, #17, #19** whenever there is an hour. #19 matters slightly more now than it
-   did: the folder rename makes `identity.ps1 -Install` a thing you will actually run, though the
-   defects themselves still only bite at a version bump.
-5. **When a Windows build with Aion Instruct behind the Phi Silica API arrives:**
-   `smoke.ps1 -Backend phi-silica` under the registry key, re-check D31, decide the fate of the
-   preview adapter, and run the tokenizer step before trusting the Phi-3 counter for that model. When
-   any Aion generation runs at all, re-check the status-driven overflow path (D73) and measure its
-   tokenizer the way D80 did.
-6. **Undecided, waiting on the owner:** whether the runtime RPC fault deserves a `bug` issue and a
-   recreate-the-model fix, or stays a documented surprise (`docs/FUTURE.md`, README).
+## Method notes worth keeping
 
-## Things learned in chunk 8 worth keeping
-
-- **Publish-before-arm is a shape, not an incident (D92).** `ScheduleAsync` wrote a job to the channel
-  before finishing the state that job needed, and the worker could dequeue, run and settle inside the
-  window. It produced two separate bugs on one branch — a leaked cancellation registration and a
-  `_liveQueueDepth` stuck permanently high. When you hand work to another thread, arm everything it
-  can observe before you publish it.
-- **On ARM64, `Volatile` is not always enough.** The fix needed `Interlocked` on *both* sides because
-  the two flags form a Dekker-pair store/load, and ARM64's memory model permits the store-buffer
-  reordering that per-field release/acquire does not close. This project's exe targets ARM64, so this
-  is not a theoretical concern here. Measured: 3 failures in 5 runs without the fix, 8 clean with it.
-- **A probabilistic regression test is a placeholder, not a guard.** D92's catches the bug about 60 %
-  of the time over 500 sequential jobs. It was filed as #24 rather than left to look like coverage.
-- **A decision entry that is wrong about its own history is worth correcting.** D92's first draft
-  claimed a third bug of this shape; re-examination found the third candidate is a plain data race,
-  not a publish-before-arm window. The final commit corrects the count rather than leaving the record
-  inflated.
-- **Don't carry a lease out on a task's return value (D85).** The first wiring read the lease off the
-  scheduled task's `ChatAttemptResult`. A streaming client that vanishes mid-frame unwinds before the
-  task is unwrapped, so `finally` saw `null` and never released the context — D43's "a context is
-  disposed on every path that creates one" and D51's ordering both silently defeated by a refactor
-  neither rule mentions. It cost a fix round and four of that round's five failing tests.
-- **When queueing an operation, ask what else touches the shared resource.** The whole of D84 is that
-  `Acquire` is not bookkeeping; it makes two calls on the same handle the generation uses.
-- **A retry should not re-enter the queue it already passed (D86).** Re-queueing a truncating retry
-  could 429 a request that is already mid-flight, which is the worst possible moment to shed load.
-- **A depth counter must decrement on abandonment, not only on service (D87).** `Reader.Count` only
-  shrinks on dequeue, so a caller that enqueued, gave up and retried against one long generation left
-  every dead job counted — inflating both `/healthz` and the `Retry-After` that multiplies by it.
-- **Accepting a loss of fidelity is a decision and needs writing down (D89).** The queue wait sits
-  inside D52's first-frame boundary, so a clean 400 or 429 can become an SSE error event once the wait
-  reaches about a second. Engineering around it would reintroduce the failure D52 exists to prevent,
-  so it is accepted and recorded rather than quietly tolerated.
-- **Two names for one cancellation (D88).** A job dropped while queued and a job that ran and threw
-  its own `OperationCanceledException` look alike at the call site and are opposites: one is a
-  shutdown, the other is a backend contract violation. The enum carries `Ran` so the wire can tell
-  them apart.
-- **An extraction is safe to do mechanically only when the copies have not drifted.** The
-  `StreamingPipeline` move was byte-identical, and that was checked rather than assumed.
-- **`identity.ps1 -Status` does not show the external location**, so it reports a folder-renamed
-  registration as healthy. Discovered by reading `Add-AppxPackage -ExternalLocation $BinDir` at
-  `scripts/identity.ps1:254,265`, not from the status output. The re-register then proved it: the
-  in-place update was refused with `0x80073D0B` and the remove-then-add fallback carried it. A
-  defensive branch nobody had seen fire is not the same as a branch that cannot fire.
-
-## Things learned earlier that still apply
-
-- The model runtime can fail its RPC channel on the first generation after a start ("The remote
-  procedure call failed", then "The RPC server is unavailable" for the rest of that process). A smoke
-  run that fails that way on its *first* generation is the flake; re-run once. The same fault on a
-  later generation is real. Chunk 8's run did not hit it.
-- Do not `dotnet build` while `smoke.ps1` has a server up: the exe is locked and the copy fails. This
-  applies across agents as well as within one.
-- Under package activation the server's console output is not in the smoke log; `/healthz` and the
-  response are the evidence.
-- Never assert on wall-clock timing in a test; gate the fake and assert on ordering (D54). Which gate
-  depends on where the hold must be: `StartGate` before the generation decides anything, including the
-  prompt-length verdict; `FirstTokenGate` after that verdict; `InitGate` during model load.
-- `Task.WhenAny(wait, delay)` settles a tie by argument order; `wait.WaitAsync(timeout)` settles it by
-  which fired first. Spell the preference out rather than inherit it from an overload.
-- `JsonDocument.Parse(string)` throws `ArgumentException`, not `JsonException`, on invalid UTF-16.
-  Check what a framework method throws on malformed input rather than what its name suggests.
-- A BPE boundary is settled only at a whitespace boundary; no fixed lookback is safe.
-- `GetUsablePromptLength` answers in UTF-8 bytes, though Microsoft's page says only "the index".
-- GitHub reads a closing keyword anywhere in a commit message, so "Filed rather than fixed: #19"
-  closed the issue it was filing — and then the commit *recording* that accident quoted the phrase
-  and closed it again. Writing about a closing keyword is still writing one.
-- Store a cached reply in the shape the client will send back, not the shape the model produced (D83).
-
-## Machine facts (do not re-discover)
-
-- Galaxy Book4 Edge, Snapdragon X Elite, Windows 11 ARM64 Insider build 29648 (29661 was taken on
-  2026-09-10 and rolled back; if offered again, expect the same breakage).
-- Git Bash reports `AMD64` under emulation; PowerShell is native Arm64. Trust
-  `RuntimeInformation.OSArchitecture`, not `uname`.
-- .NET SDK 10.0.400 arm64. Sparse package PFN `NpuBridge_jtas4mnxdyzpe`, registered against the Debug
-  build output — **see the rename warning above**. The exe references Windows App SDK
-  2.4.1-experimental.
-- Installed, user scope: `Microsoft.AionInstructPreview.Framework.1.0` 1.0.0.0, the SDK nupkg in
-  `nuget-local/`, `MicrosoftCorporationII.WinML.Qualcomm.QNN.EP.1.8` 1.8.30.0 and `...EP.2`
-  2.2450.47.0. Windows App Runtime 1.8 (8000.946.1701.0) and 2.x present.
-- No `python`. `perl` is in Git Bash and is the reliable way to script multi-line edits, but write the
-  `.pl` file with the Write tool. `scripts/smoke.ps1` is CRLF; the `.cs` and `.md` files are LF.
-  `strings` is not in Git Bash; scan binaries from PowerShell.
-- Safety hook: a command combining a delete with a `C:\Program Files` path is blocked; split it.
-- `smoke.ps1` writes with `Write-Host`; pass `6>&1` and split per line before filtering.
-- The Bash tool has been seen starting with a broken `PATH` (`git: command not found`). Use the
-  PowerShell tool when that happens rather than debugging it.
-
-## Settled, do not re-raise
-
-- The LAF token is not pursued; the experimental channel is the choice (and Aion drops LAF anyway).
-- The Aion blocker on this machine: D70 has everything; only another build or a Feedback Hub report.
-- The cache key is `ConversationKey`, never the rendered prompt (D71); the truncation header is set
-  once a generation is attempted and never on the refusal (D76); sampling parameters are not in the
-  key; no suffix lookup (D78).
-- `model` is required and served-only (D77).
-- The post-generation pipeline is shared, and `GenerationOutcome` reads no cutter: the cut's verdict is
-  a caller argument because when it is legible differs by shape (D57, D81). The
-  `IAsyncEnumerable<string>` responder redesign issue #9 sketched for `FakeBackend` was deliberately
-  not built.
-- The tool-call parser's governing rule is that a false positive is worse than a miss (D83). The three
-  consequences — an unwrapped object needing both `name` and `arguments` (#22), `parameters` accepted
-  only inside the wrapper, and unreadable arguments dropping the call — are deliberate.
-- `SseStream.Started` is the response's `HasStarted`, and the note that asked for the change was wrong
-  about why (D82). Do not re-file it as a defect.
-- **From chunk 8:** the scheduled closure contains `Acquire`, not just the generation (D84); the lease
-  is published from inside it (D85); a truncating retry keeps its slot (D86); `queue_depth` is a live
-  counter (D87); `/v1/completions` keeps the `chatcmpl-` id prefix and refuses a multi-element
-  `prompt` array (D91). D89's fidelity loss on the streamed first frame is accepted, not a bug.
-- Which of two concurrent requests for one conversation ends up owning the cached context is
-  deliberately not promised; the test pins the bound, not the coin flip.
-- Work happens on a branch and fast-forward merges after a review; after the merge, update this file,
-  `CLAUDE.md`, `docs/PLAN.md` and `memory-bank/` **in the same session**. Chunk 8 is the cautionary
-  case: the session crashed in the gap between the merge and this step, and the repository spent a
-  day claiming chunk 8 was the next thing to build.
-
-## Resume checklist
-
-```powershell
-cd C:\Users\jimsi\OneDrive\Documents\GitHub\npu-bridge
-git status; git log --oneline -3                          # expect main at 2114c36, tree clean
-dotnet build; dotnet test                                 # expect 932 passed, 0 skipped
-.\scripts\identity.ps1 -Status                            # expect PFN NpuBridge_jtas4mnxdyzpe (re-registered after the rename)
-.\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 0 skipped, 5 informational
-gh issue list                                             # #2, #11, #14 to #17, #19, #21, #22, #24 to #28
-```
+- **The review earned its cost twice.** It caught the documentation bias described above, and
+  separately caught that the probe would have built a 9.5-million-character request had
+  `/debug/tokenize` ever returned non-200 — 200x past the crash boundary, from a `Max(1, $null)`
+  flooring to 1 with no iteration cap. A measurement tool whose failure mode is crashing the machine it
+  measures is worth reviewing before trusting its numbers.
+- **Writing the record of your own measurement is the conflict.** Every error in this session's
+  write-up pointed the same way. The fix is not more care; it is the separate reviewer with access to
+  the raw evidence files, which is what caught it.
+- **A subagent that verifies before reporting is worth more than a fast one.** The implementer hit the
+  dead backend twice and both times checked rather than reporting 24 x 502 as findings. The per-cell
+  liveness gate it then added is why the third run is trustworthy.
+- **`temperature` unset means every probe cell is a sample, not a verdict.** n=3 at stochastic defaults
+  produced a clean-looking degradation curve that was noise. Any future probe sets `temperature: 0`
+  and controls position before anyone reads a number off it.

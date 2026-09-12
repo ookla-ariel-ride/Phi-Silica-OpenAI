@@ -39,7 +39,7 @@ Standing facts that will cost you a session if you do not know them:
 - **An empty `Get-AppxPackage -Name 'WindowsWorkload.LanguageModel*'` listing is not proof of
   breakage** on 29648. `/healthz` is the check.
 - **A real agent client does not fit.** Measured 2026-09-12 (D93): a terminal agent's tool schemas
-  alone are 3 to 7 times the 3,581-token window, so an agent must have its toolset cut down before it
+  alone are nearly 3 times the 3,581-token window and its whole fixed prompt 3 to 7 times, so an agent must have its toolset cut down before it
   can use this bridge at all. Compliance below that boundary is near-perfect; the window is the
   constraint, not the model's protocol discipline.
 

@@ -100,9 +100,13 @@ rest of both issues stays open, as does the CI job.
 - **A zero-argument call without the wrapper is content** (issue #22, D83). Accepted rather than fixed:
   the safe direction was the one that drops it, and the wrapper form — what the instruction asks for
   and what the model produced 20 times out of 20 — carries zero-argument calls correctly.
-- **Compliance on the hard case is unmeasured** (issue #21). The probe asks one tool with one required
-  string argument; PLAN's pessimism is about 10+ tools, deep schemas and a 3K-token agent prompt, which
-  is the shape OpenCode presents.
+- **Compliance on the hard case was measured on 2026-09-12** (issue #21, D93 to D96). PLAN's pessimism
+  did not survive: 40/40 across 1 to 25 tools, 32/32 at up to 85 % window occupancy under deterministic
+  sampling, and no argument hallucination. The hard case fails for a different reason — a real agent's
+  tool schemas alone are nearly three times the window — and `--tool-schema full` and structured JSON
+  output are both ruled out as a result. What remains deferred from that work is issue #31: every probe
+  request was `stream: false`, so D83's buffered streaming branch and the tool-call cache round trip are
+  still unmeasured on hardware.
 
 ## Chunk 5 deferrals (context cache and overflow handling)
 

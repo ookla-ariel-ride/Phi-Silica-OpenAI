@@ -84,9 +84,13 @@
   reached only through the endpoint suites (#14).
 - `BackendCapabilities.Cancellation` is advertised by `PhiSilicaBackend` and the fake's default and
   read by nothing: no endpoint branches on it, `/healthz` omits it, no test asserts it (#17).
-- Tool-call compliance is measured only at the easy end (#21): one tool, one required string
-  argument, 20/20 on the NPU. Many tools, nested schemas and a 3K-token agent system prompt are the
-  case PLAN predicted 60–80 % for, and nothing here has measured it.
+- Tool-call compliance is measured across the range (#21, D93 to D96, 2026-09-12): 40/40 over 1 to 25
+  tools, 3/3 flat and 3/3 deep schemas, 9/9 under system-prompt pressure, 32/32 at up to 85 % window
+  occupancy under `temperature: 0`, and a multi-step round trip that answered without repeating the
+  call. PLAN predicted 60–80 %. What is **not** measured: every request was `stream: false`, so D83's
+  buffered streaming branch and the tool-call cache round trip are untested on hardware (#31). One
+  compliance failure did occur, under stochastic sampling only — three calls to a tool name never
+  offered — and it did not reproduce deterministically.
 - An unwrapped zero-argument call (`{"name":"get_time"}`) is read as content, because outside a
   `tool_calls` wrapper an object needs both `name` and `arguments` (#22, accepted in D83). A
   streamed tool-call reply delivers no token until the model has stopped; that is the price of
