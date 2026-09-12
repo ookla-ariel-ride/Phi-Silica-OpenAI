@@ -65,6 +65,13 @@
   instead of front-to-back) and only means something run alongside a forward 70% cell in the same
   session, so it is opt-in.
 
+.PARAMETER Stream
+  Re-runs the count=1 and 70% occupancy fixtures with stream: true and temperature: 0, then compares
+  their assembled SSE tool_calls and finish_reason with the JSON-shape run of the same fixture.
+
+.PARAMETER SelfTest
+  Runs the offline SSE assembly, parity, and wire-shape fixtures without contacting a bridge.
+
 .PARAMETER JsonOut
   Where to write the machine-readable summary (default a timestamped file under $env:TEMP, so
   successive runs never silently overwrite each other's evidence). Every number in the human report
@@ -89,6 +96,8 @@ param(
     [string[]] $Include = @('All'),
     [ValidateSet('25%', '50%', '70%', '70%-reversed', '85%', '95%', '110%', '150%')]
     [string[]] $OccupancyCells = @('25%', '50%', '70%', '85%', '95%', '110%', '150%'),
+    [switch] $Stream,
+    [switch] $SelfTest,
     [string] $JsonOut = (Join-Path $env:TEMP "npu-bridge-tool-probe-result-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"),
     [int] $TimeoutSec = 60
 )
@@ -100,6 +109,9 @@ $dimensions = if ($Include -contains 'All') { @('ToolCountSweep', 'SchemaDepth',
 $script:defects = [System.Collections.Generic.List[object]]::new()
 $script:cells = [System.Collections.Generic.List[object]]::new()   # one row per cell (per dimension x parameter value)
 $script:calls = [System.Collections.Generic.List[object]]::new()   # one row per individual HTTP call, for the JSON dump
+$script:streamedCalls = [System.Collections.Generic.List[object]]::new()
+$script:parityResults = [System.Collections.Generic.List[object]]::new()
+$script:cacheBrackets = [System.Collections.Generic.List[object]]::new()
 
 function Write-Section([string] $name) {
     Write-Host ''
@@ -117,6 +129,311 @@ function Add-Defect([string] $context, [string] $description, $evidence) {
     if ($evidence) { Write-Host "      $evidence" -ForegroundColor Red }
 }
 
+
+# --- streamed tool-call helpers ----------------------------------------------------------------------
+
+function Test-IntegerValue($value) {
+    $value -is [byte] -or $value -is [sbyte] -or $value -is [int16] -or $value -is [uint16] -or
+    $value -is [int32] -or $value -is [uint32] -or $value -is [int64] -or $value -is [uint64]
+}
+
+# Returns descriptions rather than reporting them directly so -SelfTest can exercise the checks without
+# pretending that fixture failures are bridge defects.
+function Get-ToolCallShapeViolations($calls, [string] $finishReason, [bool] $isStream) {
+    $violations = [System.Collections.Generic.List[string]]::new()
+    $nonNullCalls = @($calls | Where-Object { $null -ne $_ })
+
+    if ($nonNullCalls.Count -gt 0 -and $finishReason -ne 'tool_calls' -and $finishReason -ne 'length') {
+        $violations.Add("non-empty tool_calls has finish_reason='$finishReason', not tool_calls or length")
+    }
+
+    for ($i = 0; $i -lt $nonNullCalls.Count; $i++) {
+        $call = $nonNullCalls[$i]
+        $prefix = "tool_calls[$i]"
+        $properties = @($call.PSObject.Properties.Name)
+        if (-not ($properties -contains 'id') -or -not ($call.id -is [string]) -or [string]::IsNullOrWhiteSpace($call.id)) {
+            $violations.Add("$prefix.id is missing or not a non-empty string")
+        }
+        if (-not ($properties -contains 'type') -or $call.type -ne 'function') {
+            $violations.Add("$prefix.type is not 'function'")
+        }
+
+        $function = if ($properties -contains 'function') { $call.function } else { $null }
+        $functionProperties = if ($null -ne $function) { @($function.PSObject.Properties.Name) } else { @() }
+        if (-not ($functionProperties -contains 'name') -or -not ($function.name -is [string]) -or [string]::IsNullOrWhiteSpace($function.name)) {
+            $violations.Add("$prefix.function.name is missing or not a non-empty string")
+        }
+        if (-not ($functionProperties -contains 'arguments') -or -not ($function.arguments -is [string])) {
+            $violations.Add("$prefix.function.arguments is missing or not a string")
+        }
+
+        if ($isStream) {
+            if (-not ($properties -contains 'index') -or -not (Test-IntegerValue $call.index)) {
+                $violations.Add("$prefix.index is missing or not an integer on the streamed shape")
+            }
+        }
+        elseif ($properties -contains 'index') {
+            $violations.Add("$prefix.index is present on the JSON shape")
+        }
+    }
+
+    $violations.ToArray()
+}
+
+# Produces the precise JSON compared by the parity check. It copies every wire field except index, so an
+# unexpected extra field also makes the byte comparison fail instead of being normalised away.
+function ConvertTo-CanonicalToolCallJson($calls) {
+    $canonical = [System.Collections.Generic.List[object]]::new()
+    foreach ($call in @($calls | Where-Object { $null -ne $_ })) {
+        $copy = [ordered]@{}
+        foreach ($property in $call.PSObject.Properties) {
+            if ($property.Name -eq 'index') { continue }
+            if ($property.Name -eq 'function' -and $null -ne $property.Value) {
+                $functionCopy = [ordered]@{}
+                foreach ($functionProperty in $property.Value.PSObject.Properties) {
+                    $functionCopy[$functionProperty.Name] = $functionProperty.Value
+                }
+                $copy[$property.Name] = [pscustomobject] $functionCopy
+            }
+            else {
+                $copy[$property.Name] = $property.Value
+            }
+        }
+        $canonical.Add([pscustomobject] $copy)
+    }
+    ConvertTo-Json -InputObject $canonical.ToArray() -Compress -Depth 10
+}
+
+function Compare-ToolCallShapes($jsonCalls, [string] $jsonFinishReason, $streamCalls, [string] $streamFinishReason) {
+    $jsonSerialisation = ConvertTo-CanonicalToolCallJson $jsonCalls
+    $streamSerialisation = ConvertTo-CanonicalToolCallJson $streamCalls
+    $callsIdentical = $jsonSerialisation -ceq $streamSerialisation
+    $finishReasonIdentical = $jsonFinishReason -ceq $streamFinishReason
+    [pscustomobject]@{
+        JsonToolCalls = $jsonSerialisation
+        StreamToolCalls = $streamSerialisation
+        JsonFinishReason = $jsonFinishReason
+        StreamFinishReason = $streamFinishReason
+        ToolCallsIdentical = $callsIdentical
+        FinishReasonIdentical = $finishReasonIdentical
+        Identical = $callsIdentical -and $finishReasonIdentical
+    }
+}
+
+# Reads the SSE stream without assuming the current one-chunk implementation. A future emitter may split
+# arguments across chunks, so fragments are appended by the wire's per-call index.
+function ConvertFrom-ToolCallSse([string] $body) {
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $callsByIndex = [ordered]@{}
+    $finishReason = $null
+    $content = ''
+    $done = $false
+    $frameCount = 0
+    $missingIndex = 0
+
+    foreach ($line in ($body -split "\r?\n")) {
+        if ($line.StartsWith(':')) { continue }
+        if (-not $line.StartsWith('data:')) { continue }
+        $payload = $line.Substring(5).TrimStart()
+        if ($payload -eq '[DONE]') {
+            $done = $true
+            break
+        }
+
+        try { $frame = $payload | ConvertFrom-Json -Depth 24 }
+        catch {
+            $errors.Add("invalid SSE data frame: $($_.Exception.Message)")
+            continue
+        }
+        $frameCount++
+        foreach ($choice in @($frame.choices)) {
+            if ($null -eq $choice) { continue }
+            $choiceProperties = @($choice.PSObject.Properties.Name)
+            if ($choiceProperties -contains 'finish_reason' -and $null -ne $choice.finish_reason) {
+                $finishReason = [string] $choice.finish_reason
+            }
+            $delta = if ($choiceProperties -contains 'delta') { $choice.delta } else { $null }
+            if ($null -eq $delta) { continue }
+            $deltaProperties = @($delta.PSObject.Properties.Name)
+            if ($deltaProperties -contains 'content' -and $null -ne $delta.content) {
+                $content += [string] $delta.content
+            }
+            if (-not ($deltaProperties -contains 'tool_calls')) { continue }
+
+            foreach ($fragment in @($delta.tool_calls)) {
+                if ($null -eq $fragment) { continue }
+                $fragmentProperties = @($fragment.PSObject.Properties.Name)
+                $hasIndex = $fragmentProperties -contains 'index'
+                $key = if ($hasIndex) { "index:$($fragment.index)" } else { "missing:$missingIndex" }
+                if (-not $hasIndex) { $missingIndex++ }
+                if (-not $callsByIndex.Contains($key)) {
+                    $callsByIndex[$key] = [pscustomobject] [ordered]@{}
+                }
+                $call = $callsByIndex[$key]
+
+                foreach ($name in @('index', 'id', 'type')) {
+                    if (-not ($fragmentProperties -contains $name)) { continue }
+                    if ($call.PSObject.Properties.Name -contains $name) { $call.$name = $fragment.$name }
+                    else { $call | Add-Member -NotePropertyName $name -NotePropertyValue $fragment.$name }
+                }
+                if (-not ($fragmentProperties -contains 'function')) { continue }
+                if (-not ($call.PSObject.Properties.Name -contains 'function')) {
+                    $call | Add-Member -NotePropertyName 'function' -NotePropertyValue ([pscustomobject] [ordered]@{})
+                }
+                if ($null -eq $fragment.function) {
+                    $call.function = $null
+                    continue
+                }
+                if ($null -eq $call.function) { $call.function = [pscustomobject] [ordered]@{} }
+                $functionProperties = @($fragment.function.PSObject.Properties.Name)
+                foreach ($name in @('name', 'arguments')) {
+                    if (-not ($functionProperties -contains $name)) { continue }
+                    if ($call.function.PSObject.Properties.Name -contains $name) {
+                        if ($name -eq 'arguments' -and $null -ne $call.function.arguments -and $null -ne $fragment.function.arguments) {
+                            $call.function.arguments = ([string] $call.function.arguments) + ([string] $fragment.function.arguments)
+                        }
+                        elseif ($name -ne 'arguments' -or $null -eq $call.function.arguments) {
+                            $call.function.$name = $fragment.function.$name
+                        }
+                    }
+                    else {
+                        $call.function | Add-Member -NotePropertyName $name -NotePropertyValue $fragment.function.$name
+                    }
+                }
+            }
+        }
+    }
+
+    [pscustomobject]@{
+        Calls = @($callsByIndex.Values)
+        FinishReason = $finishReason
+        Content = if ($content.Length -gt 0) { $content } else { $null }
+        Done = $done
+        FrameCount = $frameCount
+        ParseErrors = $errors.ToArray()
+    }
+}
+
+function Test-ToolCallReply([string] $context, $calls, [string] $finishReason, $content, [bool] $isStream, $evidence) {
+    $nonNullCalls = @($calls | Where-Object { $null -ne $_ })
+    if ($finishReason -eq 'tool_calls' -and $null -ne $content) {
+        Add-Defect $context 'finish_reason=tool_calls but message content is not null' $evidence
+    }
+    foreach ($violation in @(Get-ToolCallShapeViolations $nonNullCalls $finishReason $isStream)) {
+        Add-Defect $context $violation $evidence
+    }
+    foreach ($call in $nonNullCalls) {
+        $function = if ($call.PSObject.Properties.Name -contains 'function') { $call.function } else { $null }
+        if ($null -eq $function -or -not ($function.PSObject.Properties.Name -contains 'arguments') -or -not ($function.arguments -is [string])) { continue }
+        try { $null = $function.arguments | ConvertFrom-Json -Depth 20 }
+        catch { Add-Defect $context "tool_calls argument string is not valid JSON for tool '$($function.name)'" $function.arguments }
+    }
+    if ($nonNullCalls.Count -eq 0 -and ($finishReason -eq 'stop' -or $finishReason -eq 'length') -and $content -and
+        ($content -match '"tool_calls"\s*:' -or $content -match '"function"\s*:\s*\{\s*"name"')) {
+        Add-Defect $context 'tool-call protocol appears to have leaked into content as prose' $content
+    }
+}
+
+function Get-HealthzSnapshot {
+    $health = Invoke-WebRequest -Uri "$base/healthz" -TimeoutSec 10 -SkipHttpErrorCheck
+    if ([int] $health.StatusCode -ne 200) { throw "GET /healthz returned HTTP $($health.StatusCode): $($health.Content)" }
+    try { $parsed = $health.Content | ConvertFrom-Json -Depth 12 }
+    catch { throw "GET /healthz returned invalid JSON: $($_.Exception.Message)" }
+    foreach ($field in @('context_cache_hits', 'context_cache_misses')) {
+        if (-not ($parsed.PSObject.Properties.Name -contains $field) -or -not (Test-IntegerValue $parsed.$field)) {
+            throw "GET /healthz returned no usable '$field' field: $($health.Content)"
+        }
+    }
+    [pscustomobject]@{
+        ContextCacheHits = [int64] $parsed.context_cache_hits
+        ContextCacheMisses = [int64] $parsed.context_cache_misses
+        Raw = $health.Content
+    }
+}
+
+function Invoke-StreamParityRuns([string] $dimension, [string] $cell, $jsonRuns, [hashtable] $body, [int] $runCount) {
+    $parities = [System.Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt $runCount; $i++) {
+        $streamBody = $body.Clone()
+        $streamBody.stream = $true
+        $streamResult = Invoke-ChatOnce $streamBody
+        $context = "$cell stream run=$($i + 1)"
+        Test-BridgeDefect $context $streamResult
+        $streamFacts = Get-ChatFacts $streamResult
+        $jsonRun = $jsonRuns[$i]
+        $jsonFacts = $jsonRun.Facts
+        $comparison = Compare-ToolCallShapes $jsonFacts.Calls $jsonFacts.FinishReason $streamFacts.Calls $streamFacts.FinishReason
+        $comparable = $jsonFacts.StatusCode -eq 200 -and $streamFacts.StatusCode -eq 200 -and $streamFacts.StreamDone -and @($streamFacts.StreamParseErrors).Count -eq 0
+        if (-not $comparable) {
+            $comparison.Identical = $false
+        }
+        $verdict = if ($comparison.Identical) { 'identical' } else { 'MISMATCH' }
+        $parity = [pscustomobject]@{
+            Dimension = $dimension; Cell = $cell; Run = $i + 1; Verdict = $verdict; Comparable = $comparable
+            JsonStatusCode = $jsonFacts.StatusCode; StreamStatusCode = $streamFacts.StatusCode
+            JsonFinishReason = $comparison.JsonFinishReason; StreamFinishReason = $comparison.StreamFinishReason
+            JsonToolCalls = $comparison.JsonToolCalls; StreamToolCalls = $comparison.StreamToolCalls
+            StreamDone = $streamFacts.StreamDone; StreamParseErrors = @($streamFacts.StreamParseErrors)
+        }
+        $streamRow = [pscustomobject]@{
+            Dimension = $dimension; Cell = $cell; Run = $i + 1; StatusCode = $streamFacts.StatusCode
+            FinishReason = $streamFacts.FinishReason; LatencyMs = $streamResult.LatencyMs
+            Called = $streamFacts.Called; ToolNames = $streamFacts.ToolNames -join ','
+            ToolCalls = $streamFacts.Calls; StreamDone = $streamFacts.StreamDone
+            StreamParseErrors = @($streamFacts.StreamParseErrors); ParityVerdict = $verdict
+        }
+        $script:parityResults.Add($parity)
+        $script:streamedCalls.Add($streamRow)
+        $script:calls.Add($streamRow)
+        $parities.Add($parity)
+        if (-not $comparison.Identical) {
+            $evidence = "json tool_calls=$($comparison.JsonToolCalls); stream tool_calls=$($comparison.StreamToolCalls); json finish=$($comparison.JsonFinishReason); stream finish=$($comparison.StreamFinishReason); comparable=$comparable"
+            Add-Defect $context 'stream tool-call parity mismatch' $evidence
+        }
+        Write-Info "$cell stream run=$($i + 1): HTTP $($streamFacts.StatusCode) finish=$($streamFacts.FinishReason) parity=$verdict ($($streamResult.LatencyMs)ms)"
+    }
+    $cellVerdict = if (@($parities | Where-Object { $_.Verdict -eq 'MISMATCH' }).Count -eq 0) { 'identical' } else { 'MISMATCH' }
+    Write-Info "stream parity: $cellVerdict"
+    $script:cells.Add([pscustomobject]@{ Dimension = $dimension; Cell = "$cell (stream)"; Runs = $runCount; Summary = "stream parity: $cellVerdict" })
+}
+
+function Invoke-ToolProbeSelfTest {
+    $fixtureSse = @'
+: keep-alive
+data: {"choices":[{"delta":{"role":"assistant"}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"location\":\""}}]}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Paris\"}"}}]}}]}
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+data: [DONE]
+'@
+    $jsonMessage = '{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"location\":\"Paris\"}"}}]}' | ConvertFrom-Json -Depth 12
+    $assembled = ConvertFrom-ToolCallSse $fixtureSse
+    if (-not $assembled.Done -or $assembled.FrameCount -ne 4 -or @($assembled.ParseErrors).Count -ne 0) { throw 'SSE fixture did not assemble cleanly' }
+    if (@($assembled.Calls).Count -ne 1 -or $assembled.Calls[0].function.arguments -ne '{"location":"Paris"}') { throw 'SSE fixture did not concatenate arguments by index' }
+    Write-Host 'SELFTEST: SSE assembly passed'
+
+    $same = Compare-ToolCallShapes $jsonMessage.tool_calls 'tool_calls' $assembled.Calls $assembled.FinishReason
+    if (-not $same.Identical) { throw "expected identical parity, got JSON=$($same.JsonToolCalls) stream=$($same.StreamToolCalls)" }
+    Write-Host 'SELFTEST: parity identical passed'
+
+    $mutated = $fixtureSse.Replace('Paris\"}', 'Lyon\"}')
+    $different = ConvertFrom-ToolCallSse $mutated
+    $mismatch = Compare-ToolCallShapes $jsonMessage.tool_calls 'tool_calls' $different.Calls $different.FinishReason
+    if ($mismatch.Identical) { throw 'expected mutated argument to produce MISMATCH' }
+    Write-Host 'SELFTEST: parity mismatch detected'
+
+    $missingId = [pscustomobject]@{ index = 0; type = 'function'; function = [pscustomobject]@{ name = 'get_weather'; arguments = '{}' } }
+    $jsonWithIndex = [pscustomobject]@{ id = 'call_2'; index = 0; type = 'function'; function = [pscustomobject]@{ name = 'get_weather'; arguments = '{}' } }
+    $shapeMissingId = @(Get-ToolCallShapeViolations @($missingId) 'tool_calls' $true)
+    $shapeJsonIndex = @(Get-ToolCallShapeViolations @($jsonWithIndex) 'tool_calls' $false)
+    $shapeBiconditional = @(Get-ToolCallShapeViolations @($jsonMessage.tool_calls) 'stop' $false)
+    if (-not ($shapeMissingId -match 'id') -or -not ($shapeJsonIndex -match 'index') -or -not ($shapeBiconditional -match 'finish_reason')) {
+        throw 'shape checks did not catch missing id, JSON index, and finish_reason biconditional violations'
+    }
+    Write-Host 'SELFTEST: shape checks caught missing id, JSON index, and biconditional violations'
+    Write-Host 'SELFTEST PASS'
+}
+
 # --- HTTP -----------------------------------------------------------------------------------------
 
 # One POST to /v1/chat/completions. Never throws on a non-200 status (400/429/502/503 are all data
@@ -125,6 +442,7 @@ function Add-Defect([string] $context, [string] $description, $evidence) {
 # refused, timeout) is exceptional, and even that is caught and returned as a result rather than
 # thrown, so one flaky call cannot abort the whole probe.
 function Invoke-ChatOnce($body, [int] $timeoutSec = $TimeoutSec) {
+    $isStream = $body.ContainsKey('stream') -and [bool] $body.stream
     $json = $body | ConvertTo-Json -Depth 16
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
@@ -136,7 +454,7 @@ function Invoke-ChatOnce($body, [int] $timeoutSec = $TimeoutSec) {
         return [pscustomobject]@{
             NetworkOk = $false; NetworkError = $_.Exception.Message
             LatencyMs = [Math]::Round($sw.Elapsed.TotalMilliseconds, 1)
-            StatusCode = $null; Json = $null; RawBody = $null; ParseError = $null
+            StatusCode = $null; Json = $null; RawBody = $null; ParseError = $null; IsStream = $isStream
         }
     }
     $sw.Stop()
@@ -147,7 +465,7 @@ function Invoke-ChatOnce($body, [int] $timeoutSec = $TimeoutSec) {
     [pscustomobject]@{
         NetworkOk = $true; NetworkError = $null
         LatencyMs = [Math]::Round($sw.Elapsed.TotalMilliseconds, 1)
-        StatusCode = [int] $r.StatusCode; Json = $parsed; RawBody = $raw; ParseError = $parseError
+        StatusCode = [int] $r.StatusCode; Json = $parsed; RawBody = $raw; ParseError = $parseError; IsStream = $isStream
     }
 }
 
@@ -158,11 +476,15 @@ function Test-BridgeDefect([string] $context, $result) {
     if (-not $result.NetworkOk) {
         return   # a network failure is not a claim about the bridge's HTTP contract
     }
-    if ($null -eq $result.Json) {
+    if (-not $result.IsStream -and $null -eq $result.Json) {
         Add-Defect $context 'HTTP 200 (or other) body is not valid JSON' $result.ParseError
         return
     }
     if ($result.StatusCode -ne 200) {
+        if ($null -eq $result.Json) {
+            Add-Defect $context "HTTP $($result.StatusCode) body is not valid JSON" $result.ParseError
+            return
+        }
         $e = $result.Json.error
         if ($null -eq $e) {
             Add-Defect $context "HTTP $($result.StatusCode) body carries no 'error' object" $result.RawBody
@@ -174,52 +496,80 @@ function Test-BridgeDefect([string] $context, $result) {
         return
     }
 
+    $facts = Get-ChatFacts $result
+    if ($result.IsStream) {
+        foreach ($parseError in @($facts.StreamParseErrors)) {
+            Add-Defect $context 'stream response has an invalid SSE data frame' $parseError
+        }
+        if (-not $facts.StreamDone) {
+            Add-Defect $context 'stream response ended without data: [DONE]' $result.RawBody
+        }
+        Test-ToolCallReply $context $facts.Calls $facts.FinishReason $facts.Content $true $result.RawBody
+        return
+    }
+
     $choice = $result.Json.choices[0]
     if ($null -eq $choice) {
         Add-Defect $context 'HTTP 200 but choices[0] is missing' $result.RawBody
         return
     }
-    if ($choice.finish_reason -eq 'tool_calls') {
-        if ($null -ne $choice.message.content) {
-            Add-Defect $context 'finish_reason=tool_calls but message.content is not null' $result.RawBody
-        }
-        foreach ($call in $choice.message.tool_calls) {
-            try { $null = $call.function.arguments | ConvertFrom-Json -Depth 20 }
-            catch { Add-Defect $context "tool_calls argument string is not valid JSON for tool '$($call.function.name)'" $call.function.arguments }
-        }
-    }
-    elseif ($choice.finish_reason -eq 'stop' -or $choice.finish_reason -eq 'length') {
-        $c = $choice.message.content
-        if ($c -and ($c -match '"tool_calls"\s*:' -or $c -match '"function"\s*:\s*\{\s*"name"')) {
-            Add-Defect $context 'tool-call protocol appears to have leaked into content as prose' $c
-        }
-    }
+    Test-ToolCallReply $context $facts.Calls $facts.FinishReason $facts.Content $false $result.RawBody
 }
 
 # Pulls the measurement fields a caller needs out of one Invoke-ChatOnce result, without deciding
 # anything about correctness (that is question-specific and lives in each dimension's own code).
 function Get-ChatFacts($result) {
-    if (-not $result.NetworkOk -or $null -eq $result.Json -or $result.StatusCode -ne 200) {
+    if (-not $result.NetworkOk -or $result.StatusCode -ne 200) {
         return [pscustomobject]@{
             StatusCode = $result.StatusCode; FinishReason = $null; Called = $false
             ToolNames = @(); Calls = @(); Content = $null
             ErrorType = if ($result.Json) { $result.Json.error.type } else { $null }
             ErrorCode = if ($result.Json) { $result.Json.error.code } else { $null }
             ErrorMessage = if ($result.Json) { $result.Json.error.message } else { $result.NetworkError }
+            StreamDone = $false; StreamParseErrors = @()
+        }
+    }
+    if ($result.IsStream) {
+        $stream = ConvertFrom-ToolCallSse $result.RawBody
+        $calls = @($stream.Calls | Where-Object { $null -ne $_ })
+        return [pscustomobject]@{
+            StatusCode = $result.StatusCode; FinishReason = $stream.FinishReason
+            Called = $stream.FinishReason -eq 'tool_calls'
+            ToolNames = @($calls | ForEach-Object { $_.function.name })
+            Calls = $calls; Content = $stream.Content
+            ErrorType = $null; ErrorCode = $null; ErrorMessage = $null
+            StreamDone = $stream.Done; StreamParseErrors = @($stream.ParseErrors)
+        }
+    }
+    if ($null -eq $result.Json) {
+        return [pscustomobject]@{
+            StatusCode = $result.StatusCode; FinishReason = $null; Called = $false
+            ToolNames = @(); Calls = @(); Content = $null
+            ErrorType = $null; ErrorCode = $null; ErrorMessage = $result.ParseError
+            StreamDone = $false; StreamParseErrors = @()
         }
     }
     $choice = $result.Json.choices[0]
-    $calls = @($choice.message.tool_calls)
+    if ($null -eq $choice) {
+        return [pscustomobject]@{
+            StatusCode = $result.StatusCode; FinishReason = $null; Called = $false
+            ToolNames = @(); Calls = @(); Content = $null
+            ErrorType = $null; ErrorCode = $null; ErrorMessage = 'choices[0] is missing'
+            StreamDone = $false; StreamParseErrors = @()
+        }
+    }
+    $calls = if ($null -eq $choice.message.tool_calls) { @() } else { @($choice.message.tool_calls) }
     [pscustomobject]@{
         StatusCode = $result.StatusCode; FinishReason = $choice.finish_reason
         Called = $choice.finish_reason -eq 'tool_calls'
         ToolNames = @($calls | ForEach-Object { $_.function.name })
         Calls = $calls; Content = $choice.message.content
         ErrorType = $null; ErrorCode = $null; ErrorMessage = $null
+        StreamDone = $false; StreamParseErrors = @()
     }
 }
 
-# --- tool catalogs ----------------------------------------------------------------------------------
+# --- tool catalogs ----------------------------------------------------------------------------------# --- tool catalogs ----------------------------------------------------------------------------------
 
 # The target tool for the tool-count sweep and the system-prompt-pressure sweep: identical to
 # smoke.ps1's single-tool probe, so the count=1 cell is a direct rerun of that measurement.
@@ -343,6 +693,7 @@ function Invoke-ToolCountSweep {
         # of this script gave every non-headline cell 5 runs instead of 3).
         $cellRuns = if ($count -eq 1) { $HeadlineRuns } else { $Runs }
         $rows = [System.Collections.Generic.List[object]]::new()
+        $jsonRuns = [System.Collections.Generic.List[object]]::new()
 
         for ($i = 0; $i -lt $cellRuns; $i++) {
             $body = @{ model = $Model; messages = @(@{ role = 'user'; content = $question }); tools = $tools; temperature = 0 }
@@ -373,6 +724,7 @@ function Invoke-ToolCountSweep {
             }
             $rows.Add($row)
             $script:calls.Add($row)
+            $jsonRuns.Add([pscustomobject]@{ Facts = $facts; Result = $r })
             if ($facts.StatusCode -eq 502 -and $null -eq $cliff) { $cliff = $count }
             Write-Info "count=$count run=$($i+1): HTTP $($facts.StatusCode) finish=$($facts.FinishReason) called=$($facts.Called) tool=$($facts.ToolNames -join ',') argsValid=$argsValid argsCorrect=$argsCorrect ($($r.LatencyMs)ms)"
         }
@@ -385,6 +737,10 @@ function Invoke-ToolCountSweep {
         $summary = "count=$count ($($tools.Count) tools offered, $renderedChars rendered chars): statuses [$statuses], called $calledN/$cellRuns, correct-tool $correctN/$cellRuns, args-valid $validN/$cellRuns, args-correct(value fidelity) $accN/$cellRuns"
         Write-Host "    CELL $summary" -ForegroundColor Green
         $script:cells.Add([pscustomobject]@{ Dimension = 'ToolCountSweep'; Cell = "count=$count"; Runs = $cellRuns; Summary = $summary })
+        if ($Stream -and $count -eq 1) {
+            $streamBody = @{ model = $Model; messages = @(@{ role = 'user'; content = $question }); tools = $tools; temperature = 0 }
+            Invoke-StreamParityRuns 'ToolCountSweep' 'count=1' $jsonRuns.ToArray() $streamBody $cellRuns
+        }
     }
 
     if ($cliff) { Write-Host "    502 regime begins at tool count = $cliff" -ForegroundColor Magenta }
@@ -594,6 +950,7 @@ function Invoke-MultiStepProbe {
     $firstCallJson = $null
     $attempts = 0
     $result = $null
+    $healthBefore = Get-HealthzSnapshot
     while ($null -eq $firstCallJson -and $attempts -lt 3) {
         $attempts++
         $body = @{ model = $Model; messages = @(@{ role = 'user'; content = $question }); tools = $tools; temperature = 0 }
@@ -607,9 +964,18 @@ function Invoke-MultiStepProbe {
     }
 
     if ($null -eq $firstCallJson) {
-        $summary = "could not obtain a tool call after $attempts attempt(s); multi-step round trip not exercised this run"
+        $healthAfter = Get-HealthzSnapshot
+        $bracket = [pscustomobject]@{
+            Dimension = 'MultiStep'; Cell = 'round-trip'; Turn2Attempted = $false
+            Before = $healthBefore; After = $healthAfter
+            HitsDelta = $healthAfter.ContextCacheHits - $healthBefore.ContextCacheHits
+            MissesDelta = $healthAfter.ContextCacheMisses - $healthBefore.ContextCacheMisses
+            Verdict = 'not exercised: no valid turn-1 tool call'
+        }
+        $script:cacheBrackets.Add($bracket)
+        $summary = "could not obtain a tool call after $attempts attempt(s); multi-step round trip not exercised this run; cache bracket: $($bracket.Verdict) (hits $($healthBefore.ContextCacheHits)->$($healthAfter.ContextCacheHits), misses $($healthBefore.ContextCacheMisses)->$($healthAfter.ContextCacheMisses))"
         Write-Host "    CELL $summary" -ForegroundColor Green
-        $script:cells.Add([pscustomobject]@{ Dimension = 'MultiStep'; Cell = 'round-trip'; Runs = $attempts; Summary = $summary })
+        $script:cells.Add([pscustomobject]@{ Dimension = 'MultiStep'; Cell = 'round-trip'; Runs = $attempts; Summary = $summary; CacheBracket = $bracket })
         return
     }
 
@@ -624,6 +990,16 @@ function Invoke-MultiStepProbe {
     $r2 = Invoke-ChatOnce $body2
     Test-BridgeDefect 'multistep turn2' $r2
     $facts2 = Get-ChatFacts $r2
+    $healthAfter = Get-HealthzSnapshot
+    $hitsDelta = $healthAfter.ContextCacheHits - $healthBefore.ContextCacheHits
+    $missesDelta = $healthAfter.ContextCacheMisses - $healthBefore.ContextCacheMisses
+    $cacheVerdict = if ($hitsDelta -eq 1) { 'hit increased by exactly 1' } else { "FINDING: expected hits +1, observed $hitsDelta" }
+    $bracket = [pscustomobject]@{
+        Dimension = 'MultiStep'; Cell = 'round-trip'; Turn2Attempted = $true
+        Before = $healthBefore; After = $healthAfter; HitsDelta = $hitsDelta; MissesDelta = $missesDelta; Verdict = $cacheVerdict
+    }
+    $script:cacheBrackets.Add($bracket)
+    Write-Info "cache bracket: $cacheVerdict (hits $($healthBefore.ContextCacheHits)->$($healthAfter.ContextCacheHits), misses $($healthBefore.ContextCacheMisses)->$($healthAfter.ContextCacheMisses))"
 
     # Named for exactly what this checks (adversarial review: the old name "Sensible" implied the reply
     # was verified to relate to the injected tool result -- it isn't, only that a 200 with no repeated
@@ -639,14 +1015,14 @@ function Invoke-MultiStepProbe {
         Dimension = 'MultiStep'; Cell = 'round-trip'; Run = 1
         StatusCode = $facts2.StatusCode; FinishReason = $facts2.FinishReason; LatencyMs = $r2.LatencyMs
         Called = $facts2.Called; AnsweredInProse = $answeredInProse; RepeatedCall = $repeatedCall
-        Content = $facts2.Content
+        Content = $facts2.Content; CacheBracket = $bracket
     }
     $script:calls.Add($row)
     Write-Info "turn 2: HTTP $($facts2.StatusCode) finish=$($facts2.FinishReason) called=$($facts2.Called) content='$($facts2.Content)' ($($r2.LatencyMs)ms)"
 
-    $summary = "turn1 attempts=$attempts, tool=$($firstCallJson.function.name) args=$($firstCallJson.function.arguments) -> turn2: $verdict"
+    $summary = "turn1 attempts=$attempts, tool=$($firstCallJson.function.name) args=$($firstCallJson.function.arguments) -> turn2: $verdict; cache bracket: $cacheVerdict (hits $($healthBefore.ContextCacheHits)->$($healthAfter.ContextCacheHits), misses $($healthBefore.ContextCacheMisses)->$($healthAfter.ContextCacheMisses))"
     Write-Host "    CELL $summary" -ForegroundColor Green
-    $script:cells.Add([pscustomobject]@{ Dimension = 'MultiStep'; Cell = 'round-trip'; Runs = $attempts + 1; Summary = $summary })
+    $script:cells.Add([pscustomobject]@{ Dimension = 'MultiStep'; Cell = 'round-trip'; Runs = $attempts + 1; Summary = $summary; CacheBracket = $bracket })
 }
 
 # --- dimension 5: window occupancy ------------------------------------------------------------------
@@ -1093,6 +1469,7 @@ function Invoke-WindowOccupancyProbe {
         Write-Info "cell $($cell.Label): rendered block = $($built.Chars) chars / $($built.Tokens) tokens ($pctOfWindow% of the $windowTokens-token window)"
 
         $rows = [System.Collections.Generic.List[object]]::new()
+        $jsonRuns = [System.Collections.Generic.List[object]]::new()
         for ($i = 0; $i -lt $Runs; $i++) {
             $body = @{ model = $Model; messages = @(@{ role = 'user'; content = $question }); tools = $wireTools; temperature = 0 }
             $r = Invoke-ChatOnce $body
@@ -1127,6 +1504,7 @@ function Invoke-WindowOccupancyProbe {
             }
             $rows.Add($row)
             $script:calls.Add($row)
+            $jsonRuns.Add([pscustomobject]@{ Facts = $facts; Result = $r })
             Write-Info "occupancy=$($cell.Label) run=$($i+1): HTTP $($facts.StatusCode)$(if ($facts.ErrorCode) { " code=$($facts.ErrorCode)" }) finish=$($facts.FinishReason) called=$($facts.Called) tool=$($facts.ToolNames -join ',') argsValid=$argsValid argsCorrect=$argsCorrect ($($r.LatencyMs)ms)"
         }
 
@@ -1142,6 +1520,10 @@ function Invoke-WindowOccupancyProbe {
         $summary = "occupancy=$($cell.Label) ($($built.Chars) chars / $($built.Tokens) tokens, $pctOfWindow% of window): statuses [$statuses], called $calledN/$Runs, correct-tool $correctN/$Runs, args-valid $validN/$Runs, args-correct $accN/$Runs, latency min/avg/max = $latMin/$latAvg/$($latMax)ms"
         Write-Host "    CELL $summary" -ForegroundColor Green
         $script:cells.Add([pscustomobject]@{ Dimension = 'WindowOccupancy'; Cell = $cell.Label; Runs = $Runs; Summary = $summary })
+        if ($Stream -and $cell.Label -eq '70%') {
+            $streamBody = @{ model = $Model; messages = @(@{ role = 'user'; content = $question }); tools = $wireTools; temperature = 0 }
+            Invoke-StreamParityRuns 'WindowOccupancy' '70%' $jsonRuns.ToArray() $streamBody $Runs
+        }
         $completedCells++
     }
 
@@ -1159,6 +1541,17 @@ function Invoke-WindowOccupancyProbe {
 }
 
 # --- main -------------------------------------------------------------------------------------------
+
+if ($SelfTest) {
+    try {
+        Invoke-ToolProbeSelfTest
+        exit 0
+    }
+    catch {
+        Write-Host "SELFTEST FAIL: $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
+}
 
 Write-Host "npu-bridge hard-case tool-call probe against $base (model=$Model)" -ForegroundColor Cyan
 $health = Invoke-WebRequest -Uri "$base/healthz" -TimeoutSec 10 -SkipHttpErrorCheck
@@ -1196,9 +1589,13 @@ $out = [pscustomobject]@{
     Runs         = $Runs
     HeadlineRuns = $HeadlineRuns
     Dimensions   = $dimensions
+    Stream       = [bool] $Stream
     CliffToolCount = $cliffCount
     Cells        = $script:cells
     Calls        = $script:calls
+    StreamedCalls = $script:streamedCalls
+    ParityResults = $script:parityResults
+    CacheBrackets = $script:cacheBrackets
     Defects      = $script:defects
 }
 $out | ConvertTo-Json -Depth 12 | Set-Content -Path $JsonOut -Encoding utf8
