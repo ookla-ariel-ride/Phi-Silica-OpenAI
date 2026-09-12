@@ -11,8 +11,10 @@ namespace NpuBridge.Api;
 
 /// <summary>
 /// Everything the generation phase needs, once preparation has decided the request is servable. Built
-/// only by <see cref="ChatRequestPreparer.PrepareAsync"/>; a streamed and a non-streamed request get
-/// the identical value, which is the point of the split.
+/// by <see cref="ChatRequestPreparer.PrepareAsync"/> (<c>/v1/chat/completions</c>) and, since chunk 8
+/// task 3, by <see cref="ChatRequestPreparer.PrepareForCompletionAsync"/> (<c>/v1/completions</c>) —
+/// both funnel through the same private core, so a streamed and a non-streamed request, and a chat and
+/// a completions request, all get the identical shape of value, which is the point of the split.
 /// </summary>
 /// <param name="RequestId">The <c>chatcmpl-</c> id, already allocated: it is on the failure log lines too.</param>
 /// <param name="BackendName">Configured backend name, for the per-request log line only.</param>
@@ -61,11 +63,22 @@ internal sealed record ChatRequestPreparation(PreparedChatRequest? Prepared, IRe
 }
 
 /// <summary>
-/// Phase one of <c>POST /v1/chat/completions</c>: body, validation, readiness, ignored-parameter
-/// warnings, system-prompt placement, rendering and sampling. Everything that is identical whether the
-/// reply is a single JSON object or a stream of SSE chunks, so that the two paths cannot drift on the
-/// pieces that are cheapest to get subtly different. It never creates a context and never writes a
-/// body: it returns either a ready-made failure result or the value phase two generates from.
+/// Phase one of <c>POST /v1/chat/completions</c> (and, since chunk 8 task 3, of <c>POST
+/// /v1/completions</c>): body, validation, readiness, ignored-parameter warnings, system-prompt
+/// placement, rendering and sampling. Everything that is identical whether the reply is a single JSON
+/// object or a stream of SSE chunks, so that the two paths cannot drift on the pieces that are
+/// cheapest to get subtly different. It never creates a context and never writes a body: it returns
+/// either a ready-made failure result or the value phase two generates from.
+///
+/// <see cref="PrepareAsync"/> and <see cref="PrepareForCompletionAsync"/> are the two thin callers:
+/// each reads its own wire shape (a <see cref="ChatCompletionRequest"/> with <c>messages[]</c>, or a
+/// <see cref="CompletionRequest"/> whose <c>prompt</c> is wrapped into one user message) and then
+/// shares everything from the model-id check onward through <see cref="PrepareCoreAsync"/>. The one
+/// place they still differ inside the shared core is <see cref="PreparedChatRequest.Limits"/>: chat
+/// builds it with the chat-specific <see cref="OutputLimits.From"/> overload (the smaller of
+/// <c>max_tokens</c>/<c>max_completion_tokens</c> wins), completions with the generic
+/// <see cref="OutputLimits.Create"/> (it has no <c>max_completion_tokens</c>) — so the core takes a
+/// factory rather than deriving <see cref="OutputLimits"/> itself.
 ///
 /// The ordering here is load-bearing. Validation before readiness before placement, and — D50 —
 /// rendering before the forced-placement conflict check, because that conflict is a property of the
@@ -111,6 +124,112 @@ internal static class ChatRequestPreparer
                 OpenAiError.BadRequest("Request body is required and must be a JSON object."));
         }
 
+        return await PrepareCoreAsync(http, lifecycle, options, ignoredLog, logger, requestId, backendName, request,
+            backend => OutputLimits.From(request, backend.TokenCounter)).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Phase one of <c>POST /v1/completions</c> (chunk 8 task 3, PLAN §2.2): <c>prompt</c> must be a
+    /// string or a single-element array — a controller ruling makes more than one element a 400 rather
+    /// than silently taking the first, since a single-worker bridge cannot serve the multiple choices
+    /// real OpenAI would batch it into. The one valid prompt is wrapped into a single user message and
+    /// handed to the same <see cref="PrepareCoreAsync"/> chat's <see cref="PrepareAsync"/> uses, so
+    /// readiness, placement, rendering and every later phase treat it exactly like a one-message chat
+    /// request. <c>tools</c> do not exist on this wire shape, so the synthesised
+    /// <see cref="ChatCompletionRequest"/> never carries any.
+    /// </summary>
+    public static async Task<ChatRequestPreparation> PrepareForCompletionAsync(
+        HttpContext http,
+        BackendLifecycle lifecycle,
+        BridgeOptions options,
+        IgnoredParameterLog ignoredLog,
+        ILogger logger)
+    {
+        var requestId = ChatCompletionId.NewId();
+        var backendName = options.Backend.ToConfigName();
+
+        CompletionRequest? request;
+        try
+        {
+            request = await http.Request.ReadFromJsonAsync<CompletionRequest>(JsonDefaults.Options, http.RequestAborted)
+                .ConfigureAwait(false);
+        }
+        catch (JsonException ex)
+        {
+            return ChatRequestPreparation.Failed(OpenAiError.BadRequest($"Request body is not valid JSON: {ex.Message}"));
+        }
+        catch (InvalidOperationException)
+        {
+            return ChatRequestPreparation.Failed(
+                OpenAiError.BadRequest("Request body must be JSON (Content-Type: application/json)."));
+        }
+
+        if (request is null)
+        {
+            return ChatRequestPreparation.Failed(
+                OpenAiError.BadRequest("Request body is required and must be a JSON object."));
+        }
+
+        if (request.Prompt is null || request.Prompt.Count == 0)
+        {
+            return ChatRequestPreparation.Failed(
+                OpenAiError.BadRequest("prompt is required and must be a string or a single-element array of strings.",
+                    code: "missing_prompt", param: "prompt"));
+        }
+
+        // Controller ruling: real OpenAI batches several prompts into several choices, which this
+        // single-worker bridge cannot serve. Refusing is honest; silently taking the first element is
+        // not, and would let a client believe every prompt it sent was answered.
+        if (request.Prompt.Count > 1)
+        {
+            return ChatRequestPreparation.Failed(
+                OpenAiError.BadRequest("prompt must be a string, or an array with exactly one element; multiple prompts are not supported.",
+                    param: "prompt"));
+        }
+
+        var chatRequest = new ChatCompletionRequest(
+            Model: request.Model,
+            Messages: [new ChatMessage("user", ChatMessageContent.FromText(request.Prompt[0]), null, null)],
+            Stream: request.Stream,
+            N: request.N,
+            Temperature: request.Temperature,
+            TopP: request.TopP,
+            TopK: null,
+            MaxTokens: request.MaxTokens,
+            MaxCompletionTokens: null,
+            Stop: request.Stop,
+            Tools: null,
+            ToolChoice: null,
+            Logprobs: null,
+            ResponseFormat: null,
+            Seed: null,
+            PresencePenalty: null,
+            FrequencyPenalty: null,
+            User: null,
+            StreamOptions: request.StreamOptions);
+
+        return await PrepareCoreAsync(http, lifecycle, options, ignoredLog, logger, requestId, backendName, chatRequest,
+            backend => OutputLimits.Create(request.MaxTokens, request.Stop ?? [], backend.TokenCounter)).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Everything from validation onward, shared by both wire shapes once each has produced an
+    /// already-parsed <see cref="ChatCompletionRequest"/> (real, or synthesised from a
+    /// <c>/v1/completions</c> prompt) and knows how to build its own <see cref="OutputLimits"/> once
+    /// the backend is known. <paramref name="limitsFactory"/> is that one remaining difference; every
+    /// other step here previously lived in the single <c>PrepareAsync</c> this was split out of.
+    /// </summary>
+    private static async Task<ChatRequestPreparation> PrepareCoreAsync(
+        HttpContext http,
+        BackendLifecycle lifecycle,
+        BridgeOptions options,
+        IgnoredParameterLog ignoredLog,
+        ILogger logger,
+        string requestId,
+        string backendName,
+        ChatCompletionRequest request,
+        Func<ILanguageModelBackend, OutputLimits> limitsFactory)
+    {
         // 2. Validation. The failure carries its own param/code; bind them by name — the failure record
         // orders them (Message, Param, Code) while OpenAiError.Result takes code before param.
         var validation = ChatCompletionRequestValidator.Validate(request, options.ToolEmulation);
@@ -254,7 +373,7 @@ internal static class ChatRequestPreparer
                 Rendered: rendered,
                 NativeSystem: nativeSystem,
                 Sampling: sampling is null || sampling.IsEmpty ? null : sampling,
-                Limits: OutputLimits.From(request, backend.TokenCounter),
+                Limits: limitsFactory(backend),
                 PromptChars: promptChars,
                 Tools: catalog,
                 ToolInstructions: toolInstructions));
