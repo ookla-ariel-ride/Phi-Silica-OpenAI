@@ -70,7 +70,7 @@ nobody to answer, then an unfiltered one that reports through `GenerationFailure
 exhaustive on purpose — the JSON shape used to exclude `OperationCanceledException` from the second,
 so a cancellation that was not the client's matched no clause and became a bare 500.
 
-## Conventions this chunk established
+## Conventions the chunks established
 - **Validate what the deserializer can produce, not just what the type says.** `System.Text.Json` will
   happily hand the handler a `messages` array containing a null element despite non-nullable
   annotations; that must be a validation failure (400), not something that reaches the handler and
@@ -104,6 +104,11 @@ so a cancellation that was not the client's matched no clause and became a bare 
   `JsonDocument.Parse(string)` transcodes to UTF-8 first and answers invalid UTF-16 with
   `ArgumentException`, so a `catch (JsonException)` around it looks exhaustive and is not. Every
   parse of model text is wrapped for both (D83); D58 says surrogate pairs really do arrive split.
+- **Check how a framework method breaks a tie, too.** `Task.WhenAny(a, b)` returns the first task in
+  argument order when both are already complete; `Task.WaitAsync(timeout, ct)` answers with whichever
+  fired first. The first-delta wait was rewritten across that difference in D81, and on a
+  preflight-less backend it would have turned an over-length 400 into a 200 SSE error event. No test
+  can see it: the window is a scheduling coincidence, and Codex found it by reading the .NET sources.
 
 ## Backend contract (`ILanguageModelBackend`)
 - `InitializeAsync` once, possibly minutes; `BackendLifecycle` runs it in the background, owns the
@@ -192,6 +197,10 @@ it should not pass vacuously on the NPU.
   tool-call reply under text no client would ever return, and every test passed: each one checked one
   side of the round trip. The shape to write is "answer a request, feed the bridge's own output back
   as the next turn's assistant message, assert the hit" (D83).
+- An input that cannot survive assembly metadata has to be built in the test body. A lone surrogate
+  in an `[InlineData]` argument arrives as U+FFFD, which is valid UTF-16, so the test named for the
+  unpaired-surrogate case exercises something else and passes while the real input still throws
+  (`ToolCallParserTests`, D83). The same goes for anything else the metadata round trip normalises.
 - A test that asserts a list's *contents* passes when the list is stale and the expected value is
   stale with it. `tools` and `tool_choice` stayed on the accepted-and-ignored list through the chunk
   that implemented them for exactly that reason; the test now names each implemented parameter
@@ -263,7 +272,9 @@ service/task verbs bind through the same code.
   off the server); `queue_depth`/`queue_capacity` (reported, nothing queues yet); backend
   diagnostics passed through verbatim.
 - `/v1/{**}` fallback: 405 with `Allow` for a wrong method on a known path, otherwise 404.
-- `/debug/generate`: raw prompt into the backend with timing; diagnostic only.
+- `/debug/generate`: raw prompt into the backend with timing. `/debug/tokenize`: the backend
+  counter's count for a text and the counter's name, answered while the model is still loading (D80).
+  Both are loopback-only and diagnostic; the smoke script leans on them.
 
 ## Review loop
 Each chunk: build + tests green → adversarial review (in-session subagent, then Codex) → fix in-scope

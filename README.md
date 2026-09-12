@@ -108,7 +108,10 @@ flowchart TD
     A["POST /v1/chat/completions"] --> B["Validate the body: model, messages, ranges"]
     B -->|"unknown model"| E404["404 model_not_found"]
     B -->|"backend still loading"| E503["503 model_loading"]
-    B --> D["Render the transcript (PromptTemplate)"]
+    B --> C{"tools offered?"}
+    C -->|"yes"| C1["Append the tool instructions to the system text"]
+    C -->|"no"| D
+    C1 --> D["Render the transcript (PromptTemplate)"]
     D --> F{"A cached context holds a prefix of it?"}
     F -->|"hit"| G["Check the context out; render only the new turns"]
     F -->|"miss"| H["Fresh context; render the whole transcript"]
@@ -116,14 +119,25 @@ flowchart TD
     H --> I
     I -->|"no, and --truncate-history"| J["Drop the oldest exchange"] --> F
     I -->|"no"| E400["400 context_length_exceeded"]
-    I -->|"yes"| K["Generate on the NPU; apply max_tokens and stop; answer as JSON or SSE"]
-    K -->|"Complete and uncut"| L["Store the context under the new transcript's key"]
-    K -->|"cut, failed or cancelled"| M["Dispose the context"]
+    I -->|"yes"| K["Generate on the NPU; apply max_tokens and stop"]
+    K --> N{"tools offered?"}
+    N -->|"no"| P["Answer as JSON, or stream each delta as SSE"]
+    N -->|"yes"| O["Buffer the whole reply, then parse it"]
+    O -->|"reads as calls"| Q["tool_calls, content null, finish tool_calls"]
+    O -->|"reads as prose"| P
+    P --> R{"Complete and uncut?"}
+    Q --> R
+    R -->|"yes"| L["Store the context under the new transcript's key"]
+    R -->|"no"| M["Dispose the context"]
 ```
 
 The preflight is the runtime's own answer to "how much of this fits", asked before anything is
 generated. Aion's preview SDK has no preflight, so on that backend the answer comes from the
 generation's status instead, and with `--truncate-history` the bridge retries after it.
+
+Buffering is what tool calling costs on the streaming path: nothing can tell a call from prose until
+the model has stopped, so with `tools` present no token goes out until the whole reply is in hand.
+Keep-alive comments hold the connection open while that happens.
 
 ## Endpoints
 
@@ -196,19 +210,40 @@ without presence checks.
 
 ## Tool calling
 
-Neither Windows API offers function calling, so the bridge emulates it. A request that carries `tools`
+Neither Windows API has function calling, so the bridge emulates it. A request that carries `tools`
 gets a compact signature for each one, and the JSON envelope to answer in, appended to its system
 text; the reply is read back by a deliberately tolerant parser that accepts a fenced block, a
 `tool_calls` wrapper, a lone call object, a bare array, and single quotes on a last pass. What the
 parser cannot read comes back as ordinary content. A call the model did not mean is worse than a call
 missed, because the client's answer to a call is to run it.
 
-A reply that parses arrives as `message.tool_calls` with `content: null` and
-`finish_reason: "tool_calls"`. The call ids are the bridge's own, and a client that echoes them back
-unchanged finds its conversation in the context cache on the next turn. A tool name that was never
-offered is passed through for the client to reject. If `max_tokens` cut the reply short and it still
-parses, the calls are sent and `finish_reason` says `length`, so a client that resumes on truncation
-still knows to.
+```powershell
+curl.exe http://127.0.0.1:5273/v1/chat/completions `
+  -H "Content-Type: application/json" `
+  -d '{"model":"phi-silica",
+       "messages":[{"role":"user","content":"What is the weather in Paris?"}],
+       "tools":[{"type":"function","function":{
+         "name":"get_weather",
+         "description":"Get the current weather for a city",
+         "parameters":{"type":"object",
+                       "properties":{"location":{"type":"string"}},
+                       "required":["location"]}}}]}'
+```
+
+```json
+{"choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [
+  {"id": "call_01JQ...", "type": "function",
+   "function": {"name": "get_weather", "arguments": "{\"location\":\"Paris\"}"}}]},
+  "finish_reason": "tool_calls"}]}
+```
+
+Run the tool, append the assistant message and a `{"role":"tool"}` result to the conversation, and
+send it back. `arguments` is a JSON string, as OpenAI's schema has it.
+
+The call ids are the bridge's own, and a client that echoes them back unchanged finds its conversation
+in the context cache on the next turn. A tool name that was never offered is passed through for the
+client to reject. If `max_tokens` cut the reply short and it still parses, the calls are sent and
+`finish_reason` says `length`, so a client that resumes on truncation still knows to.
 
 With `tools` present a streamed reply is buffered whole before anything goes out, because nothing can
 tell a call from prose until the model has stopped; keep-alive comments hold the connection open

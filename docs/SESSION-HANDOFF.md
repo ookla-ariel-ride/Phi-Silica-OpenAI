@@ -1,11 +1,12 @@
 # Session handoff, 2026-09-11, after the chunk 7 merge (D83)
 
-Supersedes the handoff written after the D82 merge earlier today (in git history). Everything
-below was verified at write time.
+Supersedes the handoff written after the D82 merge earlier the same day (in git history). "Today"
+below means 2026-09-11, when every merge landed; the session ran past midnight and this file was
+finished early on the 12th. Everything below was verified at write time.
 
 ## Where things stand
 
-- `main` is at or after `b7e4eb3` (the tip of `feat/chunk-7-tool-calls`), in sync with origin. The
+- `main` is at or after `8b97aa1`, in sync with origin, tree clean. The
   repository is `ookla-ariel-ride/npu-bridge` (renamed today; the old `Phi-Silica-OpenAI` URL
   redirects). The local folder keeps its old name on purpose: package identity is registered against
   the build path, and renaming it means `identity.ps1 -Install` again.
@@ -22,9 +23,9 @@ below was verified at write time.
   back unchanged (`prompt_tokens` 41 / `completion_tokens` 2 on both shapes, 3581 tokens at the fox
   and CJK preflight boundaries, the eight-token cut streaming 31 characters with `finish=length`, a
   cache hit on the continuation, `text_mismatches=0`, `late_deltas=0`), and four teardown rows.
-- Open issues: #2, #4, #11, #14, #15, #16, #17, #21, #22, and #19, which is closed on GitHub but
-  should not be — a commit message closed it a second time by the same keyword accident (see "Things
-  learned"). Closed today: #1, #9, #10, #12, #13 and #3. Progress on #14 and #15 is recorded in
+- Open issues: #2, #4, #11, #14, #15, #16, #17, #19, #21, #22. #19 was closed twice by the keyword
+  accident described under "Things learned" and has been reopened both times; check it is still open.
+  Closed: #1, #3, #9, #10, #12, #13. Progress on #14 and #15 is recorded in
   comments on each.
 
 ## What this session did, in order
@@ -131,6 +132,13 @@ below was verified at write time.
     measured 20/20 over 20 runs. Two new issues: #21 (the hard case is unmeasured) and #22 (a
     zero-argument call without the wrapper reads as content, an accepted cost recorded in D83).
     Fast-forward merged; #3 closed from the commit.
+13. The end-of-session documentation pass the owner asked for. The README was reviewed against the
+    `crafting-effective-readmes` checklist as an update (capabilities changed) and then run through
+    `humanizer`: the request-travel diagram gained the two steps chunk 7 adds, tool calling gained a
+    worked request and reply, and one restatement the example made redundant came out. It was already
+    free of the strong tells, having had a humanizer pass after chunk 5. The memory bank was reviewed
+    whole rather than appended to, since three incremental updates in one day had left drift. This
+    file was brought to the post-merge state.
 
 ## Decisions the owner made today
 
@@ -305,8 +313,8 @@ below was verified at write time.
 
 ```powershell
 cd C:\Users\jimsi\OneDrive\Documents\GitHub\Phi-Silica-OpenAI
-git status; git log --oneline -3                          # expect main at or after b7e4eb3, tree clean
+git status; git log --oneline -3                          # expect main at or after 8b97aa1, tree clean
 dotnet build; dotnet test                                 # expect 866 passed
 .\scripts\smoke.ps1 -Backend phi-silica -Port 5298        # expect all passed, 0 skipped, 5 informational
-gh issue list                                             # #2, #4, #11, #14 to #17, #21, #22 open; #19 needs reopening
+gh issue list                                             # #2, #4, #11, #14 to #17, #19, #21, #22 open
 ```

@@ -131,14 +131,14 @@ and the `WindowsWorkload.LanguageModel.*` packages as *staged only* (registered 
   and the two paths would have to agree on every shape.
 - **Prompt compression** (`Microsoft.Windows.AI.Text.Experimental`, 2.4.8-experimental metadata only):
   `LanguageModelExperimental.CompressPromptAsync` with `LanguageModelOptionsExperimental.PreferredRetentionRatio`.
-  Relevant to chunk 5 as an alternative to dropping turns under `--truncate-history`; experimental,
-  Phi Silica only, and the exe references 2.4.1-experimental, so it would need a version bump.
+  An alternative to dropping turns under `--truncate-history`, deferred: experimental, Phi Silica
+  only, and the exe references 2.4.1-experimental, so it would need a version bump.
 
 ## Commands
 ```powershell
 dotnet build ; dotnet test
 .\scripts\identity.ps1 -Install|-Status|-Uninstall
-.\scripts\smoke.ps1 -Backend phi-silica|fake [-Port 5298] 6>&1 | Tee-Object -FilePath smoke.log
+.\scripts\smoke.ps1 -Backend phi-silica|fake [-Port 5298] [-ToolProbeRuns 20] 6>&1 | Tee-Object -FilePath smoke.log
 NpuBridge.exe --backend fake --listen http://127.0.0.1:5299 --verbose
 NpuBridge.exe task install|status|uninstall        # elevated for install/uninstall
 NpuBridge.exe service install|start|stop|uninstall # elevated; aion/fake only
@@ -150,6 +150,14 @@ NpuBridge.exe service install|start|stop|uninstall # elevated; aion/fake only
 - No `python` on the machine. `perl` exists in Git Bash. Multi-line shell heredocs have mangled
   `\u` sequences before; commit messages through `git commit -F -` with a heredoc work.
 - A safety hook blocks a command that combines a delete with a `C:\Program Files` path; split it.
+- `grep -c` exits non-zero when it counts nothing, which short-circuits an `&&` chain silently. One
+  commit was skipped that way on 2026-09-11 and only found by re-reading the log; put a count in its
+  own command, or end the chain with `|| true`.
+- GitHub treats a closing keyword anywhere in a commit message as a close, including inside a
+  sentence explaining something (`fixed: #19` in a "filed rather than fixed" line). Issue #19 was
+  closed by accident twice this way, the second time by the commit whose message described the first
+  accident. Write "Split out: #N" or "Filed: #N" for an issue that stays open, and keep the real
+  `closes #N` on a line of its own.
 - Ports used by the smoke script: the main server on `-Port`, auxiliary servers on `-Port + 1`
   (placement runs) and `-Port + 2` (`--truncate-history`).
 
@@ -177,5 +185,4 @@ NpuBridge.exe service install|start|stop|uninstall # elevated; aion/fake only
   rather than the Instruct framework. Needs a 40+ TOPS NPU (this machine qualifies); Windows AI APIs
   now also target GPUs and CPUs.
 - Consequence for the plan: a backend with native tool calling should bypass chunk 7's emulation via a
-  `ToolCalling` capability, and `--context-window-hint` becomes per-backend. Tracked in the Aion Plan
-  GitHub issue.
+  `ToolCalling` capability, and `--context-window-hint` becomes per-backend. Tracked as issue #11.
