@@ -10,8 +10,9 @@ Elite an empty context accepts 3,581 tokens of prompt, roughly 13,400 characters
 decodes at about 27 tokens per second. Those counts are the model's own: the bridge tokenizes with
 Phi-3.5-mini's vocabulary, having measured that the runtime's prompt-length limit agrees with it.
 Short conversations work well, and a continuing one is cheap because the bridge keeps the model's
-context between turns. Long agent loops with a dozen tools will not fit, and the bridge answers with
-OpenAI's `context_length_exceeded` error instead of dropping turns on its own.
+context between turns. Long agent loops with a dozen tools will not fit — a real terminal agent's
+toolset alone measured three to seven times the whole window — and the bridge answers with OpenAI's
+`context_length_exceeded` error instead of dropping turns on its own.
 
 ## Backends
 
@@ -275,12 +276,27 @@ tell a call from prose until the model has stopped; keep-alive comments hold the
 meanwhile and the calls then arrive in a single chunk. Offering different tools makes a different
 conversation as far as the cache is concerned, since the instruction block is part of the system text.
 
-How well the model follows the protocol is its own business. Measured here on Phi Silica, twenty runs
-of a request offering one tool with one required string argument called the tool twenty times, with no
-prose, no protocol text leaking into the content and no invented tool name. That is the easy end of
-the problem: many tools, nested schemas and a long agent system prompt are not measured yet, and the
-expectation for that case is 60 to 80 %. `--tool-emulation off` turns the feature off for the process,
-`tool_choice: "none"` for one request.
+How well the model follows the protocol is its own business, and it is now measured rather than
+guessed. Across 114 generations on Phi Silica — tool counts from 1 to 25, flat and nested schemas,
+agent system prompts up to 1,501 tokens, and tool blocks filling half to 85 % of the context window —
+every call named a tool that was offered and carried valid JSON arguments, and the argument values
+were right wherever the model picked the right tool. No prose-wrapped protocol reached a client, no
+tool was invented, and the bridge produced no malformed reply. An earlier run suggested accuracy
+sagged as the window filled; that was sampling noise, and it did not survive deterministic decoding
+(`docs/DECISIONS.md` D96).
+
+The limit is not the model's protocol discipline. It is the window. A real agent's tool schemas are
+larger than everything Phi Silica can hold: one terminal agent measured here presents about 40 KB of
+tool JSON for its 25 tools, against a 3,581-token window, so it cannot run until its toolset is cut
+down — restricted to a single toolset, the same agent works. Offer a handful of tools and this is
+reliable; offer an agent framework's whole toolbox and the conversation will not fit at all.
+`docs/CLIENTS.md` has the measured table, and `--tool-emulation off` turns the feature off for the
+process, `tool_choice: "none"` for one request.
+
+One safety note for anyone probing these limits: a system prompt over about 44,000 characters does
+not merely overflow, it crashes the Windows model host and leaves the NPU unusable for several
+minutes (`docs/DECISIONS.md` D94, issue #29). Find the boundary with `POST /debug/tokenize` rather
+than by sending the request.
 
 ## Configuration
 

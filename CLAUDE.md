@@ -111,6 +111,7 @@ dotnet run --project src/NpuBridge -- --backend fake --verbose   # run the exe (
 .\scripts\identity.ps1 -Install                # sparse package identity for Phi Silica; installs the runtime dep; prints the PFN
 .\scripts\identity.ps1 -Status                 # is the package registered, which PFN
 .\scripts\smoke.ps1 -Backend phi-silica        # real NPU run: health, models, /debug/generate, chat (JSON and SSE), the cut, the cache hit, the overflow refusal and --truncate-history (on a second server), the D80 tokenizer boundary check, the D53/D55 measurements, the tool-call compliance probe (-ToolProbeRuns, default 5), the chunk 8 concurrency steps (two requests really queue; --queue-capacity 1 admits one and 429s the rest) and /v1/completions on both shapes, teardown
+.\scripts\tool-probe.ps1 -Include WindowOccupancy -Runs 8   # issue #21 hard-case tool-call measurement against a RUNNING bridge; five dimensions (tool count, schema depth, system-prompt pressure, multi-step, window occupancy), -JsonOut for the numbers. Never sends >32K chars of system text: above ~44K the Windows model host fail-fasts (D94)
 NpuBridge.exe task install|status|uninstall    # logon task that starts Phi Silica with identity (install/uninstall elevated)
 NpuBridge.exe service install|start|stop|uninstall   # Windows service for aion/fake (elevated)
 ```
@@ -122,6 +123,15 @@ Do not `dotnet build` while `smoke.ps1` has a server up: the exe is locked and t
 Two smoke lines look like failures and are not. A *first*-generation "the remote procedure call failed"
 is the model runtime's known flake — re-run once; the same fault on a later generation is real. And
 `system prompt honoured: False` on the `/debug/generate` row is D45: only the bare debug path ignores it.
+
+**Never send more than ~40,000 characters of system text to Phi Silica (D94, issue #29).** At 44,000
+and above, `CreateContext` fail-fasts `WorkloadsSessionHost.exe` (`0xc0000409`) and wedges the NPU for
+the whole machine for several minutes: every generation then returns 502 `The RPC server is
+unavailable` in 3 to 17 ms, `/healthz` still says `ready` (issue #30), a bridge restart does not clear
+it, and the host processes are protected so they cannot be killed. It self-heals after minutes. This is
+easy to trigger by accident, because tool emulation renders the tool block into the system text — a
+real agent's toolset is ~40 KB. Find limits with `POST /debug/tokenize`, not by sending the request.
+"RPC server is unavailable" persisting past one retry means this happened; wait it out.
 
 Aion's SDK NuGet is not on nuget.org. It comes from the sample repo's GitHub release
 (`AionInstructPreview.Text.Framework.1.0.0.nupkg`) and lives in `nuget-local/`, wired by `nuget.config`.

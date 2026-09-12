@@ -106,6 +106,11 @@ than wait for a 429.
 
 ## OpenCode
 
+> **Not usable on this machine as of 2026-09-12.** OpenCode does not yet run properly on Windows
+> ARM64, which is the only platform the Phi Silica backend exists on. Nothing in this section has
+> been exercised against a running OpenCode instance, and it cannot be until that changes. The
+> verified client on this machine is Hermes, below.
+
 OpenCode is one of the two agent tools this bridge exists to serve, and the one where tool calling
 and burst concurrency both matter most: an agent loop calls tools repeatedly in one conversation and
 can issue several requests close together.
@@ -149,14 +154,15 @@ Start with a small task and one tool before trusting a long agent run to this ba
 
 ## Hermes
 
-Hermes is the other agent tool this bridge exists to serve, but which "Hermes" is not pinned down
-anywhere in this repository beyond the name. What follows is `NousResearch/hermes-agent`, a
-terminal coding agent that matches on every count checked (an OpenAI-compatible custom-endpoint
-setup, `/v1/models` discovery, `base_url`/`api_key` configuration), and it is the best fit found,
-not a confirmed identification. If the owner's "Hermes" is a different project, everything below
-this paragraph is about the wrong tool. Its documentation
-(`hermes-agent.nousresearch.com`, `NousResearch/hermes-agent` on GitHub) describes a custom
-OpenAI-compatible endpoint as a `model` block in `~/.hermes/config.yaml`:
+**Verified against a running instance on 2026-09-12.** The earlier guess in this document — that
+"Hermes" meant `NousResearch/hermes-agent` — was wrong. The tool installed on this machine is
+**Hermes Agent v0.21.2** (`hermes --version` reports `2026.9.11`, upstream `1c671bea`, a git
+install under `%LOCALAPPDATA%\hermes`), a far larger agent than the guess assumed: its subcommand
+surface includes `whatsapp`, `slack`, `kanban`, `lsp`, `memory-graph` and `computer-use`. Treat the
+configuration below as the verified one and ignore any write-up based on the old identification.
+
+Configuration is a `model` block in the config file that `hermes config path` prints
+(`%LOCALAPPDATA%\hermes\config.yaml` here, **not** `~/.hermes/config.yaml`):
 
 ```yaml
 model:
@@ -166,16 +172,44 @@ model:
   api_key: not-used
 ```
 
-or interactively, via `hermes model`, selecting "Custom endpoint (self-hosted / vLLM / etc.)" and
-entering the base URL, any string as the API key, and the model id. Hermes's docs say it queries
-the endpoint's `/v1/models` for model discovery, which this bridge answers, and that
-`provider: custom` streams using the standard `stream: true` protocol, which is what this bridge
-speaks. This is what Hermes's own documentation states; it has not been verified against a running
-Hermes session in this repository.
+`provider: custom` also reads `OPENAI_BASE_URL` and `OPENAI_API_KEY` from the environment, and
+`HERMES_HOME` redirects the whole config root — which together let you point Hermes at the bridge
+for a one-off run without touching your real configuration:
 
-The same two warnings apply here as for OpenCode, and more sharply, since a coding agent's normal
-turn is a tool call: verify a single-tool task works end to end before relying on this backend for a
-real Hermes session, and expect a 429 (not a hang) if a burst outruns `--queue-capacity`.
+```powershell
+$env:HERMES_HOME = 'C:\some\scratch\hermes-home'   # fresh config root
+# write the model block above to $env:HERMES_HOME\config.yaml
+hermes -t clarify -z "What is 2+2? Answer with just the number." --safe-mode --cli
+```
+
+That exact command answered `` `4` `` off the NPU in 13.1 s.
+
+### The tool schemas are what will not fit
+
+This is the thing to understand before pointing Hermes at this bridge for real work. Phi Silica's
+usable window is **3,581 tokens**, and Hermes's tool-schema JSON for its full toolset is about
+**40 KB — roughly 10,000 tokens on its own**, nearly three times the entire window. Because tool
+emulation (D83) renders that block into the **system text**, a full-toolset Hermes does not merely
+overflow; it crosses the threshold where `CreateContext` throws, and the request comes back as a
+502 rather than a clean 400 (issue #29). Hermes then retries it three times, so one impossible
+request costs 30–40 s of NPU time.
+
+Measured on 2026-09-12, same prompt each time:
+
+| Hermes configuration | Tools offered | Result |
+|---|---|---|
+| Default config, in a repo | 25 (~40 KB) | 502 `backend_error` after 3 retries, 38.9 s |
+| Fresh config root, empty cwd, all toolsets | 25 (~40 KB) | 502 `backend_error` after 3 retries, 33.6 s |
+| Fresh config root, `-t clarify` | 1 | **answered correctly, 13.1 s** |
+| Default config in a repo, `-t clarify` | 1 | **answered correctly, 13.1 s** |
+
+So the binding constraint is the **toolset**, not the working directory and not the system prompt:
+restricting tools with `-t` is what makes Hermes work here, and the `AGENTS.md`/cwd context tier
+turned out not to be what pushed it over. Use `hermes prompt-size` to see the breakdown before a
+run — it is offline and makes no API call — but note it reports the schema size for *all* toolsets
+regardless of `-t`, so it overstates what a `-t`-restricted run actually sends.
+
+Expect a 429 (not a hang) if a burst outruns `--queue-capacity`.
 
 ## `curl`
 
@@ -277,7 +311,11 @@ needs to catch `RateLimitError` to handle the exhausted case.
 
 `docs/DECISIONS.md` D44, D53, D77, D80 and D83 carry the reasoning and the measurements behind the
 `usage`, `max_tokens` and tool-calling notes above; the queue numbers came from `scripts/smoke.ps1`
-against Phi Silica on this machine (`.superpowers/sdd/chunk-8-plan/task-4-report.md`). Nothing here
-about OpenCode's or Hermes's own configuration format was run against a live instance of either tool
-from this repository; both sections say so inline, and either should be treated as a starting point
-to check against that tool's current documentation rather than a verified integration.
+against Phi Silica on this machine (`.superpowers/sdd/chunk-8-plan/task-4-report.md`).
+
+The **Hermes** section was verified against a running Hermes Agent v0.21.2 on 2026-09-12 (issue #21):
+its identity, its config path, the `OPENAI_BASE_URL`/`HERMES_HOME` overrides, the four-row toolset
+table and the `` `4` `` answer are all measured, not documented-and-assumed. The COMException
+behaviour behind the 502 rows is issue #29. The **OpenCode** section remains unverified and cannot
+be verified here, because OpenCode does not yet run on Windows ARM64; treat it as a starting point
+to check against OpenCode's current documentation rather than a working integration.

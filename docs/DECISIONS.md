@@ -1745,3 +1745,87 @@ correct as written: both shapes passed the cut's linked source as the scheduler'
 matched and a cut became a 503. The implementer's own rewiring — pass `http.RequestAborted`, create
 the linked cut source inside the closure — is what had removed the route. A fix, not a refutation, and
 it is written down that way because the report said otherwise.
+
+## 2026-09-12 — Issue #21: hard-case tool-call compliance, measured on hardware
+
+Chunk 7 measured 20/20 single-tool compliance and `docs/PLAN.md` §2.6 predicted 60 to 80 % on the
+hard case — 10+ tools, deep schemas, a 3K-token agent system prompt. That case is now measured, and
+the prediction was wrong in both directions: compliance is far better than 60 to 80 %, and the hard
+case is unreachable for a different reason than compliance.
+
+**D93. The hard case does not fit, and what does not fit is the tool schemas.** A real agent client
+(Hermes Agent v0.21.2, the first ever driven against this bridge) presents ~40 KB of tool-schema JSON
+for its 25 tools. Phi Silica's usable window is 3,581 tokens. Measured with `hermes prompt-size`,
+which is offline and makes no API call: the default configuration is ~102 KB of fixed prompt
+(~25,000 tokens, 7x the window); stripped to a fresh config root in an empty directory it is still
+~48 KB (~12,000 tokens, 3x). No Hermes configuration fits. Restricted to one toolset (`-t clarify`)
+it works and answers correctly in 13.1 s, from inside this repository as well as from an empty
+directory — so the binding constraint is the **toolset**, not the working directory and not the
+system prompt. The `AGENTS.md`/cwd context tier, at 46 KB the obvious suspect, turned out not to be
+what pushed it over. `docs/CLIENTS.md` carries the four-row table.
+
+**D94. An over-large system prompt crashes a Windows system component, and that reframes the fix.**
+Native placement sends the system text — which is where tool emulation (D83) renders the tool block —
+to `CreateContext`. Up to 40,000 characters the preflight answers correctly and the request is a
+clean 400 `context_length_exceeded` in 0.45 to 1.2 s. At 44,000 and above, `CreateContext` throws,
+and the throw is the client-side symptom of `WorkloadsSessionHost.exe` fail-fasting with exception
+`0xc0000409` (STATUS_STACK_BUFFER_OVERRUN) in `ntdll`. 36 crashes were logged in two hours, clustered
+exactly on the intervals when oversized prompts were sent. Repeated crashes wedge Phi Silica for the
+whole machine: every generation afterwards, including a bare "reply PONG" with no tools and no system
+text, returns 502 `The RPC server is unavailable` in 3 to 17 ms; `/healthz` keeps reporting
+`status: ready`; the wedge lasts minutes; a bridge restart alone does not clear it; the host
+processes are protected and survive `Stop-Process -Force`. It self-heals after several minutes
+(verified recovered, 6/6 at 413 to 619 ms). The same volume sent as a *user* message is refused
+correctly at every size to 96,000 characters, so this is specific to the system text.
+
+So the guard proposed in issue #29 — count the system text with the backend's `ITokenCounter` before
+calling `CreateContext`, refuse with 400 when it alone cannot fit — is not wire-conformance tidiness.
+It is what stops this bridge from crashing an OS service, and it should sit well below 40,000
+characters rather than at the observed edge. Issue #30 covers `/healthz` reporting ready while
+nothing can generate. Do not probe above 40,000 characters of system text on this machine; establish
+the boundary offline with the token counter instead. A Feedback Hub report is warranted separately:
+a user-supplied string length reaching `__fastfail` in a system service is a Windows defect.
+
+**D95. Compliance is not the problem, and the two design options PLAN left open are both closed.**
+`scripts/tool-probe.ps1` (new) measured five dimensions over 114 real generations with zero bridge
+defects — no malformed body, no non-null content beside `tool_calls`, no invalid JSON arguments, no
+protocol leaking into content. Tool count 1 to 25 at 5 runs each: 40/40 right tool, correct
+arguments. System prompt at 0, 526 and 1,501 tokens: 9/9. Multi-step, the first hardware exercise of
+`PromptTemplate`'s tool rendering: turn 2 answered in prose with `finish_reason: stop` rather than
+repeating the call. Window occupancy at 50 %, 70 %, 70 %-reversed and 85 % of the window, 8 runs each
+under `temperature: 0`: **32/32**, every call the right tool with correct arguments.
+
+PLAN predicted "frequent argument hallucination, prose-wrapped JSON, calling tools that weren't
+offered". None occurred: arguments were valid JSON in every call, no unoffered tool was ever called,
+the parser never leaked protocol. So **`--tool-schema full` should not be built** — compact rendering
+already consumes the window and a fuller form moves the boundary the wrong way — and **structured
+JSON output** (2.4.x stable, Phi Silica only) **is not indicated**, because parsing was never the
+failure and it would buy back no window. Both are closed on issues #3 and #1.
+
+**D96. A retraction, and why the first run said otherwise.** The first occupancy sweep reported
+compliance degrading at ~70 % of the window (0/3, a hallucinated tool *name*), recovering at 85 %,
+then not calling at all at 95 %. An adversarial review found the sweep hardcoded 3 runs per cell,
+ignoring `-Runs`, and that no cell set `temperature`, so every measurement ran at stochastic
+defaults; a lone 0/3 flanked by 3/3 on both sides is what sampling noise looks like across 21
+chances. It also found that the sweep left the target tool first in the catalog while dimensions 1
+and 2 deliberately rotate it to the midpoint, so the two were never on one scale. Re-run at
+`temperature: 0` with the rotation applied, the same cell that had failed 0/3 twice is 8/8, and a
+reversed-content control at the same occupancy and repetition depth is also 8/8. **The degradation
+finding is withdrawn, not caveated.** What is measured is that occupancy up to 85 % shows no
+degradation under deterministic sampling. Because both corrections landed in one re-run, neither can
+be singled out as the cause of the original dip, and the record says so rather than guessing.
+
+The review also caught the probe building a 9.5-million-character request had `/debug/tokenize` ever
+returned a non-200 — `-SkipHttpErrorCheck` yields no `tokens` property, `Max(1, $null)` floors to 1,
+and the padding loop had no iteration cap. That request would have been 200x past the crash boundary
+D94 describes. The script now validates every tokenize answer, clamps to 30,000 characters, asserts a
+32,000-character ceiling, and caps the loop. A measurement tool whose failure mode is crashing the
+machine it measures is worth reviewing before trusting its numbers.
+
+**What is still unmeasured.** Every probe request is `stream: false`. D83's buffered streaming branch
+— the whole reply held behind keep-alives, the calls arriving in one chunk — is the half every real
+agent client uses, and no systematic measurement covers it; the Hermes runs exercised it only
+incidentally. The tool-call round trip through the context cache (D83's ruling that a reply is stored
+under the calls the client will echo, not the text the model wrote) is also still unverified on
+hardware, because the multi-step cell never read `context_cache_hits` around its two turns. Both are
+on issue #21's successor work rather than closed by it.
