@@ -99,23 +99,27 @@ relying on this bridge.
 `scripts/smoke.ps1 -Backend phi-silica` checks the whole surface against the hardware in three to
 five minutes: health with identity, both response shapes, the cut, the context cache, the overflow
 refusal and `--truncate-history` on a second server, the tokenizer against the model's own prompt
-limit, a tool-call probe over N runs (`-ToolProbeRuns`, five by default), and at the end that the
-relaunched child process exited and the port is free. It starts and tears down three helper servers
-along the way, each with its own pass or fail row. Re-run
-`identity.ps1 -Install` whenever the build output folder or the manifest changes.
+limit, a tool-call probe over N runs (`-ToolProbeRuns`, five by default), two concurrent requests
+queueing behind one another, a full queue answering 429 on a server started with capacity 1,
+`/v1/completions` on both shapes, and at the end that the relaunched child process exited and the
+port is free. It starts and tears down four helper servers along the way, each with its own pass or
+fail row. Re-run `identity.ps1 -Install` whenever the build output folder or the manifest changes.
 
 ## How a request travels
 
 ```mermaid
 flowchart TD
-    A["POST /v1/chat/completions"] --> B["Validate the body: model, messages, ranges"]
+    A["POST /v1/chat/completions or /v1/completions"] --> B["Validate the body: model, messages, ranges"]
     B -->|"unknown model"| E404["404 model_not_found"]
     B -->|"backend still loading"| E503["503 model_loading"]
     B --> C{"tools offered?"}
     C -->|"yes"| C1["Append the tool instructions to the system text"]
     C -->|"no"| D
     C1 --> D["Render the transcript (PromptTemplate)"]
-    D --> F{"A cached context holds a prefix of it?"}
+    D --> S{"Is there room in the queue?"}
+    S -->|"no"| E429["429 queue_full, with Retry-After"]
+    S -->|"yes"| W["Wait for the one worker"]
+    W --> F{"A cached context holds a prefix of it?"}
     F -->|"hit"| G["Check the context out; render only the new turns"]
     F -->|"miss"| H["Fresh context; render the whole transcript"]
     G --> I{"Preflight: does it fit?"}
@@ -134,6 +138,14 @@ flowchart TD
     R -->|"no"| M["Dispose the context"]
 ```
 
+Everything below the queue runs on one worker. There is one model handle and no way to use it from
+two requests at once, so a second request waits, and so do its cache lookup and its prompt-length
+preflight, which are calls on that same handle. A request that arrives to a full queue is refused
+with 429, code `queue_full`, and a `Retry-After` estimated from how long recent generations took. The
+wait is why a streamed request can be refused inside the stream rather than with a status code: by
+the time its turn comes, the first keep-alive comment may already have gone out and fixed the
+response at 200.
+
 The preflight is the runtime's own answer to "how much of this fits", asked before anything is
 generated. Aion's preview SDK has no preflight, so on that backend the answer comes from the
 generation's status instead, and with `--truncate-history` the bridge retries after it.
@@ -147,10 +159,18 @@ Keep-alive comments hold the connection open while that happens.
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/chat/completions` | chat completions, streaming and non-streaming |
-| `GET /healthz` | backend state, load time, package identity, the context cache's count and hit/miss counters, the streaming keep-alive timings, diagnostics. 200 when ready, 503 otherwise |
+| `POST /v1/completions` | the legacy text-completion shape, streaming and non-streaming |
+| `GET /healthz` | backend state, load time, package identity, the context cache's count and hit/miss counters, the queue's depth and capacity, the streaming keep-alive timings, diagnostics. 200 when ready, 503 otherwise |
 | `GET /v1/models`, `GET /v1/models/{id}` | the active model id |
 | `POST /debug/generate` | one literal prompt into the backend with timing. Diagnostic, loopback only |
 | `POST /debug/tokenize` | the backend's token count of a literal text, and which counter answered. Diagnostic, loopback only, works while the model loads |
+
+`/v1/completions` wraps `prompt` into a single user message and runs the same pipeline the chat
+endpoint runs, with the same cache, queue, cut and errors. `prompt` may be a string or a one-element
+array; more than one element is a 400, because real OpenAI answers a batch with several choices and
+one worker cannot serve that. The parameters that exist only on this shape (`echo`, `best_of`,
+`suffix`, `logprobs`, `logit_bias`) are accepted and ignored with one warning each. That includes
+`echo`, so the prompt is not prepended to the returned text the way a real server prepends it.
 
 Anything else under `/v1` returns an OpenAI-shaped 404, or a 405 with `Allow` when the path is known
 but the method is wrong. Errors use the `{"error":{"message","type","param","code"}}` body with all
@@ -178,8 +198,9 @@ saving grows with the length of the history.
 
 The cache holds four conversations by default (`--context-cache-size`, `0` disables it) and drops
 the least recently used. A reply that was cut short by `max_tokens` or `stop`, or that failed, never
-goes back into the cache. Two concurrent requests for one conversation never share a context; the
-second replays.
+goes back into the cache. Two requests for one conversation never share a context. The queue makes
+the second one wait instead of racing, and it then replays anyway: the first has re-keyed the context
+under its own reply, so the transcript the second sent is no longer in the cache.
 
 ### When the conversation no longer fits
 
@@ -271,6 +292,7 @@ everything.
 | `--backend phi-silica\|aion\|fake` | `phi-silica` | |
 | `--listen <url[;url]>` | `http://127.0.0.1:5273` | localhost only unless you change it, and no auth |
 | `--context-cache-size <n>` | `4` | conversations whose model context is kept between turns; `0` disables |
+| `--queue-capacity <n>` | `4` | requests that may wait for the one worker; one that arrives to a full queue gets 429 `queue_full` and a `Retry-After` |
 | `--truncate-history` | off | drop the oldest exchanges on overflow instead of returning 400 |
 | `--context-window-hint <tokens>` | `4096` | a warning is logged when a conversation reaches nine tenths of it; overflow itself is decided by the model's preflight |
 | `--system-prompt-placement auto\|native\|prompt` | `auto` | deliver the system message through the backend's own context, or fold it into the prompt text |
@@ -282,9 +304,6 @@ everything.
 | `--hide-console` | off | hide the console window after startup |
 | `--laf-token`, `--laf-attestation` | none | unused on the experimental channel; prefer the settings file |
 | `--service-name`, `--task-name` | `NpuBridge`, `npu-bridge` | names for the service and logon task |
-
-`--queue-capacity` is accepted and range-checked, but nothing reads it yet; setting it changes no
-behaviour.
 
 Secrets belong in `appsettings.local.json`, which is gitignored. A gitleaks pre-commit hook and a
 GitHub Actions workflow scan for them; enable the hook with `git config core.hooksPath .githooks`.
@@ -325,8 +344,12 @@ and the `max_tokens` budget are counted with it, and `POST /debug/tokenize` will
 give it. The Aion preview adapter and the fake backend divide characters by four instead. On a cache
 hit `prompt_tokens` still counts the whole conversation, including the turns that were not sent.
 
-**Concurrent requests are not serialized.** Nothing queues generations against the single model
-handle, and concurrent requests on hardware are untested. A request queue is planned.
+**Only one request generates at a time.** There is one model handle, so everything that touches it
+queues: the generation, and also the cache lookup and the prompt-length preflight, which are calls on
+the same handle. Four requests may wait by default. The next one is refused with 429 rather than
+blocked, so a client is never left holding a connection open for a slot that may never come. Checked
+on the NPU: two requests sent at once queued and both answered, and a server started with
+`--queue-capacity 1` admitted one and refused the next two.
 
 **System prompts work because of the rendering.** The same instruction is ignored when sent bare
 through `/debug/generate` and obeyed when it arrives inside the rendered transcript. Use the
@@ -360,12 +383,11 @@ nuget-local/               where the Aion SDK nupkg goes (gitignored; the adapte
 .githooks/, .github/       the gitleaks pre-commit hook; the build-and-test and secret-scan workflows
 ```
 
-Start with `docs/PLAN.md` for the design and the order remaining work lands in, `docs/DECISIONS.md`
+Start with `docs/PLAN.md` for the design and the order the chunks landed in, `docs/DECISIONS.md`
 for why things are the way they are, `docs/FUTURE.md` for what is deliberately not done, and
-`docs/CLIENTS.md` for wiring up a specific client.
-Remaining work: a request queue with `/v1/completions` and client documentation, the last chunk and a
-GitHub issue like the others. The tests run against the fake backend and need no NPU; the smoke script
-is the hardware check.
+`docs/CLIENTS.md` for wiring up a specific client. All eight planned chunks are built; what is
+deliberately left undone is in `docs/FUTURE.md` and the open GitHub issues. The tests run against the
+fake backend and need no NPU; the smoke script is the hardware check.
 
 ## References
 
