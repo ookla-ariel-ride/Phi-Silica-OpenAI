@@ -172,23 +172,20 @@ public static class DebugEndpoints
             }
         }, http.RequestAborted).ConfigureAwait(false);
 
-        return scheduled.Kind switch
+        // The same classification both /v1/chat/completions shapes use (fix round 1, Finding 4): the
+        // three callers spelled a full queue and a scheduler shutdown out separately and had already
+        // drifted apart on day one, which is the drift D81 exists to prevent one level up.
+        // clientAlreadyGone is false explicitly rather than by default: this diagnostic endpoint has no
+        // streamed shape and no client worth sparing a status line for, so unlike the two OpenAI
+        // endpoints it does not answer an aborted caller with silence.
+        var admission = SchedulerAdmission.Classify(scheduled, clientAlreadyGone: false);
+        if (admission == SchedulerOutcome.Completed)
         {
-            ScheduleResultKind.Completed => scheduled.Result!,
-            ScheduleResultKind.Rejected => QueueFullResult(http, scheduled.RetryAfterSeconds),
+            return scheduled.Result!;
+        }
 
-            // Cancelled: dropped while queued, or a post-shutdown enqueue -- either way nothing ran, so
-            // there is no partial result to report and no context to dispose. This diagnostic endpoint
-            // has no streamed shape and no client to spare a status line for, so unlike the two OpenAI
-            // endpoints this does not special-case an aborted caller separately (task-2-brief.md,
-            // integration decision 4: never 429, since the scheduler is not coming back either way).
-            _ => GenerationFailure.QueueShuttingDown().ToResult(),
-        };
-    }
-
-    private static IResult QueueFullResult(HttpContext http, int retryAfterSeconds)
-    {
-        http.Response.Headers.RetryAfter = retryAfterSeconds.ToString();
-        return GenerationFailure.QueueFull(retryAfterSeconds).ToResult();
+        var failure = SchedulerAdmission.FailureFor(admission, scheduled.RetryAfterSeconds);
+        SchedulerAdmission.ApplyRetryAfter(http.Response, admission, scheduled.RetryAfterSeconds);
+        return failure.ToResult();
     }
 }
