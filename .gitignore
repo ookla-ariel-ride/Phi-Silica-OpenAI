@@ -96,3 +96,8 @@ skills-lock.json
 # leaves a whole second copy of the repository behind as untracked files. Without this line the
 # next `git add -A` commits that copy.
 .claude/worktrees/
+
+# ---- serena (MCP code-navigation agent) ----
+# Per-machine project config, its language-server cache and the agent's own memories. Serena
+# writes these on first activation; none of it is project source, and the cache is large.
+.serena/

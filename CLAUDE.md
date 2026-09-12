@@ -371,6 +371,34 @@ it is current behaviour, so do not describe it as working:
 - **Chunk 8 (concurrency and `/v1/completions`)** will queue generations rather than letting two
   concurrent requests each take their own context, and `--queue-capacity` will finally be read.
 
+## Code navigation: use serena
+
+The serena MCP server is installed and its C# language server works against this solution. Reach for
+its symbol tools before reading files whole, and for its reference-aware edits before hand-editing a
+symbol:
+
+- `get_symbols_overview` on a file, then `find_symbol` with `include_body` on the one symbol you
+  actually need. Reading a 700-line endpoint file to change one method is waste.
+- `find_referencing_symbols` before changing any signature. This repo's shared pieces
+  (`GenerationOutcome`, `DeltaSink`, `ChatRequestPreparer`, `ILanguageModelBackend`) have callers on
+  both response shapes, and missing one is how the D56/D57 drifts happened.
+- `replace_symbol_body`, `insert_after_symbol`, `rename_symbol`, `safe_delete_symbol` for
+  structure-aware changes; `replace_content` for a few lines inside a larger method.
+- `search_for_pattern` to locate candidates when you do not know the symbol's name yet.
+
+Where it does not help: the prose docs (`docs/*.md`, this file, `memory-bank/`), `scripts/smoke.ps1`
+and the other PowerShell, and any file you are about to rewrite in full. Use the ordinary tools there.
+
+Two traps. **Serena reports 0-based line numbers**; every other tool here is 1-based, so convert
+before quoting a location into a commit message or an issue. And serena's own memories
+(`.serena/memories/`) are an index into the documents named above, not a second source of truth — when
+a memory and `docs/DECISIONS.md` disagree, the decision record wins and the memory is the thing to fix.
+
+`.serena/` is gitignored: the project config is per-machine and the language-server cache is large.
+If the server fails to connect, the cause on this machine is the interpreter, not serena — uv picks a
+Python that PyYAML ships no wheel for and the source build then wants MSVC. The plugin's `.mcp.json`
+pins `--python 3.12` for that reason.
+
 ## Working method for this repo
 
 Each chunk runs in this order: build and tests green, then an adversarial review (correctness, OpenAI
