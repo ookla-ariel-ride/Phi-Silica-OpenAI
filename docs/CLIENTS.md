@@ -9,6 +9,41 @@ Read this after the README's request-parameter and tool-calling sections; this d
 wiring a specific client to them, not about what the wire does. Where a client's behaviour depends
 on a fact measured on hardware, the number is here rather than repeated from `docs/DECISIONS.md`.
 
+## Endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/chat/completions` | chat, streaming and non-streaming |
+| `POST /v1/completions` | the legacy prompt-in, text-out shape (see the `curl` section below) |
+| `GET /v1/models`, `GET /v1/models/{id}` | the served model id, for a client's own discovery step |
+| `GET /healthz` | 200 once ready, 503 otherwise; also `queue_depth`, `queue_capacity` and the context-cache counters |
+| `POST /debug/generate`, `POST /debug/tokenize` | loopback-only diagnostics, not part of the OpenAI-shaped surface a client should call |
+
+README's own "Endpoints" section has the full detail on each; this list exists so a client's
+health check or model-discovery step is pointed at something real before reading further.
+
+## Conversations, the context cache, and what happens on overflow
+
+Send the whole conversation on every call, the way OpenAI clients already do. A conversation that
+extends one the bridge already answered reuses its model context and sends only the new turns, so a
+follow-up in the same chat answers faster than a fresh one would. When a conversation grows past
+what fits (Phi Silica's usable window is 3,581 tokens on an empty context), nothing is dropped
+silently: the bridge answers HTTP 400 with code `context_length_exceeded`. Starting the bridge with
+`--truncate-history` changes that to dropping the oldest exchange instead, and the response then
+carries `x-npu-bridge-truncated-turns: N` so a client can tell it happened. The mechanics and the
+measured timings are in README's "Conversations and the context cache" section; the client-facing
+version of the fact is: a long-running agent conversation gets a 400 once it outgrows the window
+unless `--truncate-history` is set, and a client that wants to know whether history was dropped
+should check for that header rather than assume its transcript survived intact.
+
+## Running it where a client can rely on it staying up
+
+How the bridge starts matters if a client is going to depend on it being there: Phi Silica needs
+Windows package identity, and only a logon task can carry that (`NpuBridge.exe task install`,
+elevated), not a Windows service, since a service is launched by path and never gets identity.
+`aion` and `fake` use a service instead (`NpuBridge.exe service install`). Registering the wrong
+verb for the backend in use means the bridge process exists but never reports itself ready.
+
 ## The five things that catch every client on the first try
 
 **`model` must be the id `/v1/models` lists, not the client's default.** OpenAI clients ship
@@ -62,8 +97,9 @@ ordering, one level up).
 For an agent loop that fires requests in a burst (OpenCode's and Hermes's own case, per the README),
 this matters twice over: a burst larger than `--queue-capacity` gets 429s, and a client that treats
 429 as a fatal error rather than a signal to wait and retry will fail requests a slower client would
-have gotten to. The `openai` Python library retries a 429 honouring `Retry-After` by default;
-check that whatever HTTP client sits under a given agent tool's OpenAI provider does the same, since
+have gotten to. The `openai` Python library retries a 429 automatically, twice by default
+(`DEFAULT_MAX_RETRIES = 2`), honouring `Retry-After` for the backoff delay; check that whatever HTTP
+client sits under a given agent tool's OpenAI provider does the same, since
 `Retry-After` is what makes the retry correct rather than a busy-loop. `/healthz` exposes
 `queue_depth` and `queue_capacity` if a supervisor process wants to watch pressure directly rather
 than wait for a 429.
@@ -80,6 +116,11 @@ OpenAI-compatible provider as an entry under `provider` in `opencode.json`, usin
 
 ```jsonc
 {
+  // Field names under "provider.<id>" per opencode.ai/docs/providers at the time this was written;
+  // not verified against a running OpenCode instance, and they have moved between versions before
+  // (some write-ups use "package"/"settings" for what current docs call "npm"/"options"). Check
+  // opencode.ai/docs/config against the installed version. The baseURL and model id below are the
+  // two facts this document can vouch for.
   "$schema": "https://opencode.ai/config.json",
   "provider": {
     "npu-bridge": {
@@ -100,22 +141,20 @@ OpenAI-compatible provider as an entry under `provider` in `opencode.json`, usin
 }
 ```
 
-Everything above the `baseURL` and model id line is taken from OpenCode's own documentation, not
-measured against a running OpenCode instance from this repository, and the field names under
-`provider.<id>` have moved between OpenCode versions in the past (some write-ups from the same
-period use `settings` where the current docs use `options`). Check `opencode.ai/docs/config` against
-the installed version before trusting this snippet verbatim; the two facts this document can vouch
-for are the base URL and the model id, both of which come from this bridge rather than from
-OpenCode.
-
-Whatever the exact keys, the same two warnings from above apply directly: OpenCode's agent loop calls
+Whatever the exact keys turn out to be for the installed version, the same two warnings from above
+apply directly: OpenCode's agent loop calls
 tools in every turn of a real task, which is exactly the untested shape (issue #21), and issuing
 several tool-result follow-ups quickly is exactly the burst pattern the queue and its 429s exist for.
 Start with a small task and one tool before trusting a long agent run to this backend.
 
 ## Hermes
 
-Hermes is the other agent tool this bridge exists to serve. Its documentation
+Hermes is the other agent tool this bridge exists to serve, but which "Hermes" is not pinned down
+anywhere in this repository beyond the name. What follows is `NousResearch/hermes-agent`, a
+terminal coding agent that matches on every count checked (an OpenAI-compatible custom-endpoint
+setup, `/v1/models` discovery, `base_url`/`api_key` configuration), and it is the best fit found,
+not a confirmed identification. If the owner's "Hermes" is a different project, everything below
+this paragraph is about the wrong tool. Its documentation
 (`hermes-agent.nousresearch.com`, `NousResearch/hermes-agent` on GitHub) describes a custom
 OpenAI-compatible endpoint as a `model` block in `~/.hermes/config.yaml`:
 
@@ -127,11 +166,12 @@ model:
   api_key: not-used
 ```
 
-or interactively, via `hermes model`, selecting "Custom endpoint (self-hosted / vLLM / etc.)", entering the
-base URL, any string as the API key, and the model id. Hermes's docs say it queries the endpoint's
-`/v1/models` for model discovery, which this bridge answers, and that `provider: custom` streams
-using the standard `stream: true` protocol, which is what this bridge speaks. This is what Hermes's
-own documentation states; it has not been verified against a running Hermes session in this repository.
+or interactively, via `hermes model`, selecting "Custom endpoint (self-hosted / vLLM / etc.)" and
+entering the base URL, any string as the API key, and the model id. Hermes's docs say it queries
+the endpoint's `/v1/models` for model discovery, which this bridge answers, and that
+`provider: custom` streams using the standard `stream: true` protocol, which is what this bridge
+speaks. This is what Hermes's own documentation states; it has not been verified against a running
+Hermes session in this repository.
 
 The same two warnings apply here as for OpenCode, and more sharply, since a coding agent's normal
 turn is a tool call: verify a single-tool task works end to end before relying on this backend for a
@@ -155,17 +195,21 @@ curl.exe -N http://127.0.0.1:5273/v1/chat/completions `
   -d '{"model":"phi-silica","stream":true,"messages":[{"role":"user","content":"Say hello."}]}'
 ```
 
-A stream looks like this on the wire: the keep-alive comment before the first token, one
-`chat.completion.chunk` per delta, and `data: [DONE]` at the end.
+A stream looks like this on the wire for the request above, which does not ask for usage: the
+keep-alive comment before the first token, one `chat.completion.chunk` per delta with no `usage`
+field at all, and `data: [DONE]` at the end. Add `"stream_options":{"include_usage":true}` to the
+request and every chunk before the last carries `"usage": null` instead of omitting the field, with
+the real counts on one further chunk after the finish chunk, empty `choices` included (see the
+Python example below, which turns it on).
 
 ```
 : keep-alive
 
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null,"logprobs":null}],"model":"phi-silica","usage":null}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null,"logprobs":null}],"model":"phi-silica"}
 
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null,"logprobs":null}],"model":"phi-silica","usage":null}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null,"logprobs":null}],"model":"phi-silica"}
 
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop","logprobs":null}],"model":"phi-silica","usage":null}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop","logprobs":null}],"model":"phi-silica"}
 
 data: [DONE]
 ```
@@ -221,10 +265,13 @@ for chunk in stream:
 
 The library's own SSE reader already treats `: keep-alive` as a comment and skips it, so nothing
 special is needed to handle it; the warning above is for a reader written from scratch, not for this
-client. A 429 raises `openai.RateLimitError`; the library's default client does not retry
-automatically unless `max_retries` is set above its default, so an agent script written directly
-against this SDK (rather than through OpenCode or Hermes) should either set `max_retries` or catch
-`RateLimitError` and back off by the `Retry-After` value itself.
+client. A 429 does not normally reach calling code: the library retries it for you, up to
+`DEFAULT_MAX_RETRIES` (2) times, sleeping for this bridge's own `Retry-After` value between
+attempts (confirmed in `openai-python`'s `_constants.py` and the retry logic in
+`_base_client.py`). `openai.RateLimitError` only surfaces once those retries are exhausted, or
+after `max_retries=0` is passed to turn retrying off; an agent script written directly against this
+SDK gets the same protection OpenCode's and Hermes's own OpenAI providers get for free, and only
+needs to catch `RateLimitError` to handle the exhausted case.
 
 ## Where these facts come from
 
