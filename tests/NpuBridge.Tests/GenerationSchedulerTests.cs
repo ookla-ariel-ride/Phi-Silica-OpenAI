@@ -306,8 +306,9 @@ public class GenerationSchedulerTests
             ctsB.Cancel();
 
             // A is still running, gateA is still open: if B's caller had to wait for the worker to
-            // drain to its position, this would hang forever instead of completing.
-            var resultB = await taskB;
+            // drain to its position, this would never complete. Bounded (fix-round-2 controller
+            // ruling) so a regression here fails the test instead of hanging the suite.
+            var resultB = await taskB.WaitAsync(TimeSpan.FromSeconds(10));
             Assert.Equal(ScheduleResultKind.Cancelled, resultB.Kind);
 
             gateA.SetResult();
@@ -518,11 +519,14 @@ public class GenerationSchedulerTests
             var boom = new InvalidOperationException("boom");
             var taskA = scheduler.ScheduleAsync<string>(_ => throw boom, CancellationToken.None);
 
-            var observed = await Assert.ThrowsAsync<InvalidOperationException>(() => taskA);
+            // Bounded (fix-round-2 controller ruling): this is the only regression guard on a
+            // Critical-class failure mode (a wedged worker), so it must fail loudly rather than hang
+            // the suite if the catch-all it pins is ever removed.
+            var observed = await Assert.ThrowsAsync<InvalidOperationException>(() => taskA).WaitAsync(TimeSpan.FromSeconds(10));
             Assert.Same(boom, observed);
 
             var taskB = scheduler.ScheduleAsync<string>(_ => Task.FromResult("b"), CancellationToken.None);
-            var resultB = await taskB;
+            var resultB = await taskB.WaitAsync(TimeSpan.FromSeconds(10));
 
             Assert.Equal(ScheduleResultKind.Completed, resultB.Kind);
             Assert.Equal("b", resultB.Result);

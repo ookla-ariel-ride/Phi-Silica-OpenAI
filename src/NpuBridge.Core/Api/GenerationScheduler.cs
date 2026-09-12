@@ -165,16 +165,29 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(operation);
 
         var job = new QueuedJob<TResult>(operation, _time.GetUtcNow(), _time, cancellationToken);
+
+        // Controller ruling, fix-round-1 finding 3: complete the caller the moment its own token fires
+        // rather than leaving it to wait for the worker to drain to this job's position in the queue.
+        // Armed BEFORE TryWrite (fix-round-2 finding), not after: TryWrite publishes the job to the
+        // worker thread immediately, and arming a moment later left a window where the worker could
+        // dequeue and settle the job -- Drop, or a fast RunAsync -- before this thread reached the arm
+        // call, so the registration assigned after that was never disposed by anyone and leaked for as
+        // long as the caller's own token source lived. Arming first makes TryWrite's own handoff a real
+        // happens-before, so every disposal path the worker can reach always sees the live field.
+        job.ArmCancellationCompletion();
+
         if (_queue.Writer.TryWrite(job))
         {
-            // Controller ruling, fix-round-1 finding 3: complete the caller the moment its own token
-            // fires rather than leaving it to wait for the worker to drain to this job's position in
-            // the queue. The worker's own Drop/RunAsync completions already use TrySetResult, so
-            // whichever of the two gets there first wins and the other is a no-op. The queue slot
-            // itself is not freed early -- that half is deferred (see the fix report).
-            job.ArmCancellationCompletion();
             return job.Completion.Task;
         }
+
+        // The job never reached the queue at all, so neither Drop nor RunAsync will ever run to
+        // dispose the registration this call just armed -- this is the one path that must do it
+        // itself. Idempotent alongside the registration's own self-dispose: if the token fired in the
+        // narrow window between arming and this failed TryWrite, Completion is already set to
+        // Cancelled and this is a harmless second Dispose -- the Rejected/Cancelled result returned
+        // below simply supersedes it, and nothing about that result is an exception nobody observes.
+        job.DisposeCancellationRegistration();
 
         if (_shutdown.IsCancellationRequested)
         {
@@ -303,6 +316,16 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
         /// <see cref="CancellationToken.UnsafeRegister"/> is used (not <c>Register</c>) because this
         /// callback captures no ambient context worth flowing, matching the reviewer's suggestion.
         /// </summary>
+        /// <remarks>
+        /// Must be called <em>before</em> the job is published to the worker (fix-round-2 finding): the
+        /// channel handoff (<c>TryWrite</c>/dequeue) is the only real happens-before between the
+        /// enqueuing thread and the worker thread, so arming first is what guarantees every disposal
+        /// path the worker can reach (<see cref="Drop"/>, <see cref="RunAsync"/>'s <c>finally</c>) sees
+        /// a fully-written <see cref="_cancellationRegistration"/> rather than racing its assignment.
+        /// Arming after publication left a window where the worker could dequeue and settle the job
+        /// before the enqueuing thread reached this call, so the registration written a moment later was
+        /// never disposed by anyone and leaked for as long as the caller's own token source lived.
+        /// </remarks>
         public void ArmCancellationCompletion()
         {
             _cancellationRegistration = _cancellationToken.UnsafeRegister(static state =>
@@ -325,6 +348,15 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
                 job._cancellationRegistration.Dispose();
             }, this);
         }
+
+        /// <summary>
+        /// For the one path where the job never reached the queue at all (<c>TryWrite</c> failed), so
+        /// neither <see cref="Drop"/> nor <see cref="RunAsync"/> will ever run to dispose the
+        /// registration <see cref="ArmCancellationCompletion"/> just created. Safe to call unconditionally:
+        /// idempotent alongside the registration's own self-dispose in the narrow window where the token
+        /// fired between arming and the failed <c>TryWrite</c>.
+        /// </summary>
+        public void DisposeCancellationRegistration() => _cancellationRegistration.Dispose();
 
         public void Drop(TimeSpan queueWait)
         {
