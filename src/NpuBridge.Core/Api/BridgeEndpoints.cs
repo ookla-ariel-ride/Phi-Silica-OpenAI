@@ -24,6 +24,7 @@ public static class BridgeEndpoints
         app.MapGet("/v1/models", ModelsEndpoint.List);
         app.MapGet("/v1/models/{id}", ModelsEndpoint.Get);
         app.MapNpuBridgeChat();
+        app.MapNpuBridgeCompletions();
         app.MapNpuBridgeDebug();
 
         // Anything else under /v1 gets an OpenAI-shaped 404 (or 405 for a known path) instead of an empty body.
@@ -40,6 +41,7 @@ internal static class FallbackEndpoint
     [
         ("models", "GET"),
         ("chat/completions", "POST"),
+        ("completions", "POST"),
     ];
 
     public static IResult Handle(HttpContext http, string? path)
