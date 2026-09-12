@@ -29,20 +29,6 @@ land here instead of widening the chunk. Each entry says where it came from and 
 
 ## Chunk 8 deferrals (concurrency scheduler and `/v1/completions`)
 
-- **Duplicated SSE plumbing between the two streaming endpoints.** Task 3 added
-  `CompletionsStreamEndpoint`, the `text_completion` counterpart of `ChatCompletionsStreamEndpoint`.
-  Nothing about `SseStream` (the header-commit-on-first-write helper), `WaitForDeltaAsync`/
-  `WaitForFirstDeltaAsync`, `FailAsync` or the `ReportSchedulerOutcomeAsync`/`SchedulerOutcomeReport`
-  pair is chat-shaped — every one of them is generic over a string frame and a
-  `ScheduleResult<ChatAttemptResult>` — but `ChatCompletionsStreamEndpoint` is already merged and
-  reviewed (chunk 8 task 2), so task 3 copied rather than extracted them out of a file whose behaviour
-  is pinned by its own large test suite, to avoid re-touching it for a third, unrelated task. A cleanup
-  chunk could pull these five pieces into a shared internal type both endpoints construct against
-  (parameterised on the chunk DTO's own `Chunk(...)` factory, which is the one truly shape-specific
-  piece), the same way `GenerationPipeline` already holds what chunk 7 and 8 share. Until then, a fix
-  to one copy (a keep-alive timing bug, a D51/D52 regression) must be checked against the other by
-  hand — `dotnet test --filter "FullyQualifiedName~StreamingTests"` is the fastest way to confirm both
-  agree.
 - **`/v1/completions`'s request id uses the `chatcmpl-` prefix**, not OpenAI's `cmpl-`: it is allocated
   by the same `ChatCompletionId.NewId()` chat and `/debug/generate`'s log lines use, and giving
   completions its own prefix would mean threading a per-endpoint prefix through

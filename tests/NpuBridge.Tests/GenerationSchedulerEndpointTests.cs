@@ -16,13 +16,36 @@ namespace NpuBridge.Tests;
 /// 429 before either shape writes a byte, a queued stream's keep-alives, the log line's
 /// <c>queue_wait_ms</c>, <c>/healthz</c>'s live count, and the debug endpoint no longer jumping the
 /// line.
+///
+/// Chunk 8 task 3b: the scheduler sits under <c>/v1/completions</c> too, through the same
+/// <c>StreamingPipeline</c> the extraction gave both streaming shapes, so the theories that only ever
+/// exercised the wire framing rather than a chat-specific concept (a queue-full 429, a queued stream's
+/// keep-alives, a backend that throws the cut's own cancellation) are parameterised over
+/// <see cref="ChatPath"/>/<see cref="CompletionsPath"/> below. What stays chat-only does so because the
+/// scenario needs something <c>/v1/completions</c>' one-turn <c>prompt</c> cannot express at all
+/// (<c>--truncate-history</c> needs more than one turn to drop) or is not about the extracted plumbing
+/// in the first place (<c>/healthz</c>'s queue depth, the log line's <c>queue_wait_ms</c> value, and
+/// <c>/debug/generate</c>'s own queueing) -- see each test's own note.
 /// </summary>
 public class GenerationSchedulerEndpointTests
 {
-    private const string Path = "/v1/chat/completions";
+    private const string ChatPath = "/v1/chat/completions";
+    private const string CompletionsPath = "/v1/completions";
 
-    [Fact]
-    public async Task Queue_full_returns_429_with_retry_after_and_a_conformant_body_on_both_shapes()
+    /// <summary>
+    /// One user turn, in the shape each endpoint's wire needs: <c>messages</c> for chat, a bare
+    /// <c>prompt</c> string for completions. The parameterised theories below build their bodies
+    /// through this rather than duplicating both shapes at every call site.
+    /// </summary>
+    private static object RequestBody(string path, string content, bool? stream = null, int? maxTokens = null) =>
+        path == CompletionsPath
+            ? new { model = "fake", stream, prompt = content, max_tokens = maxTokens }
+            : new { model = "fake", stream, messages = new[] { new { role = "user", content } }, max_tokens = maxTokens };
+
+    [Theory]
+    [InlineData(ChatPath)]
+    [InlineData(CompletionsPath)]
+    public async Task Queue_full_returns_429_with_retry_after_and_a_conformant_body_on_both_shapes(string path)
     {
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"], FirstTokenGate = gate });
@@ -30,11 +53,11 @@ public class GenerationSchedulerEndpointTests
             options: new BridgeOptions { Backend = BackendKind.Fake, QueueCapacity = 1 });
 
         // Occupies the one worker, blocked at the gate -- not counted in QueueDepth once dequeued.
-        var running = host.Client.PostAsJsonAsync(Path, ChatBody.User("a"));
+        var running = host.Client.PostAsJsonAsync(path, RequestBody(path, "a"));
         await TestWait.UntilAsync(() => fake.Calls.Count == 1);
 
         // Fills the queue's one slot.
-        var queued = host.Client.PostAsJsonAsync(Path, ChatBody.User("b"));
+        var queued = host.Client.PostAsJsonAsync(path, RequestBody(path, "b"));
         await TestWait.UntilAsync(() => host.Scheduler.QueueDepth == 1);
 
         // Only the running request has touched the model at all: the queued one has not looked anything
@@ -42,7 +65,7 @@ public class GenerationSchedulerEndpointTests
         Assert.Equal(1, fake.ContextsCreated);
 
         // A third, non-streamed request finds the queue full and never reaches the backend at all.
-        var rejectedJson = await host.Client.PostAsJsonAsync(Path, ChatBody.User("c"));
+        var rejectedJson = await host.Client.PostAsJsonAsync(path, RequestBody(path, "c"));
         Assert.Equal(HttpStatusCode.TooManyRequests, rejectedJson.StatusCode);
         AssertRetryAfter(rejectedJson);
         var jsonError = (await ReadJson(rejectedJson)).GetProperty("error");
@@ -54,7 +77,7 @@ public class GenerationSchedulerEndpointTests
         // A fourth, streamed request is rejected identically -- decision 1 (task-2-brief.md): the
         // rejection is synchronous with the enqueue attempt, so the stream never opens at all and this
         // is the ordinary JSON error body and status line, not an SSE event.
-        var rejectedStream = await host.Client.PostAsJsonAsync(Path, new { model = "fake", stream = true, messages = new[] { new { role = "user", content = "d" } } });
+        var rejectedStream = await host.Client.PostAsJsonAsync(path, RequestBody(path, "d", stream: true));
         Assert.Equal(HttpStatusCode.TooManyRequests, rejectedStream.StatusCode);
         Assert.Equal("application/json", rejectedStream.Content.Headers.ContentType?.MediaType);
         AssertRetryAfter(rejectedStream);
@@ -90,6 +113,10 @@ public class GenerationSchedulerEndpointTests
     /// the scheduled closure, which a rejected request never enters — but a guarantee nothing checks is
     /// invisible to whoever restructures this next, and the previous arrangement (truncate first, then
     /// try to enqueue) really did put the header on a 429.
+    ///
+    /// Chat-only (task 3b): the scenario needs a transcript long enough to still overflow after some
+    /// exchanges are dropped, and <c>/v1/completions</c>' one-turn <c>prompt</c> has no exchanges to
+    /// drop at all -- <c>--truncate-history</c> is defined over <c>messages</c>, not a bare string.
     /// </summary>
     [Theory]
     [InlineData(false)]
@@ -106,13 +133,13 @@ public class GenerationSchedulerEndpointTests
         await using var host = await BridgeTestHost.StartAsync(fake,
             options: new BridgeOptions { Backend = BackendKind.Fake, QueueCapacity = 1, TruncateHistory = true });
 
-        var running = host.Client.PostAsJsonAsync(Path, ChatBody.User("a"));
+        var running = host.Client.PostAsJsonAsync(ChatPath, ChatBody.User("a"));
         await TestWait.UntilAsync(() => fake.Calls.Count == 1);
-        var queued = host.Client.PostAsJsonAsync(Path, ChatBody.User("b"));
+        var queued = host.Client.PostAsJsonAsync(ChatPath, ChatBody.User("b"));
         await TestWait.UntilAsync(() => host.Scheduler.QueueDepth == 1);
 
         // A transcript that only fits after four turns are dropped, arriving at a full queue.
-        var rejected = await host.Client.PostAsJsonAsync(Path, new { model = "fake", stream, messages = LongConversation() });
+        var rejected = await host.Client.PostAsJsonAsync(ChatPath, new { model = "fake", stream, messages = LongConversation() });
 
         Assert.Equal(HttpStatusCode.TooManyRequests, rejected.StatusCode);
         Assert.False(rejected.Headers.Contains("x-npu-bridge-truncated-turns"));
@@ -138,8 +165,16 @@ public class GenerationSchedulerEndpointTests
         new { role = "user", content = "final question" },
     ];
 
-    [Fact]
-    public async Task A_streamed_request_queued_behind_another_sends_keep_alives_while_it_waits()
+    /// <summary>
+    /// Task 3b: parameterised over the endpoint path. The keep-alive wait during a queue wait is exactly
+    /// the <c>StreamingPipeline.WaitForDeltaAsync</c> code both streaming shapes now share, so this is
+    /// one of the scenarios the extraction's own review found <c>/v1/completions</c> had zero coverage
+    /// for.
+    /// </summary>
+    [Theory]
+    [InlineData(ChatPath)]
+    [InlineData(CompletionsPath)]
+    public async Task A_streamed_request_queued_behind_another_sends_keep_alives_while_it_waits(string path)
     {
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"], FirstTokenGate = gate });
@@ -147,13 +182,13 @@ public class GenerationSchedulerEndpointTests
             keepAliveInterval: TimeSpan.FromMilliseconds(20),
             firstKeepAliveDelay: TimeSpan.FromMilliseconds(20));
 
-        var running = host.Client.PostAsJsonAsync(Path, ChatBody.User("a"));
+        var running = host.Client.PostAsJsonAsync(path, RequestBody(path, "a"));
         await TestWait.UntilAsync(() => fake.Calls.Count == 1);
 
         using var guard = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-        using var request = new HttpRequestMessage(HttpMethod.Post, Path)
+        using var request = new HttpRequestMessage(HttpMethod.Post, path)
         {
-            Content = JsonContent.Create(new { model = "fake", stream = true, messages = new[] { new { role = "user", content = "b" } } }),
+            Content = JsonContent.Create(RequestBody(path, "b", stream: true)),
         };
 
         // Headers only come from a keep-alive comment here: nothing else could have written them,
@@ -185,6 +220,10 @@ public class GenerationSchedulerEndpointTests
     /// made the two values distinguishable at the log's one-decimal precision, which is a wall-clock
     /// assumption dressed as a comment: the request that ran immediately reports idle-worker dequeue
     /// latency, and a pool stall on a loaded agent can make that exceed the margin and invert the claim.
+    ///
+    /// Chat-only (task 3b): <c>queue_wait_ms</c> is <c>ChatRequestMetrics.LogRequest</c>'s field, written
+    /// once by the scheduler layer regardless of which endpoint enqueued the job, not a piece of the
+    /// extracted SSE plumbing -- proving it on one endpoint proves the log line, not the wire shape.
     /// </summary>
     [Fact]
     public async Task Queue_wait_ms_appears_in_the_log_line_and_is_larger_for_the_request_that_queued()
@@ -195,10 +234,10 @@ public class GenerationSchedulerEndpointTests
         var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"], FirstTokenGate = gate });
         await using var host = await BridgeTestHost.StartAsync(fake, time: clock, loggerProvider: capture);
 
-        var running = host.Client.PostAsJsonAsync(Path, ChatBody.User("a"));
+        var running = host.Client.PostAsJsonAsync(ChatPath, ChatBody.User("a"));
         await TestWait.UntilAsync(() => fake.Calls.Count == 1);
 
-        var queued = host.Client.PostAsJsonAsync(Path, ChatBody.User("b"));
+        var queued = host.Client.PostAsJsonAsync(ChatPath, ChatBody.User("b"));
         await TestWait.UntilAsync(() => host.Scheduler.QueueDepth == 1);
 
         // "b" is in the queue and "a" is still holding the worker, so every tick of this advance lands
@@ -238,11 +277,18 @@ public class GenerationSchedulerEndpointTests
     /// <c>queue_shutting_down</c> — a false statement, and the wrong status class, where before chunk 8
     /// it was a 502 <c>backend_error</c>. The cut is what cancels here: the client is still connected
     /// throughout, so nothing about this is the client's own abort.
+    ///
+    /// Task 3b: parameterised over the endpoint path too. The cut and the guarded cancel are
+    /// <see cref="NpuBridge.Api.GenerationPipeline"/>'s (D81), and the 502-vs-queue-error mapping is
+    /// <c>StreamingPipeline.ReportSchedulerOutcomeAsync</c>'s on the streamed half -- both shared, so
+    /// this is the other scenario the extraction's review found untested on <c>/v1/completions</c>.
     /// </summary>
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task A_backend_that_throws_the_cuts_cancellation_is_a_502_not_a_queue_error(bool stream)
+    [InlineData(false, ChatPath)]
+    [InlineData(true, ChatPath)]
+    [InlineData(false, CompletionsPath)]
+    [InlineData(true, CompletionsPath)]
+    public async Task A_backend_that_throws_the_cuts_cancellation_is_a_502_not_a_queue_error(bool stream, string path)
     {
         var fake = new FakeBackend(new FakeBackendOptions
         {
@@ -252,13 +298,7 @@ public class GenerationSchedulerEndpointTests
         });
         await using var host = await BridgeTestHost.StartAsync(fake);
 
-        var response = await host.Client.PostAsJsonAsync(Path, new
-        {
-            model = "fake",
-            stream,
-            max_tokens = 2,
-            messages = new[] { new { role = "user", content = "hi" } },
-        });
+        var response = await host.Client.PostAsJsonAsync(path, RequestBody(path, "hi", stream, maxTokens: 2));
 
         // The streamed shape has deltas on the wire by the time the throw happens, so its status line is
         // spent and the same envelope arrives as an SSE error event (D52) -- the JSON shape answers with
@@ -278,6 +318,10 @@ public class GenerationSchedulerEndpointTests
         host.AssertNoLeak();
     }
 
+    /// <summary>
+    /// Chat-only (task 3b): <c>/healthz</c>'s queue depth is the scheduler's own count, the same object
+    /// regardless of which endpoint enqueued the job -- there is no per-endpoint code path here to cover.
+    /// </summary>
     [Fact]
     public async Task Healthz_reports_a_nonzero_queue_depth_while_a_job_waits_and_zero_once_it_drains()
     {
@@ -285,10 +329,10 @@ public class GenerationSchedulerEndpointTests
         var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"], FirstTokenGate = gate });
         await using var host = await BridgeTestHost.StartAsync(fake);
 
-        var running = host.Client.PostAsJsonAsync(Path, ChatBody.User("a"));
+        var running = host.Client.PostAsJsonAsync(ChatPath, ChatBody.User("a"));
         await TestWait.UntilAsync(() => fake.Calls.Count == 1);
 
-        var queued = host.Client.PostAsJsonAsync(Path, ChatBody.User("b"));
+        var queued = host.Client.PostAsJsonAsync(ChatPath, ChatBody.User("b"));
         await TestWait.UntilAsync(() => host.Scheduler.QueueDepth == 1);
 
         var waiting = await ReadJson(await host.Client.GetAsync("/healthz"));
@@ -309,7 +353,7 @@ public class GenerationSchedulerEndpointTests
         var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"], FirstTokenGate = gate });
         await using var host = await BridgeTestHost.StartAsync(fake);
 
-        var chat = host.Client.PostAsJsonAsync(Path, ChatBody.User("a"));
+        var chat = host.Client.PostAsJsonAsync(ChatPath, ChatBody.User("a"));
         await TestWait.UntilAsync(() => fake.Calls.Count == 1);
         Assert.Equal(1, fake.ContextsCreated);
 
