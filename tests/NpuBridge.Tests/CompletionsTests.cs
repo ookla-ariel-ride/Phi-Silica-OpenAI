@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using NpuBridge.Backends.Fake;
 
 namespace NpuBridge.Tests;
@@ -86,6 +87,27 @@ public class CompletionsTests
         Assert.Equal(0, fake.ContextsCreated);
     }
 
+    /// <summary>
+    /// Fix round 1, finding 4: <c>prompt</c> reuses <c>StringOrArrayConverter</c>'s reader, and that
+    /// converter's messages used to be hard-coded to say "stop" regardless of which field triggered
+    /// them -- so a malformed <c>prompt</c> (a JSON number here, or OpenAI's legal token-array form)
+    /// used to surface as "Request body is not valid JSON: stop must be a string, an array of strings,
+    /// or null.", naming a field the request never even set.
+    /// </summary>
+    [Fact]
+    public async Task A_malformed_prompt_names_prompt_in_its_error_not_stop()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["x"] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync(Path, new { model = "fake", prompt = 123 });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var message = (await ReadJson(response)).GetProperty("error").GetProperty("message").GetString()!;
+        Assert.Contains("prompt", message, StringComparison.Ordinal);
+        Assert.DoesNotContain("stop", message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task A_missing_prompt_is_a_400_naming_the_parameter()
     {
@@ -162,6 +184,7 @@ public class CompletionsTests
         Assert.Equal("01234567", choice.GetProperty("text").GetString());
         Assert.Equal("length", choice.GetProperty("finish_reason").GetString());
         Assert.Equal(2, root.GetProperty("usage").GetProperty("completion_tokens").GetInt32());
+        host.AssertNoLeak();
     }
 
     [Fact]
@@ -175,6 +198,72 @@ public class CompletionsTests
         var choice = (await ReadJson(response)).GetProperty("choices")[0];
         Assert.Equal("hello world ", choice.GetProperty("text").GetString());
         Assert.Equal("stop", choice.GetProperty("finish_reason").GetString());
+        host.AssertNoLeak();
+    }
+
+    /// <summary>
+    /// Fix round 1, finding 1: an empty <c>stop</c> entry matches at position 0 of everything, so
+    /// <see cref="NpuBridge.Api.OutputLimits.From"/> filters it out (D53's "never contains an empty
+    /// entry" invariant) -- the same request to the chat shape already relies on this
+    /// (<c>OutputCutTests.cs:244</c>). An earlier version of the preparer split called
+    /// <see cref="NpuBridge.Api.OutputLimits.Create"/> directly for this endpoint and skipped the
+    /// filter, which turned every reply with an empty <c>stop</c> entry into an immediate cut: empty
+    /// text, <c>finish_reason: "stop"</c>, zero completion tokens.
+    /// </summary>
+    [Fact]
+    public async Task A_bare_empty_stop_string_is_ignored_not_treated_as_an_immediate_match()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["hello", " world"] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync(Path, new { model = "fake", prompt = "hi", stop = "" });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var root = await ReadJson(response);
+        var choice = root.GetProperty("choices")[0];
+        Assert.Equal("hello world", choice.GetProperty("text").GetString());
+        Assert.Equal("stop", choice.GetProperty("finish_reason").GetString());
+        Assert.True(root.GetProperty("usage").GetProperty("completion_tokens").GetInt32() > 0);
+        host.AssertNoLeak();
+    }
+
+    /// <summary>The array form of the same finding: one empty entry among real ones is filtered, not honoured.</summary>
+    [Fact]
+    public async Task An_empty_stop_entry_inside_an_array_is_ignored_not_treated_as_an_immediate_match()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["hello", " world"] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync(Path, new { model = "fake", prompt = "hi", stop = new[] { "", "END" } });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var choice = (await ReadJson(response)).GetProperty("choices")[0];
+        Assert.Equal("hello world", choice.GetProperty("text").GetString());
+        Assert.Equal("stop", choice.GetProperty("finish_reason").GetString());
+        host.AssertNoLeak();
+    }
+
+    /// <summary>
+    /// Fix round 1, finding 3: the only overflow outcome this endpoint has, since
+    /// <c>--truncate-history</c> cannot drop anything from a one-turn transcript
+    /// (<see cref="NpuBridge.Api.ConversationSession.TryDropOldestExchange"/> needs a second user turn
+    /// to find a boundary before) -- so unlike the chat shape there is no truncate-and-retry path to
+    /// exercise here, only the preflight's straight refusal. Mirrors
+    /// <c>ChatCompletionsTests.Prompt_larger_than_context_is_400_context_length_exceeded</c>.
+    /// </summary>
+    [Fact]
+    public async Task Prompt_larger_than_context_is_400_context_length_exceeded()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { MaxPromptChars = 3, Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync(Path, new { model = "fake", prompt = "a much longer prompt than three characters" });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var error = (await ReadJson(response)).GetProperty("error");
+        Assert.Equal("invalid_request_error", error.GetProperty("type").GetString());
+        Assert.Equal("context_length_exceeded", error.GetProperty("code").GetString());
+        host.AssertNoLeak();
     }
 
     /// <summary>A wrong method on a known <c>/v1</c> path is a 405 naming the allowed method, not a bare 404.</summary>
@@ -211,6 +300,66 @@ public class CompletionsTests
 
         Assert.Equal(1, host.Cache.Count);
         host.AssertNoLeak();
+    }
+
+    /// <summary>
+    /// Fix round 1, finding 5: legacy-only parameters (<c>echo</c> foremost -- a real OpenAI server
+    /// prepends the prompt to <c>text</c>, which this bridge does not) have no field on
+    /// <see cref="NpuBridge.Api.ChatCompletionRequest"/> to ride along on, so they used to be discarded
+    /// silently at deserialisation, before <see cref="NpuBridge.Api.ChatCompletionRequestValidator"/>
+    /// ever saw they existed. They now reach the same once-per-process
+    /// <see cref="NpuBridge.Api.IgnoredParameterLog"/> warning chat's own ignored parameters use.
+    /// </summary>
+    [Fact]
+    public async Task Legacy_only_parameters_are_accepted_and_warned_once_per_process()
+    {
+        var capture = new CapturingLoggerProvider();
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture);
+
+        var response = await host.Client.PostAsJsonAsync(Path, new
+        {
+            model = "fake",
+            prompt = "say hi",
+            echo = true,
+            best_of = 2,
+            suffix = "!",
+            logprobs = 1,
+            logit_bias = new Dictionary<string, int> { ["123"] = 5 },
+        });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Contains(capture.Records, r => r.Level == LogLevel.Warning && r.Message.Contains("echo", StringComparison.Ordinal));
+        Assert.Contains(capture.Records, r => r.Level == LogLevel.Warning && r.Message.Contains("best_of", StringComparison.Ordinal));
+        Assert.Contains(capture.Records, r => r.Level == LogLevel.Warning && r.Message.Contains("suffix", StringComparison.Ordinal));
+        Assert.Contains(capture.Records, r => r.Level == LogLevel.Warning && r.Message.Contains("logprobs", StringComparison.Ordinal));
+        Assert.Contains(capture.Records, r => r.Level == LogLevel.Warning && r.Message.Contains("logit_bias", StringComparison.Ordinal));
+        host.AssertNoLeak();
+    }
+
+    /// <summary>The four fields that map straight onto a shared <see cref="NpuBridge.Api.ChatCompletionRequest"/> field get the same warning through the unmodified validator, no completions-specific code needed.</summary>
+    [Fact]
+    public async Task Seed_and_the_penalty_parameters_are_accepted_and_warned_via_the_shared_validator()
+    {
+        var capture = new CapturingLoggerProvider();
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"] });
+        await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture);
+
+        var response = await host.Client.PostAsJsonAsync(Path, new
+        {
+            model = "fake",
+            prompt = "say hi",
+            seed = 42,
+            user = "u-123",
+            presence_penalty = 0.1,
+            frequency_penalty = 0.1,
+        });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Contains(capture.Records, r => r.Level == LogLevel.Warning && r.Message.Contains("seed", StringComparison.Ordinal));
+        Assert.Contains(capture.Records, r => r.Level == LogLevel.Warning && r.Message.Contains("user", StringComparison.Ordinal));
+        Assert.Contains(capture.Records, r => r.Level == LogLevel.Warning && r.Message.Contains("presence_penalty", StringComparison.Ordinal));
+        Assert.Contains(capture.Records, r => r.Level == LogLevel.Warning && r.Message.Contains("frequency_penalty", StringComparison.Ordinal));
     }
 
     private static async Task<JsonElement> ReadJson(HttpResponseMessage response) =>

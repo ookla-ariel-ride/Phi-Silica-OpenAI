@@ -73,12 +73,15 @@ internal sealed record ChatRequestPreparation(PreparedChatRequest? Prepared, IRe
 /// <see cref="PrepareAsync"/> and <see cref="PrepareForCompletionAsync"/> are the two thin callers:
 /// each reads its own wire shape (a <see cref="ChatCompletionRequest"/> with <c>messages[]</c>, or a
 /// <see cref="CompletionRequest"/> whose <c>prompt</c> is wrapped into one user message) and then
-/// shares everything from the model-id check onward through <see cref="PrepareCoreAsync"/>. The one
-/// place they still differ inside the shared core is <see cref="PreparedChatRequest.Limits"/>: chat
-/// builds it with the chat-specific <see cref="OutputLimits.From"/> overload (the smaller of
-/// <c>max_tokens</c>/<c>max_completion_tokens</c> wins), completions with the generic
-/// <see cref="OutputLimits.Create"/> (it has no <c>max_completion_tokens</c>) — so the core takes a
-/// factory rather than deriving <see cref="OutputLimits"/> itself.
+/// shares everything from the model-id check onward through <see cref="PrepareCoreAsync"/>, including
+/// <see cref="PreparedChatRequest.Limits"/>: both callers synthesise a real
+/// <see cref="ChatCompletionRequest"/> (completions leaves <c>MaxCompletionTokens</c> null on it, since
+/// its wire shape has no such field) and the core builds <see cref="OutputLimits"/> off that one
+/// request the same way for both, via <see cref="OutputLimits.From"/> — which is the only overload that
+/// also normalises <c>stop</c> (drops an empty entry, D53's "never contains an empty entry" invariant).
+/// An earlier version of this split gave completions its own <see cref="OutputLimits.Create"/> call,
+/// which skipped that normalisation and was the only behavioural difference the split introduced (fix
+/// round 1, finding 1); there is no longer any per-caller code here at all.
 ///
 /// The ordering here is load-bearing. Validation before readiness before placement, and — D50 —
 /// rendering before the forced-placement conflict check, because that conflict is a property of the
@@ -124,8 +127,8 @@ internal static class ChatRequestPreparer
                 OpenAiError.BadRequest("Request body is required and must be a JSON object."));
         }
 
-        return await PrepareCoreAsync(http, lifecycle, options, ignoredLog, logger, requestId, backendName, request,
-            backend => OutputLimits.From(request, backend.TokenCounter)).ConfigureAwait(false);
+        return await PrepareCoreAsync(http, lifecycle, options, ignoredLog, logger, requestId, backendName, request)
+            .ConfigureAwait(false);
     }
 
     /// <summary>
@@ -202,22 +205,41 @@ internal static class ChatRequestPreparer
             ToolChoice: null,
             Logprobs: null,
             ResponseFormat: null,
-            Seed: null,
-            PresencePenalty: null,
-            FrequencyPenalty: null,
-            User: null,
+            // These four map straight onto fields the shared validator already checks (fix round 1,
+            // finding 5), so carrying them through is what gets them onto the once-per-process warning
+            // for free -- no change to ChatCompletionRequestValidator at all.
+            Seed: request.Seed,
+            PresencePenalty: request.PresencePenalty,
+            FrequencyPenalty: request.FrequencyPenalty,
+            User: request.User,
             StreamOptions: request.StreamOptions);
 
+        // The remaining legacy-only fields have no equivalent on ChatCompletionRequest to ride along
+        // on (this endpoint's integer `logprobs` is not chat's boolean one), so they get their own
+        // once-per-process warning via the same IgnoredParameterLog the shared validator's findings
+        // use (fix round 1, finding 5) rather than vanishing silently at deserialisation.
+        var legacyOnlyIgnored = new List<string>(4);
+        if (request.Echo is not null) legacyOnlyIgnored.Add("echo");
+        if (request.BestOf is not null) legacyOnlyIgnored.Add("best_of");
+        if (request.Suffix is not null) legacyOnlyIgnored.Add("suffix");
+        if (request.Logprobs is not null) legacyOnlyIgnored.Add("logprobs");
+        if (request.LogitBias is not null) legacyOnlyIgnored.Add("logit_bias");
+
         return await PrepareCoreAsync(http, lifecycle, options, ignoredLog, logger, requestId, backendName, chatRequest,
-            backend => OutputLimits.Create(request.MaxTokens, request.Stop ?? [], backend.TokenCounter)).ConfigureAwait(false);
+            legacyOnlyIgnored).ConfigureAwait(false);
     }
 
     /// <summary>
     /// Everything from validation onward, shared by both wire shapes once each has produced an
     /// already-parsed <see cref="ChatCompletionRequest"/> (real, or synthesised from a
-    /// <c>/v1/completions</c> prompt) and knows how to build its own <see cref="OutputLimits"/> once
-    /// the backend is known. <paramref name="limitsFactory"/> is that one remaining difference; every
-    /// other step here previously lived in the single <c>PrepareAsync</c> this was split out of.
+    /// <c>/v1/completions</c> prompt). There is no remaining per-caller step for building the request
+    /// itself: <see cref="OutputLimits"/> is built here, off <paramref name="request"/>, the same way
+    /// for both (fix round 1, finding 1). <paramref name="extraIgnoredParameters"/> is the one
+    /// per-caller addition to the once-per-process ignored-parameter warning (fix round 1, finding 5):
+    /// completions' legacy-only fields (<c>echo</c>, <c>best_of</c>, <c>suffix</c>, <c>logprobs</c>,
+    /// <c>logit_bias</c>) have no field on <see cref="ChatCompletionRequest"/> to ride along on, so
+    /// they cannot reach <see cref="ChatCompletionRequestValidator.Validate"/>'s own list; chat's
+    /// caller passes none.
     /// </summary>
     private static async Task<ChatRequestPreparation> PrepareCoreAsync(
         HttpContext http,
@@ -228,7 +250,7 @@ internal static class ChatRequestPreparer
         string requestId,
         string backendName,
         ChatCompletionRequest request,
-        Func<ILanguageModelBackend, OutputLimits> limitsFactory)
+        IReadOnlyList<string>? extraIgnoredParameters = null)
     {
         // 2. Validation. The failure carries its own param/code; bind them by name — the failure record
         // orders them (Message, Param, Code) while OpenAiError.Result takes code before param.
@@ -282,8 +304,9 @@ internal static class ChatRequestPreparer
         var samplingSupported = capabilities.HasFlag(BackendCapabilities.SamplingOptions);
 
         // 4. One warning per ignored parameter per process. Sampling parameters are only ignored when
-        // the backend cannot apply them.
-        foreach (var parameter in validation.IgnoredParameters)
+        // the backend cannot apply them. extraIgnoredParameters (fix round 1, finding 5) rides the same
+        // once-per-process IgnoredParameterLog as the validator's own findings; it is empty for chat.
+        foreach (var parameter in validation.IgnoredParameters.Concat(extraIgnoredParameters ?? []))
         {
             if (samplingSupported && Array.IndexOf(SamplingParameters, parameter) >= 0)
             {
@@ -373,7 +396,7 @@ internal static class ChatRequestPreparer
                 Rendered: rendered,
                 NativeSystem: nativeSystem,
                 Sampling: sampling is null || sampling.IsEmpty ? null : sampling,
-                Limits: limitsFactory(backend),
+                Limits: OutputLimits.From(request, backend.TokenCounter),
                 PromptChars: promptChars,
                 Tools: catalog,
                 ToolInstructions: toolInstructions));
