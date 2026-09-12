@@ -125,6 +125,12 @@ public static class DebugEndpoints
             IModelContext? context = null;
             try
             {
+                var systemTextFailure = SystemTextGuard.RefusalFor(backend, request.System, includesToolDefinitions: false);
+                if (systemTextFailure is not null)
+                {
+                    return systemTextFailure.ToResult();
+                }
+
                 context = backend.CreateContext(request.System);
                 var usable = backend.GetUsablePromptLength(context, request.Prompt);
 

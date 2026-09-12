@@ -777,6 +777,59 @@ try {
         $lines -join "`n"
     }
 
+    Step 'native system text is refused before CreateContext' {
+        # D97: the guard must reject both the token-window and hard-character cases before the
+        # native context is created. The 33,000-character case is intentionally above the guard but
+        # stays well below D94's 40,000-character no-probe boundary.
+        $tokenText = -join (1..2500 | ForEach-Object { "alpha$_ " })
+        if ($tokenText.Length -gt 32000) { throw "the offline token probe is $($tokenText.Length) characters, above the 32,000-character ceiling" }
+        $tokenized = Get-Json '/debug/tokenize' 'POST' (@{ text = $tokenText } | ConvertTo-Json -Compress)
+        if ($tokenized.counter -ne 'phi-3') { Skip "native system-text guard requires Phi3TokenCounter (phi-3); this backend reports $($tokenized.counter)" }
+        if ([int]$tokenized.tokens -le 3581) { throw "the offline token probe counted $($tokenized.tokens) tokens, not above Phi Silica's 3,581-token window" }
+
+        $cachedBefore = (Get-Json '/healthz').contexts_cached
+        $body = @{ model = $servedModel; temperature = 0; messages = @(
+            @{ role = 'system'; content = $tokenText }
+            @{ role = 'user'; content = 'Reply with exactly the word PONG.' }
+        ) } | ConvertTo-Json -Depth 5
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add("offline: $($tokenText.Length) system characters = $($tokenized.tokens) $($tokenized.counter) tokens")
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $response = Invoke-WebRequest -Uri "$base/v1/chat/completions" -Method POST -Body $body -ContentType 'application/json' -SkipHttpErrorCheck -TimeoutSec 30
+        $sw.Stop()
+        $error = $response.Content | ConvertFrom-Json -Depth 20
+        if ([int]$response.StatusCode -ne 400 -or $error.error.code -ne 'context_length_exceeded') { throw "token guard: expected HTTP 400 context_length_exceeded; got HTTP $($response.StatusCode): $($response.Content)" }
+        if ($error.error.message -notmatch 'system text alone exceeds the context window') { throw "token guard: missing native-system detail: $($error.error.message)" }
+        if ($sw.ElapsedMilliseconds -ge 2000) { throw "token guard took $($sw.ElapsedMilliseconds) ms, not under 2,000 ms" }
+        if ((Get-Json '/healthz').contexts_cached -ne $cachedBefore) { throw 'token guard changed contexts_cached despite creating no context' }
+        $lines.Add("token guard: HTTP 400 after $($sw.ElapsedMilliseconds) ms, cache stayed $cachedBefore")
+
+        $streamBody = @{ model = $servedModel; temperature = 0; stream = $true; messages = @(
+            @{ role = 'system'; content = $tokenText }
+            @{ role = 'user'; content = 'Reply with exactly the word PONG.' }
+        ) } | ConvertTo-Json -Depth 5
+        $stream = Invoke-Sse '/v1/chat/completions' $streamBody 30
+        if ($stream.StatusCode -ne 400 -or $stream.Frames.Count -ne 0) { throw "streamed token guard: expected plain HTTP 400 before any frame; got HTTP $($stream.StatusCode), frames=$($stream.Frames.Count): $($stream.Body)" }
+        $streamError = $stream.Body | ConvertFrom-Json -Depth 20
+        if ($streamError.error.code -ne 'context_length_exceeded' -or $streamError.error.message -notmatch 'system text alone exceeds the context window') { throw "streamed token guard returned the wrong error: $($stream.Body)" }
+        $lines.Add('streamed token guard: plain HTTP 400 before any SSE frame')
+
+        $characterText = 'x' * 33000
+        if ($characterText.Length -ge 40000) { throw "the character-ceiling probe is $($characterText.Length) characters, at or above D94's 40,000-character no-probe boundary" }
+        $characterBody = @{ model = $servedModel; temperature = 0; messages = @(
+            @{ role = 'system'; content = $characterText }
+            @{ role = 'user'; content = 'Reply with exactly the word PONG.' }
+        ) } | ConvertTo-Json -Depth 5
+        $characterResponse = Invoke-WebRequest -Uri "$base/v1/chat/completions" -Method POST -Body $characterBody -ContentType 'application/json' -SkipHttpErrorCheck -TimeoutSec 30
+        $characterError = $characterResponse.Content | ConvertFrom-Json -Depth 20
+        if ([int]$characterResponse.StatusCode -ne 400 -or $characterError.error.code -ne 'context_length_exceeded') { throw "character guard: expected HTTP 400 context_length_exceeded; got HTTP $($characterResponse.StatusCode): $($characterResponse.Content)" }
+        if ($characterError.error.message -notmatch '32,000-character safety ceiling') { throw "character guard: missing ceiling detail: $($characterError.error.message)" }
+        if ((Get-Json '/healthz').contexts_cached -ne $cachedBefore) { throw 'character guard changed contexts_cached despite creating no context' }
+        $lines.Add('character guard: 33,000 system characters refused at the 32,000-character ceiling, cache unchanged')
+        $lines -join [Environment]::NewLine
+    }
+
     # The D80 measurement, repeated per build: the preflight is the runtime's own tokenizer answering
     # "this many characters fit", so if the bridge's counter is the runtime's, every text's fitting
     # prefix counts the same number of tokens. Three texts with very different characters per token;

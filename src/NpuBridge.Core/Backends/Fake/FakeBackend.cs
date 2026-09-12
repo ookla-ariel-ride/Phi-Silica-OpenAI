@@ -39,6 +39,8 @@ public sealed partial class FakeBackend : ILanguageModelBackend
 
     public Tokenizers.ITokenCounter TokenCounter => _options.TokenCounter;
 
+    public int? ContextWindowTokens => _options.ContextWindowTokens;
+
     public IReadOnlyDictionary<string, object?> Diagnostics { get; }
 
     public bool IsInitialized => _initialized;
@@ -357,6 +359,9 @@ public sealed class FakeBackendOptions
     /// no estimate could mimic.
     /// </summary>
     public Tokenizers.ITokenCounter TokenCounter { get; set; } = Tokenizers.CharEstimateTokenCounter.Instance;
+
+    /// <summary>Measured usable context window in <see cref="TokenCounter"/> tokens. Null leaves it unknown.</summary>
+    public int? ContextWindowTokens { get; set; }
 
     /// <summary>Produces the token stream for a request. Defaults to <see cref="FakeBackend.DefaultResponder"/>.</summary>
     public Func<FakeGenerationRequest, IEnumerable<string>>? Responder { get; set; }

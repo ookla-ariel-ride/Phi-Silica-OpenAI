@@ -1893,3 +1893,24 @@ incidentally. The tool-call round trip through the context cache (D83's ruling t
 under the calls the client will echo, not the text the model wrote) is also still unverified on
 hardware, because the multi-step cell never read `context_cache_hits` around its two turns. Both are
 on issue #21's successor work rather than closed by it.
+
+
+**D97. Native system text is rejected before context creation.** Issue #29 showed that the normal
+preflight was too late for native placement: `CreateContext(systemText)` consumes the system text first,
+and D94 measured the Windows model host fail-fast at 44,000 characters. On a cache miss, the bridge now
+checks a non-null native system text before it calls `CreateContext`. More than 32,000 characters is
+refused as a hard safety ceiling below D94's measured boundary. When a backend has a measured usable
+window, text whose backend-token count is at least that window is also refused because it leaves no room
+for the prompt. The failure uses the existing `PromptLargerThanContext` mapping and returns HTTP 400
+`context_length_exceeded` without creating a context.
+
+Phi Silica reports the D80-measured 3,581-token usable window as a backend constant. The smoke boundary
+check verifies that number on hardware, so the constant is checked rather than assumed. Discovering the
+window during each initialization is deferred to `docs/FUTURE.md`; it would add a context and preflight
+probe that needs its own hardware validation. A backend whose window is unknown still gets the character
+ceiling.
+
+`--truncate-history` cannot shrink system text, so this refusal does not enter the drop loop or attach a
+truncated-turns header. Folded placement is unchanged: its system text is part of the ordinary prompt and
+continues through the existing preflight. Rendered tool definitions are part of native system text, and
+the refusal says so when they contributed to the count.
