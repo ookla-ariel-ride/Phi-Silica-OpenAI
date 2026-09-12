@@ -101,6 +101,10 @@ NpuBridge.exe service install|start|stop|uninstall   # Windows service for aion/
 Re-run `identity.ps1 -Install` after the build output folder or the manifest changes. If Phi Silica
 relaunch fails with "registered for <other folder>", that is why.
 `smoke.ps1` reports with `Write-Host`; redirect with `6>&1` if you need a transcript, plain `>` captures nothing.
+Do not `dotnet build` while `smoke.ps1` has a server up: the exe is locked and the copy fails.
+Two smoke lines look like failures and are not. A *first*-generation "the remote procedure call failed"
+is the model runtime's known flake — re-run once; the same fault on a later generation is real. And
+`system prompt honoured: False` on the `/debug/generate` row is D45: only the bare debug path ignores it.
 
 Aion's SDK NuGet is not on nuget.org. It comes from the sample repo's GitHub release
 (`AionInstructPreview.Text.Framework.1.0.0.nupkg`) and lives in `nuget-local/`, wired by `nuget.config`.
@@ -370,6 +374,8 @@ it is current behaviour, so do not describe it as working:
 
 - **Chunk 8 (concurrency and `/v1/completions`)** will queue generations rather than letting two
   concurrent requests each take their own context, and `--queue-capacity` will finally be read.
+  It also changes what an existing test can mean: `Two_concurrent_requests_for_one_conversation_never_share_a_context`
+  asserts two generations run at once, which one worker forbids by construction.
 
 ## Code navigation: use serena
 
