@@ -82,6 +82,62 @@ public class GenerationSchedulerEndpointTests
         host.AssertNoLeak();
     }
 
+    /// <summary>
+    /// Finding 6, the regression guard for it. <c>CLAUDE.md</c>'s rule is that
+    /// <c>x-npu-bridge-truncated-turns</c> appears once a generation has been attempted on the truncated
+    /// transcript, and that a refusal carries none; <c>TruncationTests</c> pins the 400 half of that and
+    /// nothing pinned this half. It is currently true by construction — the truncation happens inside
+    /// the scheduled closure, which a rejected request never enters — but a guarantee nothing checks is
+    /// invisible to whoever restructures this next, and the previous arrangement (truncate first, then
+    /// try to enqueue) really did put the header on a 429.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_queue_full_rejection_carries_no_truncated_turns_header(bool stream)
+    {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => ["ok"],
+            MaxPromptChars = 250,
+            FirstTokenGate = gate,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake,
+            options: new BridgeOptions { Backend = BackendKind.Fake, QueueCapacity = 1, TruncateHistory = true });
+
+        var running = host.Client.PostAsJsonAsync(Path, ChatBody.User("a"));
+        await TestWait.UntilAsync(() => fake.Calls.Count == 1);
+        var queued = host.Client.PostAsJsonAsync(Path, ChatBody.User("b"));
+        await TestWait.UntilAsync(() => host.Scheduler.QueueDepth == 1);
+
+        // A transcript that only fits after four turns are dropped, arriving at a full queue.
+        var rejected = await host.Client.PostAsJsonAsync(Path, new { model = "fake", stream, messages = LongConversation() });
+
+        Assert.Equal(HttpStatusCode.TooManyRequests, rejected.StatusCode);
+        Assert.False(rejected.Headers.Contains("x-npu-bridge-truncated-turns"));
+        Assert.Equal("queue_full", (await ReadJson(rejected)).GetProperty("error").GetProperty("code").GetString());
+
+        // And nothing was truncated for it either: it never reached the closure that does the dropping.
+        Assert.Single(fake.Calls);
+
+        gate.SetResult();
+        await Task.WhenAll(running, queued);
+        host.AssertNoLeak();
+    }
+
+    /// <summary>Seven turns of filler and a question: 399 rendered characters, so a 250-character window fits only after two exchanges go.</summary>
+    private static object[] LongConversation() =>
+    [
+        new { role = "user", content = new string('a', 40) },
+        new { role = "assistant", content = new string('b', 40) },
+        new { role = "user", content = new string('c', 40) },
+        new { role = "assistant", content = new string('d', 40) },
+        new { role = "user", content = new string('e', 40) },
+        new { role = "assistant", content = new string('f', 40) },
+        new { role = "user", content = "final question" },
+    ];
+
     [Fact]
     public async Task A_streamed_request_queued_behind_another_sends_keep_alives_while_it_waits()
     {
