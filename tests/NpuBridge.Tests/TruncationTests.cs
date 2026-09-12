@@ -568,4 +568,80 @@ public class TruncationTests
         Assert.Equal(1, fake.ContextsCreated);
         host.AssertNoLeak();
     }
+
+    /// <summary>
+    /// A truncation still running when the stream commits its headers reports nothing rather than a
+    /// partial count. Before chunk 8 the arrangement could not arise: the streaming shape applied the
+    /// header after <c>Acquire</c> had finished truncating, so the number was always complete or absent.
+    /// Now the loop runs on the scheduler's worker while the request thread writes keep-alives, so the
+    /// first-frame hook can fire mid-loop -- and what it writes is locked in while the real count is
+    /// still growing. This request needs four turns dropped over two preflight rounds; it is held in the
+    /// second with two gone, its headers are committed by a keep-alive while it waits, and it must arrive
+    /// carrying no header at all. "2 turns dropped" when four went is worse than silence, and the log
+    /// carries the true number either way.
+    /// </summary>
+    [Fact]
+    public async Task A_truncation_still_running_when_the_stream_commits_sends_no_header_rather_than_a_partial_one()
+    {
+        var capture = new CapturingLoggerProvider();
+        var secondRound = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var releaseLoop = new ManualResetEventSlim(false);
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            MaxPromptChars = 250,
+            Responder = _ => ["ok"],
+            OnPreflight = round =>
+            {
+                if (round != 2)
+                {
+                    return;
+                }
+
+                // Round 1 refused the whole transcript and two turns went; the loop is held here, with
+                // DroppedTurns at 2 and the final 4 still to come.
+                secondRound.SetResult();
+                Assert.True(releaseLoop.Wait(TimeSpan.FromSeconds(30)), "the truncation loop was never released");
+            },
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture,
+            options: new BridgeOptions { Backend = BackendKind.Fake, TruncateHistory = true },
+            keepAliveInterval: TimeSpan.FromMilliseconds(20));
+
+        var request = new HttpRequestMessage(HttpMethod.Post, Path)
+        {
+            Content = JsonContent.Create(new { model = "fake", stream = true, messages = LongConversation() }),
+        };
+        var send = host.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+
+        HttpResponseMessage response;
+        try
+        {
+            await secondRound.Task;
+
+            // The headers arrive only once a frame commits them, and the only frame that can exist yet
+            // is a keep-alive: the loop is parked, so no generation has started. An ordering asserted as
+            // an ordering rather than as a delay (D54).
+            response = await send;
+            Assert.False(response.Headers.Contains("x-npu-bridge-truncated-turns"),
+                "a partial truncation count reached the wire");
+        }
+        finally
+        {
+            releaseLoop.Set();
+        }
+
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.True(response.StatusCode == HttpStatusCode.OK, body);
+        Assert.Contains(": keep-alive", body, StringComparison.Ordinal);
+        Assert.Contains("data: [DONE]", body, StringComparison.Ordinal);
+
+        // Four turns really did go, and with the header spent the log is the only place that says so.
+        var warning = Assert.Single(capture.Records,
+            r => r.Message.Contains("were dropped after the response headers were committed", StringComparison.Ordinal));
+        Assert.Equal(LogLevel.Warning, warning.Level);
+        Assert.Contains("4 turn(s)", warning.Message, StringComparison.Ordinal);
+        var line = Assert.Single(capture.Records, r => r.Message.Contains("cache=", StringComparison.Ordinal));
+        Assert.Contains("truncated_turns=4", line.Message, StringComparison.Ordinal);
+        host.AssertNoLeak();
+    }
 }

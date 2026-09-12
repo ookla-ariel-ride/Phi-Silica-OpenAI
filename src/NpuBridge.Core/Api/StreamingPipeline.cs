@@ -322,7 +322,10 @@ internal sealed class SseStream
             // leaves them assigned on a response that never started, which is harmless: the
             // ordinary error result the caller returns instead overwrites the status and the
             // content type, no-cache is right on that reply too, and the X-Accel-Buffering that
-            // survives means nothing to a proxy handling a JSON error.
+            // survives means nothing to a proxy handling a JSON error. Since chunk 8 the hook above
+            // may have added a truncated-turns header to that list, and it survives the same way;
+            // it states something true about the transcript either way, and the only client that can
+            // see the difference is one that has already gone, since a first write fails when it has.
             //
             // X-Accel-Buffering defeats nginx's response buffering, which would otherwise hold the
             // whole stream and deliver it as one lump.

@@ -15,6 +15,7 @@ public sealed partial class FakeBackend : ILanguageModelBackend
     private int _contextsCreated;
     private int _contextsDisposed;
     private int _nextContextId;
+    private int _preflightCalls;
     private bool _initialized;
     private bool _disposed;
 
@@ -103,6 +104,7 @@ public sealed partial class FakeBackend : ILanguageModelBackend
         }
 
         var fake = Own(context);
+        _options.OnPreflight?.Invoke(Interlocked.Increment(ref _preflightCalls));
         if (_options.PreflightFailure is { } preflightFailure)
         {
             throw preflightFailure;
@@ -446,6 +448,18 @@ public sealed class FakeBackendOptions
     /// asked about was already checked out of the cache or freshly created when it did.
     /// </summary>
     public Exception? PreflightFailure { get; set; }
+
+    /// <summary>
+    /// Called on every <see cref="FakeBackend.GetUsablePromptLength"/> with that call's 1-based number,
+    /// after the context has been validated and before an answer is computed. It exists because the
+    /// <c>--truncate-history</c> loop has no other observable moment: it runs start to finish inside
+    /// <c>ConversationSession.Acquire</c>, on the scheduler's worker since chunk 8, while the request
+    /// thread may already be writing keep-alives to the same response — and a test whose subject is what
+    /// that thread is allowed to commit *during* the loop has to be able to stand inside it. Synchronous
+    /// on purpose, since the preflight it models is a blocking call on the shared model handle; a test
+    /// that parks here parks the worker, which is exactly the arrangement.
+    /// </summary>
+    public Action<int>? OnPreflight { get; set; }
 }
 
 /// <summary>What the fake backend saw for one generation.</summary>

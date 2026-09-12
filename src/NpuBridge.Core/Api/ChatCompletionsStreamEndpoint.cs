@@ -67,8 +67,10 @@ internal sealed class ChatCompletionsStreamEndpoint
         // why it cannot be applied where the turns are actually dropped. A truncation that has not
         // happened yet at this point simply finds nothing to report; the second call, once the outcome
         // is known, covers both the request that never wrote a frame at all and the one whose truncation
-        // arrived too late to be sent (which then logs the warning it always did).
-        var sse = new SseStream(http.Response, () => session.ApplyTruncationHeader(http.Response));
+        // arrived too late to be sent (which then logs the warning it always did). The hook is the
+        // IfSettled form: a first keep-alive that lands inside the truncation loop must not stamp the
+        // count the loop has reached so far, because that number is locked in and the final one is not.
+        var sse = new SseStream(http.Response, () => session.ApplyTruncationHeaderIfSettled(http.Response));
         var stopwatch = Stopwatch.StartNew();
 
         // The client-side cut. It runs here, on the single channel reader, and never on the backend's
