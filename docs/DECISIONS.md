@@ -193,7 +193,8 @@ with `--install-model`; otherwise `NotReady` fails with the Settings path. Follo
 guidance; a hidden logon task must never start it silently.
 
 **D40. `/debug/generate` is loopback-only** (403 otherwise) because it bypasses the request queue that
-chunk 8 adds. Routing it through the scheduler is deferred.
+chunk 8 adds. Routing it through the scheduler is deferred. (Superseded by D90: it goes through the
+scheduler since chunk 8, and creates no context until its turn. The loopback rule stands.)
 
 **D41. Progress callbacks are drained before `GenerateAsync` returns (Codex review, chunk 2).** WinRT
 does not guarantee the last `Progress` invocation has finished when the operation completes. The
@@ -294,7 +295,9 @@ in-flight operation cannot be stopped on demand is exactly the case this orderin
 without it the fake stops so promptly that the window cannot be observed. Removing the drain makes that
 test fail; that was checked, not assumed.
 
-**D52. The stream's headers are committed by the first frame, not by the handler's first line.** Also
+**D52. The stream's headers are committed by the first frame, not by the handler's first line.**
+(Amended by D89: since chunk 8 the queue wait, the cache lookup and the preflight all happen inside
+this window, so a refusal that would have been a 400 can arrive as an SSE error event instead.) Also
 found by review: an over-length prompt reached a streaming client as HTTP 200, an empty reply and
 `finish_reason: "stop"` — the model reported as having answered when it refused — while the JSON path
 correctly returned 400 `context_length_exceeded`. Writing the role chunk up front is what forced that:
@@ -1452,3 +1455,273 @@ a code block is full of balanced braces that each cost only their own short span
 would stop being searched partway through and a call after the code would be dropped. Unbalanced
 braces are what cost, and each spends the whole remaining text, so a character budget stops exactly
 them: 32 times the reply's length, with a floor for short replies.
+
+**D84. The scheduler serializes the model handle, not the generation: `ConversationSession.Acquire`
+runs inside the scheduled closure — and the chunk's own brief said the opposite.** Chunk 8, issue #4,
+PLAN §2.7. One worker drains a bounded queue so two requests can never generate at once. The task
+brief elaborated on that by putting the queue wait "after the preflight and cache lookup", which left
+`backend.CreateContext` and `backend.GetUsablePromptLength` — both calls on the one shared
+`LanguageModel` handle — outside the queue. The task-2 review traced what that means: while request A
+generates inside the worker, request B makes those two calls on the same handle from a request thread,
+unguarded, with no admission limit anywhere before them, so N simultaneous requests make N
+simultaneous handle calls. That is the exact gap `docs/FUTURE.md` describes as the reason chunk 8
+exists, and it contradicts PLAN §2.7's own sentence, "a job cancelled while queued is dropped without
+touching the model". The spec is the binding authority and the elaboration of it was wrong. It is
+recorded here rather than fixed quietly because the wrong instruction was the controller's, the briefs
+are gitignored, and a later session reading a brief instead of the code would put the race back.
+
+Two further consequences confirmed the reading rather than merely agreeing with it. The *rejection*
+path did the most model work of any path in the bridge: a burst of fifty requests would have created
+fifty contexts and issued fifty preflights in order to throw forty-five of them away. And because a
+`ContextCache` checkout is exclusive for the whole lease, a queued request turned a second request for
+the same conversation from a cache hit into a miss — the agent-loop case the cache exists for.
+
+**What it costs.** An over-length transcript under load waits its turn before being refused instead of
+being refused in tens of milliseconds, and on the streaming shape that refusal can degrade further
+(D89). D73's real value — not spending 26 seconds of NPU time to discover an overflow — survives
+intact, because the preflight still runs before the generation; it just runs later. The cost is
+bounded by the queue's capacity and is identical to the old behaviour whenever nothing else is
+running, which is every request on this single-user machine.
+
+**D85. The lease is published from inside the scheduled closure, never carried out on its return
+value.** The closure returns a `ChatAttemptResult`, and the first wiring took the lease off it. The
+outer `finally` is the one place a context is released (D43), and on the streaming shape the reader
+loop can unwind long before the scheduled task is ever unwrapped — a client that vanishes mid-frame is
+the ordinary case, not an exotic one. A lease the outer scope learns about only from a returned value
+is a lease it does not have on every path where that value never arrives, so the `finally` saw null
+and the context was never released: D43 and D51 both gone at once, in a chunk whose whole subject is
+the handle those contexts belong to. It cost a fix round, and it was behind four of that round's five
+failing tests. The closure now assigns the outer `lease` variable the instant `Acquire` hands one
+over, before anything in it can throw. A `--truncate-history` retry reassigns it over a lease the
+closure has already disposed; `ContextLease.Dispose` is idempotent, so a stale reference settles to a
+no-op rather than a double release, and the disposed lease's `CacheHit`, `TailTurns` and `PromptChars`
+stay readable afterwards because they are plain fields set once in the constructor — the catch
+clauses' log line needs them to say `cache=hit|miss` rather than `cache=-`.
+
+**D86. A `--truncate-history` retry keeps its scheduled slot instead of re-entering the queue.** The
+preflight truncation loop and the retry-after-a-failed-generation loop both live inside one scheduled
+closure, so a request that drops turns and tries again never goes back to the end of the line. One
+`ScheduleAsync` per attempt was the alternative, and it would 429 a request that is already mid-flight
+whenever the queue had filled behind it — the least defensible moment there is to shed load, since the
+work is half done, the client has already waited, and the retry exists at all because the bridge chose
+to salvage the request rather than refuse it. Keeping the slot costs the scheduler nothing: the retry
+is the same conversation against the same handle, which is what the worker is already holding. The
+price is that one slot can be held for several preflight rounds and then a generation, so the rolling
+average behind `Retry-After` is measured over a whole attempt rather than over a single generation —
+which is the number a waiting client actually wants anyway.
+
+**D87. `QueueDepth` is a live counter, not `Reader.Count`, and reading that as cosmetic was wrong.** A
+job whose caller cancels it while it is still queued completes as `Cancelled` the instant the token
+fires, without waiting for the worker to drain to its position — otherwise an aborted client's handler
+stays pending for a whole generation. The first fix stopped at the caller and left the *slot* half:
+`/healthz` still reported `_queue.Reader.Count`, which shrinks only when the worker actually dequeues.
+That was filed as cosmetic, a number on a diagnostic endpoint. It is not. `ComputeRetryAfterSeconds`
+multiplies by that number, and more to the point, a caller that enqueues, gives up and retries several
+times against one long generation leaves every one of those dead jobs counted for the generation's
+whole duration: the bridge advertises itself as busy on behalf of work nobody is waiting for, and
+sheds live load to protect it. Depth is therefore `_liveQueueDepth`, incremented once the job is
+actually written to the channel and decremented at whichever comes first of "its own caller cancelled
+it while it was queued" and "the worker dequeued it".
+
+**The half that is still true, stated plainly.** The channel slot itself is still held until the
+worker drains to the dead job, because a bounded channel has no way to withdraw an entry. So the
+admission gate — the capacity — can still be occupied by jobs that will never run, and a burst of
+aborted clients can still 429 a live one. What changed is that no reported number and no
+`Retry-After` is computed from that stale count any more. The remaining exposure is bounded by the
+capacity (4 by default) and by one generation's duration.
+
+**`Retry-After` before anything has finished.** PLAN §2.7 defines the estimate as depth × rolling
+average and does not say what the average is before any generation has completed. It is 0, so a
+cold-start flood's rejection falls to the floor of one second; the floor already existed for exactly
+this shape of gap, and a client's first retry after a cold-start flood arriving sooner than ideal is a
+retry, not a failure. The average is a plain cumulative mean over every job whose body actually ran —
+never one dropped while only queued, which touched the model for zero seconds and would only drag the
+mean down — with no decay and no window, so it reacts slowly in a long-running process. Recorded
+rather than fixed: nothing here has run long enough for it to matter.
+
+**D88. `Cancelled` carries `Ran`, and an enqueue after shutdown is 503 rather than 429.** Two
+decisions about one enum value, both wire-visible.
+
+`ScheduleResultKind.Cancelled` covers two events that a caller must be able to tell apart. A job the
+worker never got to — dropped while still queued, or enqueued after shutdown had begun — touched the
+model for zero seconds, and is HTTP 503 `queue_shutting_down`. A job that *ran* and ended by throwing
+`OperationCanceledException` for its own token is an adapter breaking the `ILanguageModelBackend` rule
+that the runtime's own cancellation is swallowed and reported as a status: the exact contract
+violation D82 exists to answer. It is reported through `GenerationFailure.FromException`, exactly as
+an escaped exception always has been, so that a client cannot tell "the queue is fine and the backend
+broke its contract" from "the bridge threw" by the shape of the two bodies. Without `Ran` the two were
+indistinguishable to a caller, and a live generation that threw came back as a cheerful "the queue is
+shutting down" — a 503 inviting a retry, for a condition a retry cannot help.
+
+The second decision: a post-shutdown enqueue answers `Cancelled`, not `Rejected`. `Rejected` becomes
+"429, retry in N seconds", and a scheduler that has stopped is never coming back to honour a
+`Retry-After`. Taken before task 2 rather than deferred, because task 2 baked it into the wire shape.
+Ahead of all of it, `clientAlreadyGone` is checked first and wins over every other reason, matching
+the convention every failure path in these endpoints already follows: an aborted client is answered
+with silence, never with a body nobody will read.
+
+**D89. D52's boundary has a queue wait inside it now.** An amendment, not a new rule. D52 says the
+headers of a streamed reply are committed by the first frame — a `: keep-alive` comment after about a
+second, or the first delta, whichever comes first — that a failure before that moment is the ordinary
+HTTP status with the ordinary JSON body, and that a failure after it is a `data: {"error":...}` event
+with the identical envelope. The boundary itself has not moved. What has moved is how much work now
+happens on the far side of it: since D84 the queue wait, the cache lookup and the preflight all take
+place while the stream is already counting down to its first keep-alive. So a preflight refusal that
+would have been a 400 `context_length_exceeded` in tens of milliseconds becomes an SSE error event on
+a 200 whenever the request spent about a second waiting for its turn first. A queue-full rejection
+degrades the same way: `Retry-After` is written only while the response has not started, and a stream
+that has already sent a keep-alive learns the queue was full from the error event's body instead.
+
+This is a real loss of fidelity and it is accepted rather than engineered around. The obvious
+alternative — hold the first keep-alive until admission, so the status line stays the server's through
+the wait — buys the status code back by reintroducing the failure D52 was written to prevent: a client
+that sees nothing at all for a queue wait plus a generation, and gives up. It is reachable only under
+concurrent load, which on this machine is a burst its single user created, and the error body a client
+receives is identical either way; what degrades is the status code that carries it, not what the
+client is told. One further imprecision on the same path is accepted for the same reason: a queued job
+dropped asynchronously at host shutdown, with the client still connected, surfaces as a 502
+`server_error` event rather than 503 `queue_shutting_down`. D52 mandates an event rather than a status
+there in any case, so only the code inside it differs.
+
+**D90. `/debug/generate` goes through the scheduler, superseding D40's deferral.** D40 deferred it in
+as many words — "once chunk 8 exists" — and the chunk-2 entry in `docs/FUTURE.md` said the same. Issue
+#4 puts it in scope explicitly and is the newer authority, and "once chunk 8 exists" is now. The
+reason is stronger than politeness about a debug endpoint: it creates a context and generates on the
+one shared handle exactly as the OpenAI endpoints do, so an unqueued `/debug/generate` is precisely
+the race D84 closes, arriving by a second door. It now creates no context at all until its turn comes,
+and a job dropped while queued touches the model for zero seconds. The cost is that a debug request
+waits behind real traffic, which is the point of routing it there. It has no streamed shape and no
+client worth the `clientAlreadyGone` distinction, so it passes `false` explicitly at its own call site
+rather than inheriting a default that would hide the question.
+
+Two imprecisions on that endpoint are known and deliberately left: a client abort while queued is
+reported as 503 `queue_shutting_down`, untrue for that case and harmless because the client is gone;
+and an `OperationCanceledException` for a token other than the request's still escapes as a bare 500,
+which is what the OpenAI shapes stopped doing in D82. Both are filed as issues rather than fixed here,
+because this is a loopback debug endpoint and the working method forbids widening a chunk to absorb
+review findings.
+
+**D91. `/v1/completions`: the wire decisions PLAN did not settle, and the 160 lines its existence
+forced into one place.** The legacy shape wraps `prompt` into one user message and runs the identical
+pipeline the chat shape runs from the model-id check onward. Four decisions were left to the chunk.
+
+**A `prompt` array with more than one element is a 400 `invalid_request_error`.** PLAN §2.2 promises
+"string or single-element array" and stops there. Real OpenAI accepts several prompts and answers with
+several choices, which is a batching feature this bridge has no way to serve behind a single-worker
+scheduler. Refusing is honest; silently generating from the first element and discarding the rest is
+not. A client that batches gets an error and files an issue, which is the outcome that carries
+information back.
+
+**The id keeps the `chatcmpl-` prefix rather than OpenAI's `cmpl-`.** Every realistic consumer was
+checked — the OpenAI Python and Node SDKs, LangChain, LiteLLM, OpenCode — and all treat `id` as
+opaque; one id allocator serving both shapes is one fewer thing to keep in step. Genuinely cosmetic,
+and on the future list as exactly that rather than as a defect.
+
+**The legacy parameters are accepted and warned, never implemented.** `echo`, `best_of`, `suffix`,
+`logprobs` and `logit_bias` have no equivalent field on the chat shape at all, so they go through the
+shared ignored-parameter check and earn a log line each. `echo` is the one that returns a materially
+different answer from a real server — the prompt is not prepended to `text` — and its line says so,
+because an operator's "is this parameter doing anything?" signal is worthless if it only covers the
+parameters that would have been harmless to ignore (D83 made the same mistake with `tools`).
+
+**Headers on the streamed shape commit at the first cutter release rather than the first delta**,
+because there is no role chunk to send ahead of the text. That is a consequence of the shape
+difference and arguably more faithful to D52 than the chat shape is; recorded so that a later reader
+does not mistake it for drift between the two.
+
+**What the endpoint cost the codebase.** Its streamed shape arrived as a copy of the chat stream's SSE
+plumbing: `SseStream`, both delta waits, `FailAsync` and `ReportSchedulerOutcomeAsync` — about 160
+lines. The copy had been taken after all of task 2's fix rounds, so unlike the usual case it was
+byte-identical rather than already drifted, and every one of the seven helpers diffed clean. That is
+what made extracting them a pure move with the chat shape's large streaming suite standing as the
+regression guard for the move itself, and it is why the extraction happened immediately instead of
+being deferred: D81's rule is that this pipeline is written once, the only thing that had ever made
+these helpers chat-shaped was the static type of one argument to `WriteChunkAsync` (now a type
+parameter inferred at each call site), and leaving the copy would have installed a permanent "fix both
+by hand" rule on the file this chunk had already fixed three times. They live in
+`Api/StreamingPipeline.cs`. The same extraction answered a coverage finding that would otherwise have
+taken a parallel test suite to answer — the duplicated paths had no D52, queue-full, keep-alive,
+disconnect or stale-timeout test of their own — with one exception that had to be written by hand: the
+client-disconnect tests cover the `http=0` clause and the D51 cancel-drain-settle `finally`, which are
+per-endpoint code that was not extracted, so those were ported to `/v1/completions` rather than
+inherited.
+
+**D92. Publish-before-arm, three times in one file, and why the fix is `Interlocked` on both sides.**
+`GenerationScheduler.ScheduleAsync` writes a job to the channel and then sets up state that job needs.
+`TryWrite` hands the job to the worker immediately, and the worker can dequeue it, run it and settle
+it before the enqueuing thread reaches the next line — so anything armed after the write has a window
+in which it never happens at all. That shape has now produced three bugs in one file.
+
+The first was the cancellation registration, armed after the write: the worker could settle the job
+before the assignment landed, so no disposal path ever saw a live registration and it leaked for as
+long as the caller's own token source lived. Fixed by arming before the write. The second was the
+depth counter standing beside it, left on the old order by the very commit whose comment describes the
+window verbatim. `MarkDequeued` called `LeaveQueueIfNeeded`, which read `_queueDepthArmed == 0` and
+returned without decrementing; the enqueuer then incremented and armed, and nothing ever decremented
+again. `_liveQueueDepth` stayed one too high for the life of the process, `/healthz` drifted
+monotonically upward, and `Retry-After` was computed by multiplying by the inflated number. Nothing
+wedges — the admission gate is the bounded channel's own capacity, not this counter — which is exactly
+why it would have shipped. It surfaced as a flake, one failure in eleven full-suite runs, and was
+diagnosed from the failure mode rather than from a reproduction: the report said "expected 0, got 1",
+and a `WaitAsync` bound expiring raises `TimeoutException` rather than an `Assert.Equal` mismatch, so
+the only assertion in that test that could have produced the message was the one on `QueueDepth`.
+
+**The fix is a memory-model decision, not a tidier one.** `MarkEnteredQueue` arms and then re-checks
+`_dequeued`; `MarkDequeued` sets `_dequeued` and then checks `_queueDepthArmed`. Two threads each
+store one flag and load the other in mirrored order — a Dekker pair — and release/acquire per field
+does not forbid the outcome where both loads miss, because the two accesses are to different
+locations. This project's exe targets ARM64, whose model permits precisely that store-buffer
+reordering, so the original `Volatile.Write`/`Volatile.Read` pairing was the enabling condition rather
+than an incidental detail, and only the full fence each `Interlocked` call carries closes it.
+Exactly-once is the `CompareExchange` on `_queueDepthClaimed` and not the flags; the counter cannot go
+negative, because the increment precedes the arm in program order and two `Interlocked` operations
+cannot reorder; and the "retry" is a single conditional re-check rather than a spin, so there is no
+livelock. Verified by removing the fix and putting it back: three failures in five runs without it,
+eight clean runs with it.
+
+**The regression test is probabilistic, which is the unsatisfying part.** It detects the pre-fix bug
+about 60 % of the time. A deterministic construction exists and is a visibility change only — make the
+two-flag gate visible to the test project and call `MarkDequeued(); MarkEnteredQueue();` in the
+adversarial order, asserting that the leave fires exactly once — and is filed as tech debt rather than
+written here. Given that this file has now had three bugs of one shape, the counter's remaining
+assumption deserves stating too: it is correct only while every job written to the channel is
+eventually dequeued, which holds today because the worker loop cannot fault and drains after
+`TryComplete`.
+
+**Chunk 8's review rounds, the hardware run, and the defect the whole-branch review caught
+(2026-09-12).** Six tasks, each reviewed, each but one taking a fix round; the decisions above are the
+rulings those rounds forced. Three things from the round are worth the record.
+
+**The first hardware verification of the chunk.** `smoke.ps1 -Backend phi-silica` passed on the first
+attempt: 28 PASS, 0 FAIL, 0 SKIP, 5 INFO, no RPC flake. Two concurrent requests on the real NPU queued
+correctly — the live `queue_depth` peaked at 1 while both were in flight, and both completed — a run
+at `--queue-capacity 1` admitted one request and rejected two with 429, `Retry-After` and
+`rate_limit_error`/`queue_full`, and `/v1/completions` answered on both shapes. The review checked
+each step against its source rather than against the report: none of the four bottoms out in a
+wall-clock comparison, none can skip in the merge-gating configuration, the streamed step really reads
+`choices[0].text` rather than a chat-shaped `.Content` that would have read empty either way, and the
+concurrency step proves serialization rather than merely that both requests eventually succeeded. The
+unit suite only ever sees `FakeBackend`, so this run is what makes the concurrency claim a measurement
+instead of a property of a test double.
+
+**One code defect, and it was this chunk's own regression.** The streamed shapes' first-frame hook
+could stamp a partial truncated-turns count and make it permanent. Before chunk 8 the arrangement
+could not arise — the header was applied after `Acquire` had finished truncating, so the count was
+always complete or absent — but with the truncation loop now on the scheduler's worker (D84) and
+keep-alives on the request thread, a keep-alive landing inside the loop committed whatever had been
+dropped so far, `_headerAppliedFor` locked it in, and the true, larger count reached only the log. The
+client is told two turns were dropped when six were. Narrow to reach and silent when reached, and a
+wrong number is worse than a missing one, so the hook now writes nothing until `Acquire` has returned:
+the post-outcome call then either writes the complete count, if the response has somehow not started,
+or logs the "cannot be sent" warning a late truncation has always produced. Both of those are honest.
+The test parks the truncation loop in its second round with two of four turns gone, waits for a
+keep-alive to commit the headers, and asserts that no header arrives; it fails against the old hook.
+`FakeBackendOptions.OnPreflight` exists for it, because the truncation loop runs start to finish
+inside `Acquire` and has no other observable moment. 932 tests.
+
+**A correction to the record of an earlier round.** Task 2's implementer reported that one finding's
+interleaving "does not reproduce". The re-reviewer checked the pre-fix source and the finding was
+correct as written: both shapes passed the cut's linked source as the scheduler's token, so the filter
+matched and a cut became a 503. The implementer's own rewiring — pass `http.RequestAborted`, create
+the linked cut source inside the closure — is what had removed the route. A fix, not a refutation, and
+it is written down that way because the report said otherwise.
