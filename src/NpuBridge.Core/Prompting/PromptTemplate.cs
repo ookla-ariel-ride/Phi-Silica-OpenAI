@@ -220,6 +220,20 @@ public static class PromptTemplate
     }
 
     /// <summary>
+    /// Non-ASCII goes into the prompt as itself rather than as <c>\uXXXX</c>. The default encoder
+    /// escapes every non-ASCII character, which would show a model asked about Tokyo its own argument
+    /// back as escape sequences and spend four tokens a character doing it. Deterministic either way,
+    /// so the cache key is unaffected. (Supplementary-plane characters — emoji — are still written as
+    /// a surrogate pair; that is this encoder's behaviour, it is valid JSON, and it decodes to the
+    /// same character.)
+    /// </summary>
+    private static readonly JsonWriterOptions ToolCallWriterOptions = new()
+    {
+        Indented = false,
+        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    };
+
+    /// <summary>
     /// The tool calls of one assistant turn, in the wire envelope <c>ToolSchemaRenderer</c> instructs
     /// the model to use and <c>ToolCallParser</c> reads back. Compact and in the order the client sent
     /// them: this text is hashed, so indentation or reordering would silently miss the cache.
@@ -232,7 +246,7 @@ public static class PromptTemplate
     private static string RenderToolCalls(IReadOnlyList<ChatToolCall> calls)
     {
         var buffer = new ArrayBufferWriter<byte>();
-        using var writer = new Utf8JsonWriter(buffer);
+        using var writer = new Utf8JsonWriter(buffer, ToolCallWriterOptions);
 
         writer.WriteStartObject();
         writer.WriteStartArray("tool_calls");
