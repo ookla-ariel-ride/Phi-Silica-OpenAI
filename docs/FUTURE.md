@@ -48,6 +48,17 @@ land here instead of widening the chunk. Each entry says where it came from and 
   completions its own prefix would mean threading a per-endpoint prefix through
   `ChatRequestPreparer.PrepareCoreAsync` for a cosmetic difference no test in `docs/CLIENTS.md`'s
   audience depends on. Worth revisiting if a strict OpenAI client ever parses the `id` shape.
+- **`/v1/completions`'s legacy-only parameters are warned about, not implemented (fix round 1, finding
+  5).** `echo`, `best_of`, `suffix`, `logprobs` (the legacy integer form) and `logit_bias` now reach the
+  same once-per-process `IgnoredParameterLog` warning every other accepted-but-ignored parameter uses
+  (`ChatRequestPreparer.PrepareCoreAsync`'s new `extraIgnoredParameters` parameter, since none of the
+  five has an equivalent field on `ChatCompletionRequest` to ride along on chat's own list); `seed`,
+  `presence_penalty`, `frequency_penalty` and `user` ride that shared list directly, since their fields
+  already exist there. None of the five legacy-only ones does anything: `echo: true` still does not
+  prepend the prompt to `text`, which is the one a real client is most likely to notice, now with a log
+  line explaining why rather than a silent difference. Implementing it for real is a small, self-
+  contained change to `CompletionsEndpoint`/`CompletionsStreamEndpoint` (prepend `prompt` to the first
+  chunk of text, or to the whole reply on the JSON shape) whenever it is worth a task of its own.
 
 ## 2026-09-11 test coverage audit
 
