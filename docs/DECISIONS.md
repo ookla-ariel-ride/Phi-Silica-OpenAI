@@ -1344,3 +1344,80 @@ already succeeded.
 657 tests. `smoke.ps1 -Backend phi-silica -Port 5298` passed every step again afterwards, which is
 what says the reordered install still grants identity: the run relaunches through package activation
 and reports `identity=True`.
+
+**D83. Tool-call emulation: the model is asked for JSON, and everything after that is the bridge not
+believing it.** Chunk 7, issue #3, PLAN §2.6. `tools` and `tool_choice` now produce OpenAI-shaped
+`tool_calls` from a runtime with no native tool calling. The design was signed off; what follows is
+what building it decided.
+
+**Injection goes into the system text, not beside it.** `ToolSchemaRenderer` writes the block —
+preamble, one compact signature per tool, the envelope the parser reads — and `PromptTemplate.Render`
+appends it to the system section. That placement is the whole cache story: `ConversationKey` hashes
+the system text, so two requests offering different tools cannot share a context, having been told
+about different tools. Compact signatures are not a nicety either: full JSON Schema for OpenCode's
+~15 tools is 2–3K tokens against Phi Silica's ~3.5K window. `tool_choice: "none"` renders nothing and
+nulls the catalog, so all three ways of turning the feature off — no tools, `none`,
+`--tool-emulation off` — are one code path and one question for phase two.
+
+**Buffering is what the streamed shape costs.** With tools present nothing goes out until the reply is
+whole, because only a finished reply can be told from prose, and a delta already written cannot be
+recalled. The cut still runs during the drain, so `max_tokens` and `stop` behave as they always did.
+The price is that the window in which a failure is still an ordinary HTTP status now spans the whole
+generation, and that keep-alives have to cover it — a deadline measured from the last frame written,
+not from the last delta received.
+
+**The parser's rule is that a false positive is worse than a miss**, because the client's answer to a
+tool call is to run it. That single principle decided every contested case: an object that never
+declared itself a call needs both `name` and `arguments`; `parameters` is accepted only inside a
+`tool_calls` wrapper, since outside one an object with `name` and `parameters` is the tool
+*definition* echoed back; arguments that were supplied and cannot be read drop the call rather than
+defaulting to `{}`, which would hand over a confident call with every optional parameter at its
+default. Unknown tool *names* are the exception and are surfaced, because PLAN says the client
+decides. The parser never throws: every malformed reply is content.
+
+**What the hardware said.** `smoke.ps1`'s probe, 20 runs on build 29648: 20/20 called the tool, no
+prose, no leaked protocol, no unoffered tool, every argument valid JSON. PLAN predicted 60–80 %. That
+is better than expected and it is not the case the prediction was about — the probe asks one tool with
+one required string argument, and the plan's pessimism is for 10+ tools, deep schemas and a 3K-token
+agent prompt. What 20/20 establishes is that a model this size understands the instruction and the
+compact signature form at all, and that the parser handles what it actually emits. The hard case is
+issue #21.
+
+**D83 review round (a Claude subagent and Codex, 2026-09-11).** Eleven findings, all real, listed in
+the merge commit. Both reviewers independently found the same one, and it is the one worth keeping in
+mind.
+
+**Every turn of an agent loop missed the cache.** The reply was stored with `Keep(result.Text)`, so
+the key described an assistant turn whose *content* was the raw model text — fence, prose and all.
+What a client sends back is an assistant message with null content and the `tool_calls` array the
+bridge emitted, and `ConversationKey.AppendTurn` hashes that array's count, ids, types, names and
+arguments as fields of their own. The two could never match, on any input, including a model that
+wrote the normalised envelope verbatim. `Keep` and `Compute` now take the turn rather than its text.
+
+Two consequences to state, because the fix changes what a key means. The stored key now describes
+**what the client will send back**, not what the context literally holds: the context absorbed the
+fence and the surrounding prose, and the key describes the normalised envelope. That is sound because
+a hit renders only the turns *after* the prefix, so the model never sees the divergence — but "the key
+is the transcript the context holds" has stopped being true. And the round trip hits only for a client
+that echoes the `arguments` string byte for byte, since the hash takes it as sent; a client that
+re-serialises with different spacing misses.
+
+This was hiding behind a comment of mine that asserted the opposite, and the mistaken reasoning in it
+— that rendering the call id would poison the key — was wrong twice: the id is hashed as its own field
+whatever the rendering does, and it round-trips precisely because the client echoes ours. Omitting it
+from the *prompt* is still right, for the unrelated reason that the model is never asked to write one.
+
+The other finding worth recording is a framework trap. `JsonDocument.Parse(string)` transcodes UTF-16
+to UTF-8 before it parses, so invalid input fails with `ArgumentException`, not `JsonException` — and
+a `catch (JsonException)` around it looks exhaustive and is not. A lone surrogate in a reply therefore
+escaped the parser and answered a perfectly successful generation with a 502 that blamed the backend
+for the bridge's own parser. D58 exists because this runtime splits surrogate pairs across callbacks,
+so that input is not hypothetical. The same catch appears in `PromptTemplate`, unreachable from the
+wire today because the request deserializer rejects one first, and was widened anyway.
+
+A smaller one with a lesson: `tools` and `tool_choice` were still on the accepted-but-ignored list, so
+the operator's "is this feature on?" signal said the opposite of the truth the moment the feature
+shipped. The test that should have caught it asserted the list's contents and passed, because the
+stale entries were in the expected value; it now names each implemented parameter individually.
+
+859 tests.
