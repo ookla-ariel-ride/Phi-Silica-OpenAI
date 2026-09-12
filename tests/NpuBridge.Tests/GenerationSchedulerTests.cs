@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging.Abstractions;
 using NpuBridge.Api;
 using NpuBridge.Configuration;
@@ -321,6 +322,126 @@ public class GenerationSchedulerTests
         }
     }
 
+    /// <summary>
+    /// Fix round 1, Finding 3 (the "slot half" the comment above deferred): before this fix,
+    /// <see cref="GenerationScheduler.QueueDepth"/> was <c>_queue.Reader.Count</c>, which only shrinks
+    /// once the worker drains to a cancelled job's position -- so a caller that enqueued, gave up and
+    /// retried several times against one long generation left every one of those dead jobs still
+    /// occupying a slot for the whole generation, inflating both <c>/healthz</c>'s reported depth and
+    /// the <c>Retry-After</c> computed off it. <see cref="ScheduleResultKind.Cancelled"/> already came
+    /// back to B's own caller immediately (the test above); this pins that the *count* drops in that
+    /// same instant too, well before A's gate is ever released.
+    /// </summary>
+    [Fact]
+    public async Task Queue_depth_drops_the_instant_a_queued_jobs_own_token_cancels_not_when_the_worker_drains_to_it()
+    {
+        var scheduler = NewScheduler();
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            var gateA = new TaskCompletionSource();
+            var startedA = new TaskCompletionSource();
+            var taskA = scheduler.ScheduleAsync<string>(async ct =>
+            {
+                startedA.TrySetResult();
+                await gateA.Task.WaitAsync(ct).ConfigureAwait(false);
+                return "a";
+            }, CancellationToken.None);
+            await startedA.Task;
+
+            using var ctsB = new CancellationTokenSource();
+            var taskB = scheduler.ScheduleAsync<string>(_ => Task.FromResult("b"), ctsB.Token);
+            await TestWait.UntilAsync(() => scheduler.QueueDepth == 1);
+
+            ctsB.Cancel();
+            await taskB.WaitAsync(TimeSpan.FromSeconds(10)); // B's own caller is already done...
+
+            // ...and the depth reflects that immediately: A is still running (gateA still open), so if
+            // this were still Reader.Count it would still read 1 until the worker drained to B.
+            await TestWait.UntilAsync(() => scheduler.QueueDepth == 0);
+
+            gateA.SetResult();
+            await taskA;
+        }
+        finally
+        {
+            await scheduler.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Fix round 1, Finding 1: <see cref="ScheduleResult{TResult}.Ran"/> is what lets a caller tell "the
+    /// scheduler never got to this job" apart from "the job ran and ended by throwing
+    /// <see cref="OperationCanceledException"/> for its own token instead of reporting a domain result"
+    /// -- both used to surface as an identical <see cref="ScheduleResultKind.Cancelled"/>. This is the
+    /// second of those two: the operation is genuinely invoked (unlike a job dropped while queued) and
+    /// throws for the very token it was handed.
+    /// </summary>
+    [Fact]
+    public async Task Ran_is_true_when_a_running_operation_throws_for_its_own_token()
+    {
+        var scheduler = NewScheduler();
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            using var cts = new CancellationTokenSource();
+            var started = new TaskCompletionSource();
+            var task = scheduler.ScheduleAsync<string>(async ct =>
+            {
+                started.TrySetResult();
+                await Task.Delay(Timeout.Infinite, ct).ConfigureAwait(false);
+                return "unreachable";
+            }, cts.Token);
+
+            await started.Task;
+            cts.Cancel();
+
+            var result = await task;
+            Assert.Equal(ScheduleResultKind.Cancelled, result.Kind);
+            Assert.True(result.Ran, "an operation that was actually invoked and threw for its own token should report Ran");
+        }
+        finally
+        {
+            await scheduler.DisposeAsync();
+        }
+    }
+
+    /// <summary>Counterpart to the test above: a job dropped without ever running reports <c>Ran: false</c>.</summary>
+    [Fact]
+    public async Task Ran_is_false_when_a_job_is_dropped_while_still_queued()
+    {
+        var scheduler = NewScheduler();
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            var gateA = new TaskCompletionSource();
+            var startedA = new TaskCompletionSource();
+            var taskA = scheduler.ScheduleAsync<string>(async ct =>
+            {
+                startedA.TrySetResult();
+                await gateA.Task.WaitAsync(ct).ConfigureAwait(false);
+                return "a";
+            }, CancellationToken.None);
+            await startedA.Task;
+
+            using var ctsB = new CancellationTokenSource();
+            var taskB = scheduler.ScheduleAsync<string>(_ => Task.FromResult("b"), ctsB.Token);
+            await TestWait.UntilAsync(() => scheduler.QueueDepth == 1);
+            ctsB.Cancel();
+
+            var resultB = await taskB.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(ScheduleResultKind.Cancelled, resultB.Kind);
+            Assert.False(resultB.Ran, "a job dropped while still queued never invoked its operation");
+
+            gateA.SetResult();
+            await taskA;
+        }
+        finally
+        {
+            await scheduler.DisposeAsync();
+        }
+    }
+
     [Fact]
     public async Task A_job_cancelled_while_running_is_awaited_to_completion_before_the_next_job_starts()
     {
@@ -553,5 +674,108 @@ public class GenerationSchedulerTests
         Assert.Equal(0, result.RetryAfterSeconds);
 
         await scheduler.DisposeAsync();
+    }
+}
+
+/// <summary>
+/// The one place a <see cref="ScheduleResult{TResult}"/> is turned into something an endpoint can act on
+/// (chunk 8 fix round 1, Finding 4). It exists because all three callers — both
+/// <c>/v1/chat/completions</c> shapes and <c>/debug/generate</c> — used to spell a full queue and a
+/// scheduler shutdown out for themselves, and the two OpenAI shapes had already drifted apart on day
+/// one over whether the answer goes out as a status line or an SSE event (Finding 2). Pinned here
+/// rather than only through the endpoints so <c>/v1/completions</c> (task 3) inherits a mapping with a
+/// test rather than a fourth copy.
+/// </summary>
+public class SchedulerAdmissionTests
+{
+    private static readonly TimeSpan Wait = TimeSpan.FromMilliseconds(5);
+
+    [Fact]
+    public void A_completed_schedule_is_completed_even_when_the_client_has_gone()
+    {
+        // Deliberately not ClientGone: the operation ran, so there is a lease to settle and a status to
+        // log. Telling the client is the caller's own aborted check, further down its own method.
+        Assert.Equal(SchedulerOutcome.Completed,
+            SchedulerAdmission.Classify(ScheduleResult.Completed("x", Wait), clientAlreadyGone: true));
+    }
+
+    [Fact]
+    public void A_full_queue_is_a_429_with_the_schedulers_own_retry_after()
+    {
+        var rejected = ScheduleResult.Rejected<string>(7);
+        var outcome = SchedulerAdmission.Classify(rejected, clientAlreadyGone: false);
+
+        Assert.Equal(SchedulerOutcome.QueueFull, outcome);
+        var failure = SchedulerAdmission.FailureFor(outcome, rejected.RetryAfterSeconds);
+        Assert.Equal(StatusCodes.Status429TooManyRequests, failure.StatusCode);
+        Assert.Equal(OpenAiError.RateLimit, failure.Body.Error.Type);
+        Assert.Equal("queue_full", failure.Body.Error.Code);
+        Assert.Contains("7", failure.Body.Error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>Integration decision 4: a scheduler that is going away answers "this will never run", not "try again in N".</summary>
+    [Fact]
+    public void A_job_that_never_ran_is_a_503_queue_shutting_down()
+    {
+        var outcome = SchedulerAdmission.Classify(ScheduleResult.Cancelled<string>(Wait), clientAlreadyGone: false);
+
+        Assert.Equal(SchedulerOutcome.QueueShuttingDown, outcome);
+        var failure = SchedulerAdmission.FailureFor(outcome, 0);
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable, failure.StatusCode);
+        Assert.Equal("queue_shutting_down", failure.Body.Error.Code);
+    }
+
+    /// <summary>
+    /// Finding 1, and the whole reason <see cref="ScheduleResult{TResult}.Ran"/> exists: the same
+    /// <see cref="ScheduleResultKind.Cancelled"/> means two unrelated things, and reporting the second
+    /// as the first tells a client the queue is shutting down when what actually happened is that a
+    /// live generation threw.
+    /// </summary>
+    [Fact]
+    public void A_job_that_ran_and_threw_its_own_cancellation_is_a_502_backend_error()
+    {
+        var outcome = SchedulerAdmission.Classify(ScheduleResult.Cancelled<string>(Wait, ran: true), clientAlreadyGone: false);
+
+        Assert.Equal(SchedulerOutcome.BackendThrewCancellation, outcome);
+        var failure = SchedulerAdmission.FailureFor(outcome, 0);
+        Assert.Equal(StatusCodes.Status502BadGateway, failure.StatusCode);
+        Assert.Equal("backend_error", failure.Body.Error.Code);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void An_aborted_client_outranks_every_reason_but_completion(bool ran)
+    {
+        Assert.Equal(SchedulerOutcome.ClientGone,
+            SchedulerAdmission.Classify(ScheduleResult.Cancelled<string>(Wait, ran), clientAlreadyGone: true));
+        Assert.Equal(SchedulerOutcome.ClientGone,
+            SchedulerAdmission.Classify(ScheduleResult.Rejected<string>(3), clientAlreadyGone: true));
+    }
+
+    /// <summary>
+    /// Neither has a failure to report — the first has a real result instead, the second nobody to send
+    /// one to — so asking for one is the caller's bug rather than a silent default it would then send.
+    /// (Not a <c>[Theory]</c> over the enum: <see cref="SchedulerOutcome"/> is internal, and a public
+    /// test method may not take one as a parameter.)
+    /// </summary>
+    [Fact]
+    public void There_is_no_failure_for_a_completed_or_client_gone_outcome()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => SchedulerAdmission.FailureFor(SchedulerOutcome.Completed, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => SchedulerAdmission.FailureFor(SchedulerOutcome.ClientGone, 0));
+    }
+
+    /// <summary>The header goes on only for a full queue, and never onto a response whose headers are already spent (Finding 2).</summary>
+    [Fact]
+    public void Retry_after_is_written_for_a_full_queue_and_for_nothing_else()
+    {
+        var http = new DefaultHttpContext();
+
+        SchedulerAdmission.ApplyRetryAfter(http.Response, SchedulerOutcome.QueueShuttingDown, 9);
+        Assert.False(http.Response.Headers.ContainsKey("Retry-After"));
+
+        SchedulerAdmission.ApplyRetryAfter(http.Response, SchedulerOutcome.QueueFull, 9);
+        Assert.Equal("9", http.Response.Headers.RetryAfter.ToString());
     }
 }

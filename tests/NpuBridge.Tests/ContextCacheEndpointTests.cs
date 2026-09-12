@@ -264,13 +264,19 @@ public class ContextCacheEndpointTests
     [Fact]
     public async Task Two_concurrent_requests_for_one_conversation_never_share_a_context()
     {
-        // Both start before either finishes: the first checks the context out, the second misses and
-        // creates its own -- the context lookup itself is not queued, only the generation is (chunk 8,
-        // task-2-brief.md). What one worker forbids by construction is the two generations running at
-        // once: the second's call into the backend does not happen until the first's has completely
-        // ended, so it queues behind it instead of racing it. Both still complete with the same reply,
-        // so both are stored under the same key and the cache keeps one, disposing the other (D11 for
-        // the older) -- exactly the cache and leak claims this test made before chunk 8.
+        // Chunk 8 fix round 1 (controller ruling): Acquire() itself -- the cache lookup and the
+        // preflight, not only the generation -- now runs inside the scheduled closure, because its two
+        // calls (CreateContext, GetUsablePromptLength) are calls on the one shared model handle exactly
+        // like GenerateAsync is. So a second request for the same conversation does not even attempt
+        // its own lookup until the first's whole attempt has run its course on the scheduler's one
+        // worker; before this fix the lookup raced ahead of the queue and could make N concurrent
+        // handle calls against a live generation (the gap docs/FUTURE.md:388 describes). Both still
+        // complete with the same reply and are stored under the same key, so the cache ends with
+        // exactly one survivor and nothing leaked -- whether that is the seed context reused a second
+        // time (b's own Acquire() happening to run after a's Keep() already returned it) or a second,
+        // freshly created one that then loses the key to the other (D11 for the older) is a scheduling
+        // detail chunk 8 does not promise either way, so this test pins the bound rather than the coin
+        // flip: at most one extra context beyond the seed, and never two live at once.
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["same"], FirstTokenGate = gate });
         await using var host = await BridgeTestHost.StartAsync(fake);
@@ -281,6 +287,7 @@ public class ContextCacheEndpointTests
         gate.SetResult();
         await AskAsync(host, stream: false, Msg("user", "hi"));
         Assert.Equal(1, host.Cache.Count);
+        Assert.Equal(1, fake.ContextsCreated);
 
         var secondGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         fake.Options.FirstTokenGate = secondGate;
@@ -288,23 +295,20 @@ public class ContextCacheEndpointTests
         var a = host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = conversation });
         var b = host.Client.PostAsJsonAsync(Path, new { model = "fake", stream = true, messages = conversation });
 
-        // Both requests reach the context lookup before either's generation runs, so both contexts
-        // exist right away: whichever of a/b gets there first checks the cached one out, and the other
-        // misses and creates a fresh one.
-        await TestWait.UntilAsync(() => fake.ContextsCreated == 2);
-        Assert.Equal(0, host.Cache.Count);
-
-        // Only one generation has actually reached the backend: the scheduler's one worker is holding
-        // it open at the gate, and the other is still behind it in the queue, never having touched the
-        // model. fake.Calls records a call the instant GenerateAsync is entered, before either gate, so
-        // this is the queueing itself under test -- not a race that happens not to have resolved yet.
+        // Only one of the two has actually reached the backend: the scheduler's one worker is holding
+        // it open at the gate, and the other is still behind it in the queue -- and, unlike before this
+        // fix, has not even performed its own context lookup yet, since Acquire() now runs inside the
+        // same scheduled slot as the generation. fake.Calls records a call the instant GenerateAsync is
+        // entered, before either gate, so this is the queueing itself under test.
         await TestWait.UntilAsync(() => fake.Calls.Count == 2);
         await TestWait.UntilAsync(() => host.Scheduler.QueueDepth == 1);
+        Assert.Equal(1, fake.ContextsCreated); // still just the seed; the queued request has looked nothing up yet.
+        Assert.Equal(0, host.Cache.Count); // the seed context is checked out by whichever of a/b is running.
         Assert.Equal(2, fake.Calls.Count);
 
         // Release the gate: the running generation completes, the worker moves on to the one that was
-        // queued behind it, and that call reaches the model too -- the same gate, already open by then,
-        // does not hold it.
+        // queued behind it -- which now performs its own Acquire() for the first time -- and that call
+        // reaches the model too, on the same already-open gate.
         secondGate.SetResult();
         var responses = await Task.WhenAll(a, b);
         Assert.All(responses, r => Assert.Equal(HttpStatusCode.OK, r.StatusCode));
@@ -312,13 +316,14 @@ public class ContextCacheEndpointTests
 
         await TestWait.UntilAsync(() => fake.Calls.Count == 3);
 
-        // One of them is on the cached context, the other on a fresh one.
-        Assert.Equal(2, fake.ContextsCreated);
-        Assert.NotEqual(fake.Calls[1].ContextId, fake.Calls[2].ContextId);
-        Assert.Contains(fake.Calls[0].ContextId, new[] { fake.Calls[1].ContextId, fake.Calls[2].ContextId });
+        // At most one context beyond the seed: the queued request's Acquire() either ran after the
+        // first's Keep() had already returned the seed context to the cache (a hit -- one context
+        // total, reused) or before it (a miss -- a second context, created fresh). Either way, never
+        // more than that: neither could look anything up while the other's scheduled slot was live.
+        Assert.True(fake.ContextsCreated is 1 or 2, $"expected the seed plus at most one more, got {fake.ContextsCreated}");
 
-        await TestWait.UntilAsync(() => fake.ContextsDisposed == 1);
-        Assert.Equal(1, host.Cache.Count);
+        // Whichever happened, exactly one survivor ends up under the shared key and nothing leaked.
+        await TestWait.UntilAsync(() => host.Cache.Count == 1);
         host.AssertNoLeak();
     }
 

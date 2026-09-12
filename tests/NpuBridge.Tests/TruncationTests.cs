@@ -188,6 +188,48 @@ public class TruncationTests
         Assert.Equal(1, host.Cache.Count);
     }
 
+    /// <summary>
+    /// Chunk 8 fix round 1: a <c>--truncate-history</c> retry continues on the scheduled slot it already
+    /// holds rather than going back to the end of the queue. The choice is visible only when something
+    /// else is waiting, so this puts a second request in the queue before the first attempt can finish
+    /// (<c>StartGate</c>, released once for all attempts) and then reads the order the backend was
+    /// called in. Re-queueing would interleave the waiting request between the first request's attempts;
+    /// keeping the slot means the three attempts of one request are consecutive. Keeping it is also what
+    /// makes the retry terminate: re-entering a full queue would answer a mid-request retry with 429,
+    /// turning a transcript this bridge can serve into a load-shedding failure halfway through.
+    /// </summary>
+    [Fact]
+    public async Task A_truncate_history_retry_keeps_its_scheduled_slot_rather_than_requeueing()
+    {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Capabilities = NoPreflight,
+            MaxPromptChars = 250,
+            Responder = _ => ["ok"],
+            StartGate = gate,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake,
+            options: new BridgeOptions { Backend = BackendKind.Fake, TruncateHistory = true });
+
+        var truncating = host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = LongConversation() });
+        await TestWait.UntilAsync(() => fake.Calls.Count == 1);
+
+        var waiting = host.Client.PostAsJsonAsync(Path, new { model = "fake", messages = new[] { Msg("user", "short") } });
+        await TestWait.UntilAsync(() => host.Scheduler.QueueDepth == 1);
+
+        gate.SetResult();
+        var responses = await Task.WhenAll(truncating, waiting);
+        Assert.All(responses, r => Assert.Equal(HttpStatusCode.OK, r.StatusCode));
+
+        // Two refused by status and one that answered, all three the truncating request's, and only
+        // then the request that was waiting the whole time.
+        Assert.Equal(4, fake.Calls.Count);
+        Assert.All(fake.Calls.Take(3), c => Assert.Contains("final question", c.Prompt, StringComparison.Ordinal));
+        Assert.Contains("short", fake.Calls[3].Prompt, StringComparison.Ordinal);
+        host.AssertNoLeak();
+    }
+
     [Fact]
     public async Task Without_a_preflight_and_without_truncate_history_the_status_is_still_the_400()
     {

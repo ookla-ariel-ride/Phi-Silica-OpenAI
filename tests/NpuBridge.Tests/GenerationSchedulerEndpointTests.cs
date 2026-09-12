@@ -37,6 +37,10 @@ public class GenerationSchedulerEndpointTests
         var queued = host.Client.PostAsJsonAsync(Path, ChatBody.User("b"));
         await TestWait.UntilAsync(() => host.Scheduler.QueueDepth == 1);
 
+        // Only the running request has touched the model at all: the queued one has not looked anything
+        // up yet, because Acquire() is inside the scheduled closure (fix round 1, controller ruling).
+        Assert.Equal(1, fake.ContextsCreated);
+
         // A third, non-streamed request finds the queue full and never reaches the backend at all.
         var rejectedJson = await host.Client.PostAsJsonAsync(Path, ChatBody.User("c"));
         Assert.Equal(HttpStatusCode.TooManyRequests, rejectedJson.StatusCode);
@@ -61,15 +65,20 @@ public class GenerationSchedulerEndpointTests
         // Still exactly one worker slot busy and one queued: the two rejections never touched the queue.
         Assert.Equal(1, host.Scheduler.QueueDepth);
 
+        // And neither rejection touched the model. This is the ruling's own point (fix round 1): with
+        // Acquire() outside the queue, shedding load was the path that hammered the shared handle
+        // hardest -- a burst of N requests created N contexts and ran N preflights before throwing most
+        // of them away. A rejected request now creates nothing at all.
+        Assert.Equal(1, fake.ContextsCreated);
+
         gate.SetResult();
         var settled = await Task.WhenAll(running, queued);
         Assert.All(settled, r => Assert.Equal(HttpStatusCode.OK, r.StatusCode));
 
-        // The two rejected requests each did their own context lookup (a miss, since "c" and "d" are
-        // new conversations) before ever reaching the scheduler -- the queue wait sits after that, not
-        // before it (task-2-brief.md) -- so each created a context nobody ever generated on, and each
-        // is disposed rather than cached.
-        Assert.Equal(4, fake.ContextsCreated);
+        // One per request that was actually admitted, and not one more: "a" ran, then "b" was dequeued
+        // and did its own lookup (a miss, being a different conversation), and "c"/"d" never got that
+        // far.
+        Assert.Equal(2, fake.ContextsCreated);
         host.AssertNoLeak();
     }
 
@@ -113,20 +122,22 @@ public class GenerationSchedulerEndpointTests
     }
 
     /// <summary>
-    /// The margin (a short real wait between the queued request reaching the queue and the gate that
-    /// releases the one ahead of it) is not itself the assertion (D54): the claim is the ordering
-    /// <c>queued's wait &gt; immediate's wait</c>, which the scheduler's own clock guarantees regardless
-    /// of how long that margin actually is. The margin exists only so the two values are distinguishable
-    /// at the log line's own precision (one decimal place) instead of both flooring to the same
-    /// <c>0.0</c> on a fast run.
+    /// No clock of its own (global constraint 2, fix round 1 Finding 7): the scheduler times its queue
+    /// waits off the injected <see cref="TimeProvider"/>, so the test advances that provider by a known
+    /// amount while the second request sits in the queue and then asserts the exact number the log line
+    /// must carry. The first draft of this test used a real 30 ms <c>Task.Delay</c> as the margin that
+    /// made the two values distinguishable at the log's one-decimal precision, which is a wall-clock
+    /// assumption dressed as a comment: the request that ran immediately reports idle-worker dequeue
+    /// latency, and a pool stall on a loaded agent can make that exceed the margin and invert the claim.
     /// </summary>
     [Fact]
     public async Task Queue_wait_ms_appears_in_the_log_line_and_is_larger_for_the_request_that_queued()
     {
         var capture = new CapturingLoggerProvider();
+        var clock = new ManualTimeProvider(new DateTimeOffset(2026, 9, 12, 12, 0, 0, TimeSpan.Zero));
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => ["ok"], FirstTokenGate = gate });
-        await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture);
+        await using var host = await BridgeTestHost.StartAsync(fake, time: clock, loggerProvider: capture);
 
         var running = host.Client.PostAsJsonAsync(Path, ChatBody.User("a"));
         await TestWait.UntilAsync(() => fake.Calls.Count == 1);
@@ -134,7 +145,9 @@ public class GenerationSchedulerEndpointTests
         var queued = host.Client.PostAsJsonAsync(Path, ChatBody.User("b"));
         await TestWait.UntilAsync(() => host.Scheduler.QueueDepth == 1);
 
-        await Task.Delay(30);
+        // "b" is in the queue and "a" is still holding the worker, so every tick of this advance lands
+        // on "b"'s wait and none of it on "a"'s, which was dequeued at the instant it was enqueued.
+        clock.Advance(TimeSpan.FromSeconds(2));
         gate.SetResult();
 
         // Task.WhenAll preserves argument order regardless of which request actually finished first
@@ -154,10 +167,59 @@ public class GenerationSchedulerEndpointTests
             return double.Parse(match.Groups["v"].Value, CultureInfo.InvariantCulture);
         }
 
-        var runningWait = QueueWaitFor(runningId);
-        var queuedWait = QueueWaitFor(queuedId);
-        Assert.True(queuedWait > runningWait, $"expected the queued request's wait ({queuedWait}) to exceed the one that ran immediately ({runningWait})");
-        Assert.True(queuedWait > 0, "the queued request's own log line should report a real, nonzero wait");
+        // Exact, not merely ordered: the clock only moved while "b" was queued.
+        Assert.Equal(0, QueueWaitFor(runningId));
+        Assert.Equal(2000, QueueWaitFor(queuedId));
+    }
+
+    /// <summary>
+    /// Fix round 1, Finding 1. A backend that breaks the <c>ILanguageModelBackend</c> contract by letting
+    /// the runtime's own <see cref="OperationCanceledException"/> escape — the violation D82's unfiltered
+    /// catch clauses exist for — must still be reported as the backend failure it is, even though the
+    /// request now runs inside the scheduler. The scheduler is a new place for such an exception to be
+    /// absorbed on its way to the client: swallow it into a bare <c>Cancelled</c> and the endpoint sees
+    /// something indistinguishable from "the queue never ran this job" and answers 503
+    /// <c>queue_shutting_down</c> — a false statement, and the wrong status class, where before chunk 8
+    /// it was a 502 <c>backend_error</c>. The cut is what cancels here: the client is still connected
+    /// throughout, so nothing about this is the client's own abort.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_backend_that_throws_the_cuts_cancellation_is_a_502_not_a_queue_error(bool stream)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => ["0123", "4567", "89ab", "cdef"],
+            TokenDelay = TimeSpan.FromMilliseconds(5),
+            ThrowOnCancellation = true,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync(Path, new
+        {
+            model = "fake",
+            stream,
+            max_tokens = 2,
+            messages = new[] { new { role = "user", content = "hi" } },
+        });
+
+        // The streamed shape has deltas on the wire by the time the throw happens, so its status line is
+        // spent and the same envelope arrives as an SSE error event (D52) -- the JSON shape answers with
+        // the status itself. Either way the body is the backend's failure, never the queue's.
+        var error = stream
+            ? JsonDocument.Parse(ErrorEventPayload(await response.Content.ReadAsStringAsync())).RootElement.GetProperty("error")
+            : (await ReadJson(response)).GetProperty("error");
+
+        Assert.Equal(stream ? HttpStatusCode.OK : HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Equal("backend_error", error.GetProperty("code").GetString());
+        Assert.Contains("OperationCanceledException", error.GetProperty("message").GetString(), StringComparison.Ordinal);
+
+        // And the context the failed attempt held is released, not left to the cache (D43).
+        await TestWait.UntilAsync(() => fake.ActiveContexts == 0);
+        Assert.Equal(1, fake.ContextsCreated);
+        Assert.Equal(1, fake.ContextsDisposed);
+        host.AssertNoLeak();
     }
 
     [Fact]
@@ -211,6 +273,14 @@ public class GenerationSchedulerEndpointTests
         Assert.Equal(2, fake.Calls.Count);
         Assert.Equal(2, fake.ContextsCreated);
         host.AssertNoLeak();
+    }
+
+    /// <summary>The one <c>data:</c> payload carrying an error, which must also be the last frame before the done marker.</summary>
+    private static string ErrorEventPayload(string body)
+    {
+        var payloads = Sse.Payloads(body);
+        Assert.Equal("[DONE]", payloads[^1]);
+        return Assert.Single(payloads, p => p.Contains("\"error\"", StringComparison.Ordinal));
     }
 
     private static void AssertRetryAfter(HttpResponseMessage response)
