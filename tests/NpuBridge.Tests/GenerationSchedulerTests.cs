@@ -629,6 +629,15 @@ public class GenerationSchedulerTests
     /// every subsequent <see cref="GenerationScheduler.ScheduleAsync{TResult}"/> forever. This pins that
     /// the exception is rethrown to the exact caller that is waiting for it, and that the worker survives
     /// to run the very next job.
+    ///
+    /// This test is also the one the task 3b review reproduced flaking (1 failure in 11 full-suite runs)
+    /// on the <c>Assert.Equal(0, scheduler.QueueDepth)</c> below, from the publish-before-arm race
+    /// Finding 1 describes: <c>taskA</c> is a job the worker can dequeue and run to completion before
+    /// this thread even reaches its own <c>Interlocked.Increment</c>/<c>MarkEnteredQueue</c> call two
+    /// lines after <c>TryWrite</c>. <see cref="Rapid_back_to_back_jobs_never_leave_the_depth_counter_stuck_above_zero"/>
+    /// below is the dedicated regression test for that race; this test's own final assertion is left as
+    /// it was rather than removed, since it is a real (if now much rarer to hit by chance) instance of
+    /// the same invariant.
     /// </summary>
     [Fact]
     public async Task A_job_that_throws_faults_its_own_caller_without_wedging_the_worker()
@@ -652,6 +661,52 @@ public class GenerationSchedulerTests
             Assert.Equal(ScheduleResultKind.Completed, resultB.Kind);
             Assert.Equal("b", resultB.Result);
             Assert.Equal(0, scheduler.QueueDepth);
+        }
+        finally
+        {
+            await scheduler.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Task 3b review fix round 1, Finding 1. <c>ScheduleAsync</c> arms <c>_liveQueueDepth</c>'s
+    /// counter (<c>Interlocked.Increment</c>, then <c>MarkEnteredQueue</c>) two statements after
+    /// <c>TryWrite</c> hands the job to the channel -- and a worker parked in <c>WaitToReadAsync</c> can
+    /// wake, dequeue, run and complete a trivial job in that gap. When it does, the worker's own
+    /// <c>MarkDequeued</c>-&gt;<c>LeaveQueueIfNeeded</c> call sees the counter not yet armed and returns
+    /// without decrementing, and nothing calls it again: the job that was never really "left waiting"
+    /// stays counted forever, and <c>/healthz</c>'s <c>queue_depth</c> (and the <c>Retry-After</c> it
+    /// feeds) drifts upward for the rest of the process's life.
+    ///
+    /// The window is a handful of instructions wide and cannot be forced open on a specific call, so
+    /// this widens the odds of landing in it instead of trying to pin it exactly: many trivial,
+    /// instantly-completing jobs scheduled one after another, so the worker is essentially always
+    /// freshly parked and immediately eligible to race the very next enqueue. Before the fix this failed
+    /// intermittently under that load (matching the reviewer's own reproduction rate on the neighbouring
+    /// <see cref="A_job_that_throws_faults_its_own_caller_without_wedging_the_worker"/> test, which
+    /// exercises the identical race on a single pair of jobs); after it, <c>MarkEnteredQueue</c>'s own
+    /// retry against <c>_dequeued</c> makes the outcome the same whichever of the two threads gets there
+    /// first, so every one of these iterations leaves the counter exactly where it started regardless of
+    /// which way the race actually broke on this run -- no wall clock involved (D54), only the counter's
+    /// own value once every job has been awaited to completion.
+    /// </summary>
+    [Fact]
+    public async Task Rapid_back_to_back_jobs_never_leave_the_depth_counter_stuck_above_zero()
+    {
+        var scheduler = NewScheduler();
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            for (var i = 0; i < 500; i++)
+            {
+                var result = await scheduler.ScheduleAsync<string>(_ => Task.FromResult("x"), CancellationToken.None);
+                Assert.Equal(ScheduleResultKind.Completed, result.Kind);
+
+                // Checked every iteration, not only at the end: the bug leaves the counter one too high
+                // per race it wins, so a single check after the loop could still pass by coincidence if
+                // an unrelated regression instead left it transiently negative partway through.
+                Assert.Equal(0, scheduler.QueueDepth);
+            }
         }
         finally
         {

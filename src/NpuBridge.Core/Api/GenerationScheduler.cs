@@ -343,12 +343,43 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
 
         public bool IsCancellationRequested => _cancellationToken.IsCancellationRequested;
 
-        /// <summary>Called once, right after a successful <c>TryWrite</c> -- arms <see cref="LeaveQueueIfNeeded"/> to actually decrement the live counter this job was just added to.</summary>
-        public void MarkEnteredQueue() => Volatile.Write(ref _queueDepthArmed, 1);
+        /// <summary>
+        /// Called once, right after a successful <c>TryWrite</c> -- arms <see cref="LeaveQueueIfNeeded"/>
+        /// to actually decrement the live counter this job was just added to.
+        ///
+        /// Task 3b review fix round 1, Finding 1: the worker thread can call <see cref="MarkDequeued"/>
+        /// -- itself calling <see cref="LeaveQueueIfNeeded"/> -- before this thread reaches this call at
+        /// all, since <c>TryWrite</c> hands the job to the worker immediately and the worker can dequeue
+        /// and even finish running it before the enqueuing thread gets here. When that happens
+        /// <see cref="MarkDequeued"/>'s own <see cref="LeaveQueueIfNeeded"/> call saw
+        /// <see cref="_queueDepthArmed"/> still 0 and returned without decrementing -- and nothing ever
+        /// called it again, so <c>_liveQueueDepth</c> stayed one too high for the rest of the process's
+        /// life. So this checks <see cref="_dequeued"/> after arming and retries the leave itself;
+        /// <see cref="_queueDepthClaimed"/>'s <c>CompareExchange</c> is what keeps the actual decrement
+        /// exactly-once regardless of which of the two calls gets there first, exactly as it already did
+        /// for the callback/<see cref="MarkDequeued"/> race <see cref="_queueDepthArmed"/>'s own comment
+        /// describes.
+        ///
+        /// <see cref="Interlocked.Exchange(ref int, int)"/>, not <c>Volatile.Write</c>, on both this and
+        /// <see cref="MarkDequeued"/>'s write to <see cref="_dequeued"/>: the two threads write one flag
+        /// and read the other in mirrored order (a Dekker shape), and a plain release store paired with
+        /// an acquire load on the same field does not by itself stop that store from being reordered
+        /// past this thread's own later read of the *other* field on a weaker memory model -- this
+        /// project's exe targets ARM64. The full fence each `Interlocked` call carries is what makes the
+        /// ordering an actual guarantee instead of a bet that happened not to lose in this run.
+        /// </summary>
+        public void MarkEnteredQueue()
+        {
+            Interlocked.Exchange(ref _queueDepthArmed, 1);
+            if (Volatile.Read(ref _dequeued) != 0)
+            {
+                LeaveQueueIfNeeded();
+            }
+        }
 
         public void MarkDequeued()
         {
-            Volatile.Write(ref _dequeued, 1);
+            Interlocked.Exchange(ref _dequeued, 1);
             LeaveQueueIfNeeded();
         }
 
