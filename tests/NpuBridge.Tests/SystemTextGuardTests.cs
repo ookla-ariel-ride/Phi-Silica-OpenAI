@@ -291,6 +291,7 @@ public class SystemTextGuardTests
         var preflightCalls = 0;
         var fake = new FakeBackend(new FakeBackendOptions
         {
+            ContextWindowTokens = 100,
             MaxPromptChars = 100,
             OnPreflight = _ => preflightCalls++,
         });
