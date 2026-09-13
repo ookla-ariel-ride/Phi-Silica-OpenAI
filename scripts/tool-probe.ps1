@@ -259,6 +259,10 @@ function ConvertFrom-ToolCallSse([string] $body) {
     $done = $false
     $frameCount = 0
     $missingIndex = 0
+    $streamFailed = $false
+    $errorType = $null
+    $errorCode = $null
+    $errorMessage = $null
 
     foreach ($line in ($body -split "\r?\n")) {
         if ($line.StartsWith(':')) { continue }
@@ -275,6 +279,14 @@ function ConvertFrom-ToolCallSse([string] $body) {
             continue
         }
         $frameCount++
+        if ($frame.PSObject.Properties.Name -contains 'error' -and $null -ne $frame.error) {
+            $streamFailed = $true
+            $errorProperties = @($frame.error.PSObject.Properties.Name)
+            if ($errorProperties -contains 'type') { $errorType = [string] $frame.error.type }
+            if ($errorProperties -contains 'code') { $errorCode = [string] $frame.error.code }
+            if ($errorProperties -contains 'message') { $errorMessage = [string] $frame.error.message }
+            continue
+        }
         foreach ($choice in @($frame.choices)) {
             if ($null -eq $choice) { continue }
             $choiceProperties = @($choice.PSObject.Properties.Name)
@@ -338,6 +350,10 @@ function ConvertFrom-ToolCallSse([string] $body) {
         FinishReason = $finishReason
         Content = if ($content.Length -gt 0) { $content } else { $null }
         Done = $done
+        Failed = $streamFailed
+        ErrorType = $errorType
+        ErrorCode = $errorCode
+        ErrorMessage = $errorMessage
         FrameCount = $frameCount
         ParseErrors = $errors.ToArray()
     }
@@ -365,15 +381,20 @@ function Test-ToolCallReply([string] $context, $calls, [string] $finishReason, $
 
 function Get-HealthzSnapshot {
     $health = Invoke-WebRequest -Uri "$base/healthz" -TimeoutSec 10 -SkipHttpErrorCheck
-    if ([int] $health.StatusCode -ne 200) { throw "GET /healthz returned HTTP $($health.StatusCode): $($health.Content)" }
     try { $parsed = $health.Content | ConvertFrom-Json -Depth 12 }
     catch { throw "GET /healthz returned invalid JSON: $($_.Exception.Message)" }
+    $statusCode = [int] $health.StatusCode
+    if ($statusCode -ne 200 -and -not ($statusCode -eq 503 -and $parsed.status -eq 'degraded')) {
+        throw "GET /healthz returned HTTP $statusCode`: $($health.Content)"
+    }
     foreach ($field in @('context_cache_hits', 'context_cache_misses')) {
         if (-not ($parsed.PSObject.Properties.Name -contains $field) -or -not (Test-IntegerValue $parsed.$field)) {
             throw "GET /healthz returned no usable '$field' field: $($health.Content)"
         }
     }
     [pscustomobject]@{
+        StatusCode = $statusCode
+        Status = [string] $parsed.status
         ContextCacheHits = [int64] $parsed.context_cache_hits
         ContextCacheMisses = [int64] $parsed.context_cache_misses
         Raw = $health.Content
@@ -386,13 +407,17 @@ function Get-ToolCallParityAssessment($jsonFacts, $streamFacts) {
     if ($jsonFacts.StatusCode -ne 200 -or $streamFacts.StatusCode -ne 200) {
         $reasons.Add("HTTP statuses are not both 200 (json=$($jsonFacts.StatusCode), stream=$($streamFacts.StatusCode))")
     }
+    if ($streamFacts.StreamFailed) {
+        $reasons.Add("stream carried $($streamFacts.ErrorCode)")
+    }
     if (@($jsonFacts.Calls).Count -eq 0 -or @($streamFacts.Calls).Count -eq 0) {
         $reasons.Add("tool_calls missing (json=$(@($jsonFacts.Calls).Count), stream=$(@($streamFacts.Calls).Count))")
     }
     if (-not $streamFacts.StreamDone) { $reasons.Add('stream did not end with data: [DONE]') }
     if (@($streamFacts.StreamParseErrors).Count -gt 0) { $reasons.Add('stream had SSE parse errors') }
     $comparable = $reasons.Count -eq 0
-    $verdict = if (-not $comparable) { 'not comparable' } elseif ($comparison.Identical) { 'identical' } else { 'MISMATCH' }
+    $verdict = if ($streamFacts.StreamFailed) { "not comparable: stream carried $($streamFacts.ErrorCode)" }
+               elseif (-not $comparable) { 'not comparable' } elseif ($comparison.Identical) { 'identical' } else { 'MISMATCH' }
     [pscustomobject]@{
         Comparison = $comparison
         Comparable = $comparable
@@ -449,7 +474,7 @@ function Invoke-StreamParityRuns([string] $dimension, [string] $cell, $jsonRuns,
         Write-Info "$cell stream run=$($i + 1): HTTP json=$($jsonFacts.StatusCode) stream=$($streamFacts.StatusCode) finish=$($streamFacts.FinishReason) parity=$verdict$(if ($reason) { " reason=$reason" }) ($($streamResult.LatencyMs)ms)"
     }
     $mismatchN = @($parities | Where-Object { $_.Verdict -eq 'MISMATCH' }).Count
-    $notComparableN = @($parities | Where-Object { $_.Verdict -eq 'not comparable' }).Count
+    $notComparableN = @($parities | Where-Object { $_.Verdict -like 'not comparable*' }).Count
     $cellVerdict = if ($mismatchN -gt 0) { 'MISMATCH' } elseif ($notComparableN -gt 0) { "not comparable ($notComparableN/$runCount pairs)" } else { 'identical' }
     Write-Info "stream parity: $cellVerdict"
     $script:cells.Add([pscustomobject]@{ Dimension = $dimension; Cell = "$cell (stream)"; Runs = $runCount; Summary = "stream parity: $cellVerdict" })
@@ -469,6 +494,29 @@ data: [DONE]
     if (-not $assembled.Done -or $assembled.FrameCount -ne 4 -or @($assembled.ParseErrors).Count -ne 0) { throw 'SSE fixture did not assemble cleanly' }
     if (@($assembled.Calls).Count -ne 1 -or $assembled.Calls[0].function.arguments -ne '{"location":"Paris"}') { throw 'SSE fixture did not concatenate arguments by index' }
     Write-Host 'SELFTEST: SSE assembly passed'
+
+    $errorFixtureSse = @'
+: keep-alive
+data: {"error":{"type":"server_error","code":"backend_fault","message":"generation failed"}}
+data: [DONE]
+'@
+    $errorAssembled = ConvertFrom-ToolCallSse $errorFixtureSse
+    if (-not $errorAssembled.Failed -or $errorAssembled.ErrorType -ne 'server_error' -or
+        $errorAssembled.ErrorCode -ne 'backend_fault' -or $errorAssembled.ErrorMessage -ne 'generation failed' -or
+        -not $errorAssembled.Done -or @($errorAssembled.ParseErrors).Count -ne 0) {
+        throw 'SSE error fixture did not record the streamed error after keep-alive'
+    }
+    $errorStreamFacts = Get-ChatFacts ([pscustomobject]@{
+        NetworkOk = $true; StatusCode = 200; IsStream = $true; RawBody = $errorFixtureSse
+    })
+    $errorJsonFacts = [pscustomobject]@{ StatusCode = 200; FinishReason = $null; Calls = @() }
+    $errorParity = Get-ToolCallParityAssessment $errorJsonFacts $errorStreamFacts
+    if ($errorParity.Verdict -ne 'not comparable: stream carried backend_fault' -or
+        $errorStreamFacts.ErrorType -ne 'server_error' -or $errorStreamFacts.ErrorCode -ne 'backend_fault' -or
+        $errorStreamFacts.ErrorMessage -ne 'generation failed') {
+        throw "streamed error was not surfaced in parity: verdict=$($errorParity.Verdict)"
+    }
+    Write-Host 'SELFTEST: streamed error after keep-alive passed'
 
     $same = Compare-ToolCallShapes $jsonMessage.tool_calls 'tool_calls' $assembled.Calls $assembled.FinishReason
     if (-not $same.Identical) { throw "expected identical parity, got JSON=$($same.JsonToolCalls) stream=$($same.StreamToolCalls)" }
@@ -612,7 +660,8 @@ function Get-ChatFacts($result) {
             Called = $stream.FinishReason -eq 'tool_calls'
             ToolNames = @($calls | ForEach-Object { $_.function.name })
             Calls = $calls; Content = $stream.Content
-            ErrorType = $null; ErrorCode = $null; ErrorMessage = $null
+            ErrorType = $stream.ErrorType; ErrorCode = $stream.ErrorCode; ErrorMessage = $stream.ErrorMessage
+            StreamFailed = $stream.Failed
             StreamDone = $stream.Done; StreamParseErrors = @($stream.ParseErrors)
         }
     }
@@ -644,7 +693,7 @@ function Get-ChatFacts($result) {
     }
 }
 
-# --- tool catalogs ----------------------------------------------------------------------------------# --- tool catalogs ----------------------------------------------------------------------------------
+# --- tool catalogs ----------------------------------------------------------------------------------
 
 # The target tool for the tool-count sweep and the system-prompt-pressure sweep: identical to
 # smoke.ps1's single-tool probe, so the count=1 cell is a direct rerun of that measurement.
@@ -1616,8 +1665,8 @@ function Invoke-WindowOccupancyProbe {
     if ($deadAtCell -and $deadStatus -eq 502) {
         Write-Host "    sweep stopped on a 502 at cell '$deadAtCell'" -ForegroundColor Red
     }
-    elseif ($degradeAt) { Write-Host "    compliance first degraded at ~$degradeAt% of the window (still HTTP 200)" -ForegroundColor Magenta }
-    else { Write-Host '    no compliance degradation observed on any HTTP 200 cell (only the hard 400/502 failures, if any)' -ForegroundColor Magenta }
+    if ($degradeAt) { Write-Host "    compliance first degraded at ~$degradeAt% of the window (still HTTP 200)" -ForegroundColor Magenta }
+    elseif (-not ($deadAtCell -and $deadStatus -eq 502)) { Write-Host '    no compliance degradation observed on any HTTP 200 cell (only the hard 400/502 failures, if any)' -ForegroundColor Magenta }
     if ($cliff400) { Write-Host "    200->400 flip: first seen at $($cliff400.Chars) chars / $($cliff400.Tokens) tokens" -ForegroundColor Magenta }
     elseif (-not $observedHttp400) { Write-Host '    no HTTP 400 observed in this sweep' -ForegroundColor Magenta }
     else { Write-Host '    HTTP 400 observed in this sweep' -ForegroundColor Magenta }
@@ -1650,11 +1699,12 @@ if ($h.model -ne $Model) { throw "bridge serves model '$($h.model)', not '$Model
 Write-Host "healthz: backend=$($h.backend) model=$($h.model) contexts_cached=$($h.contexts_cached)/$($h.context_cache_capacity) queue_depth=$($h.queue_depth)" -ForegroundColor Cyan
 
 $cliffCount = $null
+$occupancy = $null
 if ($dimensions -contains 'ToolCountSweep') { $cliffCount = Invoke-ToolCountSweep }
 if ($dimensions -contains 'SchemaDepth') { Invoke-SchemaDepthProbe }
 if ($dimensions -contains 'SystemPromptPressure') { Invoke-SystemPromptPressureProbe }
 if ($dimensions -contains 'MultiStep') { Invoke-MultiStepProbe }
-if ($dimensions -contains 'WindowOccupancy') { Invoke-WindowOccupancyProbe -CellLabels $OccupancyCells }
+if ($dimensions -contains 'WindowOccupancy') { $occupancy = Invoke-WindowOccupancyProbe -CellLabels $OccupancyCells }
 
 Write-Host ''
 Write-Host '=== per-cell summary ===' -ForegroundColor Cyan
@@ -1684,6 +1734,8 @@ $out = [pscustomobject]@{
     StreamedCalls = $script:streamedCalls
     ParityResults = $script:parityResults
     CacheBrackets = $script:cacheBrackets
+    Occupancy = $occupancy
+    DegradeAtPct = if ($null -ne $occupancy) { $occupancy.DegradeAtPct } else { $null }
     Defects      = $script:defects
 }
 $out | ConvertTo-Json -Depth 12 | Set-Content -Path $JsonOut -Encoding utf8
