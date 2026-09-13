@@ -135,6 +135,32 @@ public class DebugGenerateTests
     }
 
     [Fact]
+    public async Task Foreign_cancellation_is_502_with_openai_error_envelope()
+    {
+        using var foreignCancellation = new CancellationTokenSource();
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => ["Hello", " world"],
+            FailAfterTokens = 1,
+            FailureException = new OperationCanceledException(
+                "adapter let a foreign cancellation escape", foreignCancellation.Token),
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync("/debug/generate", new { prompt = "x" });
+
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var error = doc.RootElement.GetProperty("error");
+        Assert.Equal("server_error", error.GetProperty("type").GetString());
+        Assert.Equal("backend_error", error.GetProperty("code").GetString());
+        Assert.True(error.TryGetProperty("message", out _));
+        Assert.True(error.TryGetProperty("param", out _));
+        Assert.Equal(0, fake.ActiveContexts);
+        host.AssertNoLeak();
+    }
+
+    [Fact]
     public async Task Client_disconnect_cancels_and_disposes_the_context()
     {
         var fake = new FakeBackend(new FakeBackendOptions
