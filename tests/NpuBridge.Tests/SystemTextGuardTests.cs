@@ -49,6 +49,27 @@ public class SystemTextGuardTests
         public int TokensCovering(string text, int prefixChars) => Count(text);
     }
 
+    private sealed class CountingTokenCounter : ITokenCounter
+    {
+        public string Name => CharEstimateTokenCounter.Instance.Name;
+
+        public bool PrefixStable => CharEstimateTokenCounter.Instance.PrefixStable;
+
+        public int CountCalls { get; private set; }
+
+        public int Count(string text)
+        {
+            CountCalls++;
+            return CharEstimateTokenCounter.Instance.Count(text);
+        }
+
+        public int IndexAtTokenCount(string text, int tokens, out int totalTokens) =>
+            CharEstimateTokenCounter.Instance.IndexAtTokenCount(text, tokens, out totalTokens);
+
+        public int TokensCovering(string text, int prefixChars) =>
+            CharEstimateTokenCounter.Instance.TokensCovering(text, prefixChars);
+    }
+
     [Fact]
     public async Task Token_window_refuses_native_system_text_before_context_creation_and_allows_smaller_text()
     {
@@ -86,6 +107,25 @@ public class SystemTextGuardTests
 
         var accepted = await PostChatAsync(host, new string('s', 32_000));
         Assert.Equal(HttpStatusCode.OK, accepted.StatusCode);
+        host.AssertNoLeak();
+    }
+
+    [Fact]
+    public async Task Character_ceiling_refusal_does_not_tokenize_native_system_text()
+    {
+        var counter = new CountingTokenCounter();
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            ContextWindowTokens = 100,
+            TokenCounter = counter,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var refused = await PostChatAsync(host, new string('s', 32_001));
+
+        Assert.Equal(HttpStatusCode.BadRequest, refused.StatusCode);
+        Assert.Equal(0, counter.CountCalls);
+        Assert.Equal(0, fake.ContextsCreated);
         host.AssertNoLeak();
     }
 

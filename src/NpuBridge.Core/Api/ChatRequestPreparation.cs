@@ -379,13 +379,13 @@ internal static class ChatRequestPreparer
             // separately through the native context.
             promptChars = rendered.Prompt.Length + (nativeSystem?.Length ?? 0);
 
-            // Native system text never changes across --truncate-history retries. Count it once here,
-            // before a scheduler slot is taken, and reuse that count for both the wire-level guard and
-            // every later transcript-usage calculation.
-            var nativeSystemTokens = nativeSystem is null ? 0 : backend.TokenCounter.Count(nativeSystem);
-            var systemTextFailure = SystemTextGuard.RefusalFor(
-                backend, nativeSystem, catalog is not null, nativeSystemTokens);
-            if (systemTextFailure is not null)
+            // Native system text never changes across --truncate-history retries. The guard checks the
+            // hard character ceiling before it tokenizes; text that passes is counted once here and its
+            // count is reused for every later transcript-usage calculation.
+            var systemTextCheck = SystemTextGuard.RefusalForPreparation(
+                backend, nativeSystem, catalog is not null);
+            var nativeSystemTokens = systemTextCheck.NativeSystemTokens;
+            if (systemTextCheck.Failure is { } systemTextFailure)
             {
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs: 0, tokens: 0,
                     status: GenerationStatus.PromptLargerThanContext.ToString(), finish: "-",
