@@ -137,6 +137,7 @@ public static class DebugEndpoints
                 generationAttempted = true;
                 context = backend.CreateContext(request.System);
                 var usable = backend.GetUsablePromptLength(context, request.Prompt);
+                var preflightKnownOverflow = usable is { } usablePromptChars && usablePromptChars < request.Prompt.Length;
 
                 var result = await backend.GenerateAsync(
                     context,
@@ -155,7 +156,8 @@ public static class DebugEndpoints
                 var totalMs = stopwatch.Elapsed.TotalMilliseconds;
                 if (!http.RequestAborted.IsCancellationRequested)
                 {
-                    _ = GenerationOutcome.Classify(result, cancelledByCut: false, health: generationHealth, durationMs: totalMs);
+                    _ = GenerationOutcome.Classify(result, cancelledByCut: false,
+                        health: preflightKnownOverflow ? null : generationHealth, durationMs: totalMs);
                     outcomeClassified = true;
                 }
                 var ttftMs = callbacks == 0 ? totalMs : firstTokenTicks * 1000.0 / Stopwatch.Frequency;

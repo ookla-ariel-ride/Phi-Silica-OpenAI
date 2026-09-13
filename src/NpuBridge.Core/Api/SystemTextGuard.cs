@@ -17,35 +17,57 @@ public static class SystemTextGuard
         ILanguageModelBackend backend,
         string? nativeSystemText,
         bool includesToolDefinitions,
-        int? nativeSystemTokens = null)
+        int? nativeSystemTokens = null) =>
+        Evaluate(backend, nativeSystemText, includesToolDefinitions, nativeSystemTokens, countForUsage: false).Failure;
+
+    /// <summary>
+    /// Checks native system text before preparation computes its usage count. The character ceiling is
+    /// decisive before tokenization; a non-refused native system text is counted exactly once for later
+    /// conversation usage calculations.
+    /// </summary>
+    internal static (GenerationFailure? Failure, int NativeSystemTokens) RefusalForPreparation(
+        ILanguageModelBackend backend,
+        string? nativeSystemText,
+        bool includesToolDefinitions) =>
+        Evaluate(backend, nativeSystemText, includesToolDefinitions, nativeSystemTokens: null, countForUsage: true);
+
+    private static (GenerationFailure? Failure, int NativeSystemTokens) Evaluate(
+        ILanguageModelBackend backend,
+        string? nativeSystemText,
+        bool includesToolDefinitions,
+        int? nativeSystemTokens,
+        bool countForUsage)
     {
         ArgumentNullException.ThrowIfNull(backend);
         if (nativeSystemText is null)
         {
-            return null;
+            return (null, 0);
         }
 
         if (nativeSystemText.Length > NativeSystemTextCharacterCeiling)
         {
-            return Overflow(
+            return (Overflow(
                 string.Create(CultureInfo.InvariantCulture,
                     $"Native system text alone exceeds the {NativeSystemTextCharacterCeiling:N0}-character safety ceiling: {nativeSystemText.Length:N0} characters."),
-                includesToolDefinitions);
+                includesToolDefinitions), 0);
         }
 
-        if (backend.ContextWindowTokens is { } windowTokens)
+        var windowTokens = backend.ContextWindowTokens;
+        var systemTokens = nativeSystemTokens;
+        if (windowTokens is not null || countForUsage)
         {
-            var systemTokens = nativeSystemTokens ?? backend.TokenCounter.Count(nativeSystemText);
-            if (systemTokens >= windowTokens)
-            {
-                return Overflow(
-                    string.Create(CultureInfo.InvariantCulture,
-                        $"Native system text alone exceeds the context window: {systemTokens:N0} tokens fills the {windowTokens:N0}-token usable window."),
-                    includesToolDefinitions);
-            }
+            systemTokens ??= backend.TokenCounter.Count(nativeSystemText);
         }
 
-        return null;
+        if (windowTokens is { } usableWindowTokens && systemTokens is { } countedTokens && countedTokens >= usableWindowTokens)
+        {
+            return (Overflow(
+                string.Create(CultureInfo.InvariantCulture,
+                    $"Native system text alone exceeds the context window: {countedTokens:N0} tokens fills the {usableWindowTokens:N0}-token usable window."),
+                includesToolDefinitions), countedTokens);
+        }
+
+        return (null, systemTokens ?? 0);
     }
 
     private static GenerationFailure Overflow(string detail, bool includesToolDefinitions)
