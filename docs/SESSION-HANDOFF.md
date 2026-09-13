@@ -76,11 +76,13 @@ on a PR or pushed directly is the last section.
 
 ## Do this next
 
-1. PR #36 (`wave/issues-29-30-31` into `main`) is open with CI green. A whole-branch `/code-review`
-   found one real defect (`/debug/generate` recording a preflight-known overflow as a backend fault)
-   and four probe-script gaps; both are fixed on the branch by two board tickets before the merge.
-   Merge on GitHub, delete the branch and the delivered `refs/sidequest/*` refs. The board's
-   `integrationBranch` gets set to the next wave's branch when it is cut.
+1. PR #36 (`wave/issues-29-30-31`) merged into `main` as 4b252c4 on 2026-09-12 at 20:03 local, CI
+   green on the head. A whole-branch `/code-review` had found one real defect (`/debug/generate`
+   recording a preflight-known overflow as a backend fault) and four probe-script gaps; both were
+   fixed on the branch by two board tickets before the merge. The branch is deleted and the delivered
+   `refs/sidequest/*` refs are gone; `refs/sidequest/SQ-2` (the rejected candidate) is kept as the
+   board's immutable record. Cut `wave/<name>` from `main` and set the board's `integrationBranch`
+   to it when the next wave starts.
 2. `.claude/settings.json` enabling `observability@eigenwise-toolshed` was stashed during the wave so
    the board could merge onto a clean target; pop it, then `/reload-plugins` and run the plugin's
    `enable-project-telemetry` skill.
