@@ -248,7 +248,10 @@ gets a compact signature for each one, and the JSON envelope to answer in, appen
 text; the reply is read back by a deliberately tolerant parser that accepts a fenced block, a
 `tool_calls` wrapper, a lone call object, a bare array, and single quotes on a last pass. What the
 parser cannot read comes back as ordinary content. A call the model did not mean is worse than a call
-missed, because the client's answer to a call is to run it.
+missed, because the client's answer to a call is to run it. One narrow exception to the rule that a
+lone object needs both `name` and `arguments`: an object whose only key is `name`, naming a tool the
+request offered, is a zero-argument call. The same object with any other key, or a name that was not
+offered, stays content, so a tool definition the model echoes back is never run.
 
 ```powershell
 curl.exe http://127.0.0.1:5273/v1/chat/completions `
@@ -401,16 +404,20 @@ within about eight minutes; one needed a restart. The bridge does not recreate t
 but `/healthz` now says what is happening: after two consecutive backend faults it answers 503 with
 `status: degraded`, the last outcome and the fault count, while still admitting requests so a
 runtime that recovers can show it. A client that polls `/healthz` should back off on 503 rather than
-retry hot.
+retry hot. Only a failure inside a call to the model counts toward that state: a throw from the
+bridge's own code after the model has answered is still a 502 to the client, and leaves
+`/healthz` alone.
 
 ## Repository layout
 
 ```
 npu-bridge.slnx, Directory.Build.props, nuget.config   solution; shared build settings; the local NuGet source
 src/NpuBridge.Core/        logic, no WinRT references, tested without the NPU
-  Api/                     endpoints (chat and completions, JSON and SSE), OpenAI DTOs, validation, the cut,
-                           the conversation session and lease, the generation queue and its 429 mapping
-  Backends/                ILanguageModelBackend, BackendLifecycle, ContextCache, DeltaAccumulator; Fake/ the fake backend
+  Api/                     endpoints (chat and completions, JSON and SSE) over one shared JSON pipeline and one
+                           shared SSE pipeline, OpenAI DTOs, validation, the cut, the conversation session and
+                           lease, the generation queue and its 429 mapping
+  Backends/                ILanguageModelBackend, BackendLifecycle, ContextCache, DeltaAccumulator, the health
+                           recorder behind /healthz, the native system-text ceiling; Fake/ the fake backend
   Configuration/           options, binder, command line, environment variables
   Hosting/                 DI wiring, sc.exe and schtasks command builders, process identity
   Prompting/               PromptTemplate (message flattening, tails), ConversationKey (the cache key)
