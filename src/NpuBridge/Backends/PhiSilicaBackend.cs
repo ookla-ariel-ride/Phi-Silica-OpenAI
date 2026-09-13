@@ -4,7 +4,6 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Windows.AI;
 using Microsoft.Windows.AI.Text;
 using Microsoft.Windows.ApplicationModel.DynamicDependency;
-using NpuBridge.Api;
 using NpuBridge.Backends;
 using NpuBridge.Configuration;
 using NpuBridge.Hosting;
@@ -160,10 +159,10 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
         // Defence in depth for direct hardware callers: the Core wire guard cannot protect an init probe
         // or adapter harness that bypasses it, and this call can fail-fast WorkloadsSessionHost.exe above
         // the measured ceiling. This cannot be unit-tested without the Phi Silica runtime and NPU.
-        if (systemPrompt?.Length > SystemTextGuard.NativeSystemTextCharacterCeiling)
+        if (systemPrompt?.Length > BackendLimits.NativeSystemTextCharacterCeiling)
         {
             throw new ArgumentException(
-                $"Native system text exceeds the {SystemTextGuard.NativeSystemTextCharacterCeiling}-character safety ceiling.",
+                $"Native system text exceeds the {BackendLimits.NativeSystemTextCharacterCeiling}-character safety ceiling.",
                 nameof(systemPrompt));
         }
 
