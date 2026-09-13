@@ -1,13 +1,13 @@
-# Session handoff, 2026-09-13 (morning, local): the `leftovers` wave is integrated on its branch and waits for the PR
+# Session handoff, 2026-09-13 (morning, local): the `leftovers` wave is pushed as PR #37 and waits for CI and the merge
 
 Supersedes the 2026-09-12 handoff (in git history). Second wave run on the Sidequest board here: six
 GitHub issues, ten board tickets (seven implementers, three bound reviews), one whole-branch review,
-four hardware smoke runs. Everything is on `wave/leftovers`; nothing has been pushed.
+four hardware smoke runs. Everything is on `wave/leftovers`, pushed, as pull request #37 with the six `closes` lines; CI runs on it; the merge is on GitHub.
 
 ## State
 
 - `main` is `0733868`, unchanged since the last handoff and equal to `origin/main`.
-- `wave/leftovers` is `f1d3b8b` plus the docs commit that carries this file. Twenty commits from
+- `wave/leftovers` is `f1d3b8b` plus three docs commits (D-entries and this file, `930f0de`; the memory bank, `044082e`; the README, `c8a10f5`) and the commit that records the push. Twenty board commits from
   the board (ten candidates, ten merges), 33 files, all delivered by `merge` into the local branch. The board's
   `integrationBranch` is `wave/leftovers` and its `worktreeBase` is `local-main` (set this session:
   `auto` wanted `origin/wave/leftovers`, which does not exist until the branch is pushed).
@@ -26,7 +26,7 @@ four hardware smoke runs. Everything is on `wave/leftovers`; nothing has been pu
 - Decisions D100 (JsonPipeline and the scheduler cleanups, #26), D101 (offered zero-argument calls,
   #22, with the exact-keys narrowing and an addendum for #25, #35, #19) and D102 (the backend-call fault
   tracker, #34, with its two follow-up fixes). `docs/FUTURE.md` has a dated 2026-09-13 section.
-- GitHub: nothing posted yet. #19, #22, #25, #26, #34 and #35 close from the PR body. #33, #24, #27,
+- GitHub: PR #37 (https://github.com/ookla-ariel-ride/npu-bridge/pull/37) carries the evidence and closes #19, #22, #25, #26, #34 and #35 on merge. #33, #24, #27,
   #28, #2, #11, #14 to #17 stay open.
 
 ## What shipped (all on the branch)
@@ -78,9 +78,7 @@ four hardware smoke runs. Everything is on `wave/leftovers`; nothing has been pu
 1. `/reload-plugins`, then dispatch SQ-30 (the readiness-loop fix), integrate it, and run
    `scripts/smoke.ps1 -Backend phi-silica` on the resulting tip. Expect all steps to pass; the
    queue-full step is the one to watch.
-2. Push `wave/leftovers`, open the PR with `closes #19`, `closes #22`, `closes #25`, `closes #26`,
-   `closes #34`, `closes #35` and the evidence lines (test count, the smoke runs, the 20/20 probe), let
-   CI run, merge on GitHub, then repoint the board's `integrationBranch` to `main` and reset local
+2. When SQ-30 has landed and its smoke is clean, push again so PR #37 carries it; check CI on the PR, merge on GitHub, then repoint the board's `integrationBranch` to `main` and reset local
    `main` to `origin/main`. Post the SQ-29 and whole-branch review deferrals as one sanitized comment
    on #34 (the fault-attribution notes) and #14 (the two wall-clock tests).
 3. After the merge, in the same session: this file, `memory-bank/`, and the status line in
