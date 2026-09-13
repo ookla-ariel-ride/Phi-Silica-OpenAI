@@ -79,6 +79,7 @@ internal sealed class CompletionsStreamEndpoint
 
         var queueWaitMs = 0.0;
         var generationAttempted = false;
+        var outcomeClassified = false;
 
         // Published from *inside* the scheduled closure -- see the type-level remarks and
         // ChatCompletionsStreamEndpoint's fuller account of why (D43 + D51).
@@ -255,6 +256,7 @@ internal sealed class CompletionsStreamEndpoint
             }
 
             var outcome = GenerationOutcome.Classify(result, cancelledByCut, generationHealth, totalMs);
+            outcomeClassified = true;
             if (outcome.Failure is { } failure)
             {
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
@@ -322,7 +324,7 @@ internal sealed class CompletionsStreamEndpoint
         }
         catch (Exception ex)
         {
-            var failure = GenerationFailure.FromException(ex, generationAttempted ? generationHealth : null, stopwatch.Elapsed.TotalMilliseconds);
+            var failure = GenerationFailure.FromException(ex, generationAttempted && !outcomeClassified ? generationHealth : null, stopwatch.Elapsed.TotalMilliseconds);
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
                 status: ex.GetType().Name, finish: "-",
                 httpStatus: sse.Started ? StatusCodes.Status200OK : failure.StatusCode,

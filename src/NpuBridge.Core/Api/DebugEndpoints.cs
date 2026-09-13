@@ -125,6 +125,7 @@ public static class DebugEndpoints
 
             IModelContext? context = null;
             var generationAttempted = false;
+            var outcomeClassified = false;
             try
             {
                 var systemTextFailure = SystemTextGuard.RefusalFor(backend, request.System, includesToolDefinitions: false);
@@ -155,6 +156,7 @@ public static class DebugEndpoints
                 if (!http.RequestAborted.IsCancellationRequested)
                 {
                     _ = GenerationOutcome.Classify(result, cancelledByCut: false, health: generationHealth, durationMs: totalMs);
+                    outcomeClassified = true;
                 }
                 var ttftMs = callbacks == 0 ? totalMs : firstTokenTicks * 1000.0 / Stopwatch.Frequency;
                 var decodeMs = totalMs - ttftMs;
@@ -179,7 +181,7 @@ public static class DebugEndpoints
             {
                 return GenerationFailure.FromException(
                     ex,
-                    generationAttempted ? generationHealth : null,
+                    generationAttempted && !outcomeClassified ? generationHealth : null,
                     stopwatch.Elapsed.TotalMilliseconds).ToResult();
             }
             finally

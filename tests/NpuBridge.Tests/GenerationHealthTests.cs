@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using NpuBridge.Backends.Fake;
+using NpuBridge.Tokenizers;
 
 namespace NpuBridge.Tests;
 
@@ -39,7 +40,8 @@ public class GenerationHealthTests
         {
             FailAfterTokens = 0,
             FailureException = new InvalidOperationException("RPC unavailable"),
-            Responder = _ => ["abcdefgh"],
+            Responder = _ => ["abcdefgh", " still generating"],
+            TokenDelay = TimeSpan.FromMilliseconds(20),
         };
         var fake = new FakeBackend(options);
         await using var host = await BridgeTestHost.StartAsync(fake);
@@ -71,6 +73,8 @@ public class GenerationHealthTests
         var afterSuccess = await ReadHealthAsync(host);
 
         Assert.Equal(HttpStatusCode.OK, recovered.StatusCode);
+        using var recoveredDocument = JsonDocument.Parse(await recovered.Content.ReadAsStringAsync());
+        Assert.Equal("length", recoveredDocument.RootElement.GetProperty("choices")[0].GetProperty("finish_reason").GetString());
         Assert.Equal(HttpStatusCode.OK, afterSuccess.StatusCode);
         Assert.Equal("ready", afterSuccess.Body.GetProperty("status").GetString());
         Assert.Equal(0, afterSuccess.Body.GetProperty("consecutive_backend_faults").GetInt32());
@@ -147,6 +151,25 @@ public class GenerationHealthTests
     }
 
     [Fact]
+    public async Task Post_generation_bridge_exception_does_not_replace_a_successful_health_outcome()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            TokenCounter = new ThrowingTokensCoveringCounter(),
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await PostChatAsync(host, ChatBody.User());
+        var health = await ReadHealthAsync(host);
+
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        Assert.Equal(0, health.Body.GetProperty("consecutive_backend_faults").GetInt32());
+        Assert.Equal("ok", health.Body.GetProperty("last_generation").GetProperty("outcome").GetString());
+        host.AssertNoLeak();
+    }
+
+    [Fact]
     public async Task Backend_calls_before_generation_record_faults_and_a_success_clears_them()
     {
         var options = new FakeBackendOptions
@@ -192,5 +215,19 @@ public class GenerationHealthTests
         var response = await host.Client.GetAsync("/healthz");
         using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         return (response.StatusCode, document.RootElement.Clone());
+    }
+
+    private sealed class ThrowingTokensCoveringCounter : ITokenCounter
+    {
+        public string Name => CharEstimateTokenCounter.Instance.Name;
+
+        public bool PrefixStable => CharEstimateTokenCounter.Instance.PrefixStable;
+
+        public int Count(string text) => CharEstimateTokenCounter.Instance.Count(text);
+
+        public int IndexAtTokenCount(string text, int tokens, out int totalTokens) =>
+            CharEstimateTokenCounter.Instance.IndexAtTokenCount(text, tokens, out totalTokens);
+
+        public int TokensCovering(string text, int prefixChars) => throw new InvalidOperationException("post-generation usage failure");
     }
 }

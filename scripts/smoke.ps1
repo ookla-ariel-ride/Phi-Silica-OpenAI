@@ -1378,7 +1378,7 @@ tokenizer on phi-silica; these ratios are both assumptions checked on one real g
     }
 
     InfoStep 'final generation health' {
-        $health = Get-Json '/healthz'
+        $health = Get-Json '/healthz' -expect 200,503
         "last_generation=$($health.last_generation | ConvertTo-Json -Compress -Depth 5) consecutive_backend_faults=$($health.consecutive_backend_faults)"
     }
 } finally {

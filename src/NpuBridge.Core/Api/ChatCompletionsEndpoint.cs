@@ -115,7 +115,9 @@ internal sealed class ChatCompletionsEndpoint
         // clauses, which run for a throw at any point including before scheduling, can still log the
         // best value they have.
         var queueWaitMs = 0.0;
+        var elapsed = Stopwatch.StartNew();
         var generationAttempted = false;
+        var outcomeClassified = false;
 
         try
         {
@@ -321,6 +323,7 @@ internal sealed class ChatCompletionsEndpoint
             // shapes cannot describe the same generation differently. See GenerationOutcome for why the
             // cut is consulted as the flag recorded at the cancel rather than as the cutter's state.
             var outcome = GenerationOutcome.Classify(result, cancelledByCut, generationHealth, totalMs);
+            outcomeClassified = true;
 
             if (outcome.Failure is { } failure)
             {
@@ -416,7 +419,7 @@ internal sealed class ChatCompletionsEndpoint
         // answered the identical event with a 502 and the ordinary error body.
         catch (Exception ex)
         {
-            var failure = GenerationFailure.FromException(ex, generationAttempted ? generationHealth : null);
+            var failure = GenerationFailure.FromException(ex, generationAttempted && !outcomeClassified ? generationHealth : null, elapsed.Elapsed.TotalMilliseconds);
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
                 status: ex.GetType().Name, finish: "-", httpStatus: failure.StatusCode,
                 cache: CacheLabel(lease), tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns,

@@ -86,7 +86,9 @@ internal sealed class CompletionsEndpoint
         // ChatCompletionsEndpoint's fuller account of why (D43 + D51, chunk 8 fix round 1).
         ContextLease? lease = null;
         var queueWaitMs = 0.0;
+        var elapsed = Stopwatch.StartNew();
         var generationAttempted = false;
+        var outcomeClassified = false;
 
         try
         {
@@ -207,6 +209,7 @@ internal sealed class CompletionsEndpoint
             // same reply and finish reason regardless of which endpoint asked for it.
             var cut = limits.Cut(result.Text);
             var outcome = GenerationOutcome.Classify(result, cancelledByCut, generationHealth, totalMs);
+            outcomeClassified = true;
 
             if (outcome.Failure is { } failure)
             {
@@ -256,7 +259,7 @@ internal sealed class CompletionsEndpoint
         }
         catch (Exception ex)
         {
-            var failure = GenerationFailure.FromException(ex, generationAttempted ? generationHealth : null);
+            var failure = GenerationFailure.FromException(ex, generationAttempted && !outcomeClassified ? generationHealth : null, elapsed.Elapsed.TotalMilliseconds);
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
                 status: ex.GetType().Name, finish: "-", httpStatus: failure.StatusCode,
                 cache: CacheLabel(lease), tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns,

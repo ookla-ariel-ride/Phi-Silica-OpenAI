@@ -18,28 +18,6 @@ public sealed class GenerationHealth
         _time = time;
     }
 
-    public GenerationHealthSnapshot? LastGeneration
-    {
-        get
-        {
-            lock (_gate)
-            {
-                return _lastGeneration;
-            }
-        }
-    }
-
-    public int ConsecutiveBackendFaults
-    {
-        get
-        {
-            lock (_gate)
-            {
-                return _consecutiveBackendFaults;
-            }
-        }
-    }
-
     public GenerationHealthState Snapshot
     {
         get
