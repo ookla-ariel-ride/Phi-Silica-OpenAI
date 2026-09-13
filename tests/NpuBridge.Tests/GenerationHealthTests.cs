@@ -281,6 +281,37 @@ public class GenerationHealthTests
         host.AssertNoLeak();
     }
 
+    [Theory]
+    [InlineData("/v1/chat/completions")]
+    [InlineData("/v1/completions")]
+    public async Task Cutter_tokenizer_failure_cancels_a_gated_generation_before_its_next_delta(string path)
+    {
+        var deltaGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            TokenCounter = new ThrowingIndexAtTokenCountCounter(),
+            Responder = _ => Enumerable.Repeat("done ", 200),
+            DeltaGate = deltaGate,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+        object body = path == "/v1/chat/completions"
+            ? new { model = "fake", messages = new[] { new { role = "user", content = "chat json" } }, max_tokens = 1 }
+            : new { model = "fake", prompt = "completions json", max_tokens = 1 };
+
+        var responseTask = host.Client.PostAsJsonAsync(path, body);
+        await TestWait.UntilAsync(() => fake.DeltasEmitted == 1);
+        await TestWait.UntilAsync(() => fake.CancellationsObserved == 1);
+        deltaGate.SetResult();
+
+        using var response = await responseTask;
+        var health = await ReadHealthAsync(host);
+
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Equal(1, fake.DeltasEmitted);
+        Assert.Equal(0, health.Body.GetProperty("consecutive_backend_faults").GetInt32());
+        host.AssertNoLeak();
+    }
+
     [Fact]
     public async Task Create_context_failures_count_as_backend_faults_on_every_generation_shape()
     {
