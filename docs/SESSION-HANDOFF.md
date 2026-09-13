@@ -26,7 +26,7 @@ four hardware smoke runs. Everything is on `wave/leftovers`, pushed, as pull req
 - Decisions D100 (JsonPipeline and the scheduler cleanups, #26), D101 (offered zero-argument calls,
   #22, with the exact-keys narrowing and an addendum for #25, #35, #19) and D102 (the backend-call fault
   tracker, #34, with its two follow-up fixes). `docs/FUTURE.md` has a dated 2026-09-13 section.
-- GitHub: PR #37 (https://github.com/ookla-ariel-ride/npu-bridge/pull/37) carries the evidence and closes #19, #22, #25, #26, #34 and #35 on merge. #33, #24, #27,
+- GitHub: PR #37 (https://github.com/ookla-ariel-ride/npu-bridge/pull/37) carries the evidence and closes #19, #22, #25, #26, #34 and #35 on merge. CI is green on all four checks after one rerun: the pull-request build of `a1c0356` failed once on `DebugGenerateTests.Client_disconnect_cancels_and_disposes_the_context` (`Assert.Single` on an empty call list: a 150 ms cancel against 20 ms token delays, so the slow runner cancelled before the first backend call) while the push build of the same commit passed. That test and its chat twin are the two wall-clock disconnect tests the SQ-29 review named; filed as SQ-31 (gate both on `DeltaGate`), not dispatched because the board MCP is down. #33, #24, #27,
   #28, #2, #11, #14 to #17 stay open.
 
 ## What shipped (all on the branch)
@@ -75,7 +75,7 @@ four hardware smoke runs. Everything is on `wave/leftovers`, pushed, as pull req
 
 ## Do this next
 
-1. `/reload-plugins`, then dispatch SQ-30 (the readiness-loop fix), integrate it, and run
+1. `/reload-plugins`, then dispatch SQ-30 (the readiness-loop fix) and SQ-31 (the two gated disconnect tests), integrate them, and run
    `scripts/smoke.ps1 -Backend phi-silica` on the resulting tip. Expect all steps to pass; the
    queue-full step is the one to watch.
 2. When SQ-30 has landed and its smoke is clean, push again so PR #37 carries it; check CI on the PR, merge on GitHub, then repoint the board's `integrationBranch` to `main` and reset local
