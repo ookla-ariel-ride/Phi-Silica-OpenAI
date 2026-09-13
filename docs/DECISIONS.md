@@ -1932,3 +1932,10 @@ Automatic model recreation is deferred. D94 records two wedges with different re
 cleared after several minutes, while the other persisted until restart. Recreating a shared model handle
 without knowing whether those are one fault could make the self-healing case worse. The degraded state
 is the trigger to evaluate if later evidence establishes a safe policy.
+
+**2026-09-13 addendum.** An exception from any backend call inside a scheduled attempt, including
+`CreateContext`, `GetUsablePromptLength`, and `GenerateAsync`, is a backend fault; a preflight that
+returns a refusal is not. At 00:28, a fresh bridge reported `/healthz` ready after a 14 s load, then its
+first generation took 1,580 ms and returned 502 `The RPC server is unavailable`. Twenty-six more calls
+returned 502 in 3 to 16 ms. The Application log had no `WorkloadsSessionHost` crash, and no oversized
+prompt had been sent.
