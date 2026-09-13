@@ -80,8 +80,8 @@ tool-detection path would be a caller of it and not a third copy, and the three 
 from the 2026-09-10 review (D82; issue #10 closed), taken in the same window because two of them sat
 in the files D81 had just rewritten. Chunk 7 then landed the same day, and chunk 8 the next, which
 completes the plan. **All eight chunks are built and merged as of 2026-09-12.** Remaining work is
-tracked as GitHub issues rather than chunks: #24 to #28 from chunk 8's own review, #29 to #31 from the
-issue #21 measurement (#29 is the model-host crash guard), #14 to #16 from the coverage audit, #17,
+tracked as GitHub issues rather than chunks: #24 to #28 from chunk 8's own review, #33 to #35 left by the
+2026-09-13 wave that shipped #29 to #31 (D97 to D99), #14 to #16 from the coverage audit, #17,
 #19, #22, and #2 and #11 for Aion.
 
 ## Repository

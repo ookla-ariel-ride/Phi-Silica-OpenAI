@@ -1,13 +1,18 @@
 # Active Context: npu-bridge
 
-_Last updated: 2026-09-12 (evening), after PR #32 (issue #21 measured, D93 to D96) was fast-forward
-merged. **All eight chunks of `docs/PLAN.md` are built and merged; the plan is complete.** Work from
-here is GitHub issues, not chunks._
+_Last updated: 2026-09-13 (early morning), after the first Sidequest wave shipped issues #29, #30 and
+#31 (D97 to D99). **All eight chunks of `docs/PLAN.md` are built and merged; the plan is complete.**
+Work from here is GitHub issues, run as Sidequest waves; `docs/SESSION-HANDOFF.md` has how the board
+ran and what it taught._
 
 ## Where we are
-`main` is on the PR #32 fast-forward merge, in sync with origin. 932 tests pass (CI on PR #32,
-2026-09-12; not run locally that day because a live bridge held the exe), the solution builds with no
-warnings, CI is green. PR #32 changed no product code: `scripts/tool-probe.ps1` plus documents.
+`main` carries the #29/#30/#31 wave (merged by the board on 2026-09-13; see the handoff for the
+commit list) on top of the PR #32 merge. 950 tests pass (the board's integration gate on `7a3207c`,
+2026-09-13), the solution builds with no warnings. `smoke.ps1 -Backend phi-silica` passed on the merged
+tree on 2026-09-13 (all steps, 0 skipped, 6 informational): the new guard step refused a 32,000-character
+system text counted offline at 13,421 tokens before any context, `/healthz` reported
+`context_window_tokens` 3581 and the D80 step measured 3581, and the final health line showed the D55
+cross-check's runtime `Error` recorded as one backend fault, not degraded. Earlier that night:
 `smoke.ps1 -Backend phi-silica` passed at the merge (28 PASS / 0 FAIL / 0 SKIP / 5 INFO, first
 attempt, no RPC flake) and again on 2026-09-12 after the folder rename and identity re-register:
 all steps passed, 0 skipped, 5 informational, no FAIL or WARN rows, `identity=True`, `queue_depth`
@@ -129,6 +134,11 @@ No chunk is outstanding. What remains is issues.
   parsing.** It exposed #29 (an over-large system prompt fail-fasts the Windows model host and wedges
   the NPU machine-wide), #30 (`/healthz` says ready throughout) and #31 (the streamed shape is
   unmeasured).
+- **#29, #30, #31:** shipped 2026-09-13 (D97 to D99; closed with their evidence on GitHub). Left
+  behind: #33 (the model answered a tool round trip's second turn with an empty `tool_calls` fence,
+  delivered as content), #34 (the healthz recorder's armed window still covers in-process work before
+  classification, plus five smaller items) and #35 (the guard's analyzer gate, the one-token window
+  cross-check tolerance, the untested null window, layering, the zero-margin smoke probe).
 - **#22:** an unwrapped zero-argument call reads as content. Accepted in D83, not a defect.
 - **#11:** Aion 1.0 Plan — native tool calling would bypass chunk 7's emulation; still no SDK.
 - **#2:** the Aion hardware half, blocked on the OS (D70).

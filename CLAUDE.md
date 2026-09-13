@@ -15,13 +15,14 @@ bypass the tool-call emulation rather than use it.
 
 **All eight chunks of `docs/PLAN.md` are built and merged; there is no next chunk.** Work from here
 is GitHub issues. `docs/PLAN.md` is the signed-off design; `docs/DECISIONS.md` records why things are
-the way they are, decision by decision (D1 to D96), and is where the chunk-by-chunk history this
+the way they are, decision by decision (D1 to D99), and is where the chunk-by-chunk history this
 section used to duplicate actually lives; `docs/SESSION-HANDOFF.md` carries the current state and
 what to do next; `docs/FUTURE.md` holds deferred work. Read the handoff first; update DECISIONS and
 FUTURE whenever work changes a choice or defers something.
 
-Current state: 932 tests pass (last confirmed by CI on 2026-09-12), `smoke.ps1 -Backend phi-silica` passes clean on hardware, and the
-repository is `ookla-ariel-ride/npu-bridge`.
+Current state: 950 tests pass (last run by the Sidequest integration gate on `7a3207c`, 2026-09-13), `smoke.ps1 -Backend phi-silica`
+passes clean on hardware (2026-09-13: all steps, 0 skipped, 6 informational; `/healthz` `context_window_tokens` 3581 matched the
+measured D80 boundary exactly), and the repository is `ookla-ariel-ride/npu-bridge`.
 
 Standing facts that will cost you a session if you do not know them:
 
@@ -43,8 +44,9 @@ Standing facts that will cost you a session if you do not know them:
   can use this bridge at all. Compliance below that boundary is near-perfect; the window is the
   constraint, not the model's protocol discipline.
 
-Open issues carry the rest: #24 to #28 are chunk 8's known leftovers, #29 to #31 came out of the
-issue #21 measurement (#29 is the serious one — see the crash warning under Commands), and #2, #11,
+Open issues carry the rest: #24 to #28 are chunk 8's known leftovers; #29 to #31 (the issue #21
+findings) shipped on 2026-09-13 as D97 to D99 and left #33 (an empty `tool_calls` fence delivered as
+content), #34 (healthz fault-attribution leftovers) and #35 (system-text guard leftovers); #2, #11,
 #14 to #17, #19 and #22 are longer-running.
 
 ## Machine reality
