@@ -144,7 +144,33 @@ public class SystemTextGuardTests
     [Fact]
     public async Task Folded_system_text_is_left_to_the_prompt_preflight()
     {
-        var fake = new FakeBackend(new FakeBackendOptions { ContextWindowTokens = 100 });
+        var preflightCalls = 0;
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            MaxPromptChars = 100,
+            OnPreflight = _ => preflightCalls++,
+        });
+        var options = new BridgeOptions { Backend = BackendKind.Fake, SystemPromptPlacement = SystemPromptPlacement.Prompt };
+        await using var host = await BridgeTestHost.StartAsync(fake, options);
+
+        var response = await PostChatAsync(host, new string('s', 500));
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var error = await ErrorAsync(response);
+        Assert.Equal("context_length_exceeded", error.GetProperty("code").GetString());
+        Assert.Contains(
+            "Backend 'fake' can take 100 characters of the 598-character prompt; the transcript is 598 characters over 1 turn(s).",
+            error.GetProperty("message").GetString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("Native system text alone", error.GetProperty("message").GetString(), StringComparison.Ordinal);
+        Assert.True(preflightCalls >= 1);
+        Assert.Equal(1, fake.ContextsCreated);
+        Assert.Equal(1, fake.ContextsDisposed);
+        host.AssertNoLeak();
+    }
+
+    [Fact]
+    public async Task Folded_system_text_uses_no_native_system_context_when_the_prompt_fits()
+    {
+        var fake = new FakeBackend();
         var options = new BridgeOptions { Backend = BackendKind.Fake, SystemPromptPlacement = SystemPromptPlacement.Prompt };
         await using var host = await BridgeTestHost.StartAsync(fake, options);
 
