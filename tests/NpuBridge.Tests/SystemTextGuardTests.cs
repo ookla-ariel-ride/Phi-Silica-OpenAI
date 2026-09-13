@@ -1,9 +1,12 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using NpuBridge.Api;
 using NpuBridge.Backends;
 using NpuBridge.Backends.Fake;
 using NpuBridge.Configuration;
+using NpuBridge.Tokenizers;
 
 namespace NpuBridge.Tests;
 
@@ -28,6 +31,23 @@ public class SystemTextGuardTests
             },
         },
     ];
+
+    private sealed class FixedTokenCountCounter : ITokenCounter
+    {
+        public string Name => "fixed";
+
+        public bool PrefixStable => true;
+
+        public int Count(string text) => 32_001;
+
+        public int IndexAtTokenCount(string text, int tokens, out int totalTokens)
+        {
+            totalTokens = Count(text);
+            return text.Length;
+        }
+
+        public int TokensCovering(string text, int prefixChars) => Count(text);
+    }
 
     [Fact]
     public async Task Token_window_refuses_native_system_text_before_context_creation_and_allows_smaller_text()
@@ -67,6 +87,34 @@ public class SystemTextGuardTests
         var accepted = await PostChatAsync(host, new string('s', 32_000));
         Assert.Equal(HttpStatusCode.OK, accepted.StatusCode);
         host.AssertNoLeak();
+    }
+
+    [Fact]
+    public void Refusal_messages_use_invariant_grouping_under_a_non_invariant_current_culture()
+    {
+        var original = CultureInfo.CurrentCulture;
+        try
+        {
+            CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("de-DE");
+            var backend = new FakeBackend(new FakeBackendOptions { ContextWindowTokens = 32_000 });
+
+            var characterFailure = SystemTextGuard.RefusalFor(backend, new string('s', 32_001), includesToolDefinitions: false);
+            var tokenBackend = new FakeBackend(new FakeBackendOptions
+            {
+                ContextWindowTokens = 32_000,
+                TokenCounter = new FixedTokenCountCounter(),
+            });
+            var tokenFailure = SystemTextGuard.RefusalFor(tokenBackend, "s", includesToolDefinitions: false);
+
+            Assert.Contains("32,000-character safety ceiling: 32,001 characters.", characterFailure!.Body.Error.Message,
+                StringComparison.Ordinal);
+            Assert.Contains("32,001 tokens fills the 32,000-token usable window.", tokenFailure!.Body.Error.Message,
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = original;
+        }
     }
 
     [Fact]

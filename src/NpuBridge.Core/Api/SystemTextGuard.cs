@@ -1,3 +1,4 @@
+using System.Globalization;
 using NpuBridge.Backends;
 
 namespace NpuBridge.Api;
@@ -26,7 +27,8 @@ internal static class SystemTextGuard
         if (nativeSystemText.Length > NativeSystemTextCharacterCeiling)
         {
             return Overflow(
-                $"Native system text alone exceeds the {NativeSystemTextCharacterCeiling:N0}-character safety ceiling: {nativeSystemText.Length:N0} characters.",
+                string.Create(CultureInfo.InvariantCulture,
+                    $"Native system text alone exceeds the {NativeSystemTextCharacterCeiling:N0}-character safety ceiling: {nativeSystemText.Length:N0} characters."),
                 includesToolDefinitions);
         }
 
@@ -36,7 +38,8 @@ internal static class SystemTextGuard
             if (systemTokens >= windowTokens)
             {
                 return Overflow(
-                    $"Native system text alone exceeds the context window: {systemTokens:N0} tokens fills the {windowTokens:N0}-token usable window.",
+                    string.Create(CultureInfo.InvariantCulture,
+                        $"Native system text alone exceeds the context window: {systemTokens:N0} tokens fills the {windowTokens:N0}-token usable window."),
                     includesToolDefinitions);
             }
         }
