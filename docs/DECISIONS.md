@@ -1914,6 +1914,13 @@ truncated-turns header. Folded placement is unchanged: its system text is part o
 continues through the existing preflight. Rendered tool definitions are part of native system text, and
 the refusal says so when they contributed to the count.
 
+**2026-09-12 addendum.** The guard now runs in `ChatRequestPreparer`, before a request enters
+`GenerationScheduler`. A busy queue therefore returns the normal HTTP 400 without taking a slot or
+changing the rolling duration that sets `Retry-After`. `PhiSilicaBackend.CreateContext` also checks the
+same ceiling for direct adapter callers. `/healthz` exposes `context_window_tokens`, and the D80 smoke
+step compares it with the measured boundary on hardware. The native-system smoke step sends at most
+32,000 characters; unit tests cover the character ceiling.
+
 **D98. Health reflects generation outcomes, not a probe.** Issue #30 found a Phi Silica process that
 still reported `ready` after generations had stopped reaching the model. `/healthz` now records real
 terminal generation outcomes: a backend exception, `Error`, or an unrequested `Cancelled` is a backend

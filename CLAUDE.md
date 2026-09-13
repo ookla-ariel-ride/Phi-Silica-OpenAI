@@ -166,6 +166,7 @@ context is in the cache or disposed, never both, never neither.
 HTTP → ChatRequestPreparer (shared by both shapes, and by /v1/completions after the model-id check):
        body → validate DTO → backend readiness
      → ignored-parameter warnings → placement → PromptTemplate (messages → system + transcript)
+     → native system guard (character ceiling and context-window tokens) → 400 context_length_exceeded
      → OutputLimits (max_tokens/stop) → PreparedChatRequest
      → GenerationScheduler.ScheduleAsync: bounded queue (--queue-capacity), one worker
          queue full      → 429 + Retry-After (depth x rolling mean), rate_limit_error/queue_full
@@ -336,15 +337,15 @@ Live today:
   `x-npu-bridge-truncated-turns: N` (turns dropped) to the response once a generation is attempted on
   the truncated transcript; the 400 refusal carries no header. On a stream that had already sent
   a keep-alive when a status-driven truncation happened, the header cannot be sent and the log says so.
-- **Native system-text guard (D97).** On a cache miss with native placement, the bridge refuses a system text before `CreateContext` when it exceeds 32,000 characters or a backend's known usable context window in tokens. It uses the same 400 `context_length_exceeded` envelope, does not create a context, and does not retry with `--truncate-history`; folded placement remains governed by the normal preflight.
+- **Native system-text guard (D97).** During preparation, before the scheduler, the bridge refuses native system text when it exceeds 32,000 characters or a backend's known usable context window in tokens. It uses the same 400 `context_length_exceeded` envelope, takes no queue slot, does not create a context, and does not retry with `--truncate-history`; folded placement remains governed by the normal preflight.
 - **The context cache** (D71, D72): a request whose transcript extends a cached prefix (ending in an
   assistant turn, longest match wins) generates on that context with only the tail rendered, in the
   marker format; a context goes back in only after a `Complete`, uncut generation, under the key of
   the transcript plus the reply. `usage.prompt_tokens` estimates the whole transcript on a hit and a
   miss alike; the log line's `prompt_chars` is what was sent, and it also carries `cache=hit|miss`,
   `tail_turns=N` and `truncated_turns=N`. `/healthz` reports `contexts_cached`,
-  `context_cache_capacity`, `context_cache_hits`, `context_cache_misses`, `last_generation` and
-  `consecutive_backend_faults`. It returns `503 degraded` after two consecutive backend faults while
+  `context_cache_capacity`, `context_cache_hits`, `context_cache_misses`, `last_generation`,
+  `consecutive_backend_faults` and `context_window_tokens`. It returns `503 degraded` after two consecutive backend faults while
   still admitting requests, so a later successful generation can clear the state.
 - Token counts in `usage` are the backend's counter's (D80): Phi-3 tokens on Phi Silica, `ceil(chars/4)`
   on Aion and the fake (D44). `prompt_tokens` counts the whole rendered transcript plus the native
