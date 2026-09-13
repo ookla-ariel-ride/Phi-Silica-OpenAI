@@ -4,16 +4,16 @@ using NpuBridge.Backends;
 namespace NpuBridge.Api;
 
 /// <summary>Refuses native system text that would make creating a model context unsafe or useless.</summary>
-internal static class SystemTextGuard
+public static class SystemTextGuard
 {
     // D94 / issue #29: CreateContext crashes the Windows model host above the measured boundary.
-    internal const int NativeSystemTextCharacterCeiling = 32_000;
+    public const int NativeSystemTextCharacterCeiling = 32_000;
 
     /// <summary>
     /// Returns the normal prompt-overflow failure before a native system text reaches
     /// <see cref="ILanguageModelBackend.CreateContext"/>, or <c>null</c> when it is safe to create.
     /// </summary>
-    public static GenerationFailure? RefusalFor(
+    internal static GenerationFailure? RefusalFor(
         ILanguageModelBackend backend,
         string? nativeSystemText,
         bool includesToolDefinitions,
