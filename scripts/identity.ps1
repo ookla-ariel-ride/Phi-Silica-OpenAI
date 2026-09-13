@@ -183,7 +183,9 @@ function Install-ManifestDependencies {
 }
 
 function Get-RegisteredPackage {
-    Get-AppxPackage -Name $identityName -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1
+    Get-AppxPackage -Name $identityName -ErrorAction SilentlyContinue |
+        Sort-Object { try { [version]$_.Version } catch { [version]'0.0' } } -Descending |
+        Select-Object -First 1
 }
 
 function Show-Status {
@@ -245,9 +247,8 @@ switch ($PSCmdlet.ParameterSetName) {
         # Register first, remove the old registration afterwards. The other order -- which this was --
         # leaves the machine with no package at all whenever Add-AppxPackage fails, and then
         # `--backend phi-silica` cannot start ("no package is registered") until someone works out that
-        # the install is what broke it. Add-AppxPackage updates a registration of the same identity in
-        # place, so the usual path never removes anything; the remove below is for the case where the
-        # new package full name differs from the old one (a version bump), which leaves both.
+        # the install is what broke it. Add-AppxPackage normally replaces the registration on a version
+        # bump; remove the old package only if that registration was left behind.
         $existing = Get-RegisteredPackage
         Write-Step "Registering package with external location $BinDir"
         try {
@@ -269,8 +270,12 @@ switch ($PSCmdlet.ParameterSetName) {
         if ($existing) {
             $current = Get-RegisteredPackage
             if ($current -and $current.PackageFullName -ne $existing.PackageFullName) {
-                Write-Step "Removing superseded $($existing.PackageFullName)"
-                Remove-AppxPackage -Package $existing.PackageFullName
+                $stillRegistered = Get-AppxPackage -Name $identityName -ErrorAction SilentlyContinue |
+                    Where-Object { $_.PackageFullName -eq $existing.PackageFullName }
+                if ($stillRegistered) {
+                    Write-Step "Removing superseded $($existing.PackageFullName)"
+                    Remove-AppxPackage -Package $existing.PackageFullName -ErrorAction SilentlyContinue
+                }
             }
         }
 
