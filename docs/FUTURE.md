@@ -55,6 +55,32 @@ land here instead of widening the chunk. Each entry says where it came from and 
   `Task.WaitAsync` uses today, which is a production change and so out of scope for a coverage-only
   task. A genuine client-disconnect mid-stream is covered on both endpoints as of task 3b (fix round 1).
 
+## 2026-09-13 wave leftovers (issues #29, #30, #31)
+
+- **An empty `tool_calls` fence reaches the client as content** (issue #33, D99). On the second turn
+  of a tool round trip the model answered with a fenced `{"tool_calls": []}` and nothing else;
+  `ToolCallParser` correctly treats an empty array as no call, so the client got the fence as prose
+  with `finish_reason: stop`. Options: strip a reply that is nothing but an empty fence (hides what the
+  model did), or document that clients treat it as "no answer" and re-ask. Either way the tool block's
+  instructions could tell the model to answer in prose when no tool applies; one `tool-probe.ps1` cell
+  would measure whether that removes it.
+- **`/healthz` fault attribution leftovers** (issue #34, from the second review of the #30 fix). The
+  armed window that makes a `CreateContext` throw count as a backend fault also covers in-process work
+  before classification (the cut, the raw-output log, the tokenizer calls in the session lookup and the
+  system-text guard), so a bridge-internal throw there after a good generation is labelled
+  `backend_fault`; closing it means the recorder learning "a backend call was made" from
+  `ConversationSession`. Also: an SSE write failure ahead of `RequestAborted` can record a fault (a
+  narrow pre-existing race); the cut-counts-as-success test reaches the cut-cancelled branch only
+  probabilistically and needs a mid-generation gate on `FakeBackend` (D54); `duration_ms` is 0 for the
+  scheduler-routed cancellation fault and the JSON shapes' fault duration includes the queue wait;
+  ten other `/healthz` reads in `smoke.ps1` still expect only 200; no test pins that the #29 guard's
+  refusal records nothing, and the `CreateContext`-throw case is pinned on the chat JSON shape only.
+- **Serena is unusable by concurrent worktree executors** (observed 2026-09-12 during this wave). The
+  serena MCP server is one process per session with one active project; three Sidequest executors in
+  separate worktrees all edited through it and every edit landed in whichever worktree had activated
+  serena last. Until the upstream fix, dispatch briefs forbid serena in executors; this session's
+  orchestrator still uses it for reads. Worth an upstream report on the Toolshed repository.
+
 ## 2026-09-11 test coverage audit
 
 Three subagent audits (options against tests, the uncovered lines of a coverlet report, the smoke
