@@ -89,6 +89,11 @@ public sealed partial class FakeBackend : ILanguageModelBackend
     {
         ThrowIfDisposed();
         ThrowIfNotInitialized();
+        if (_options.CreateContextFailure is { } createContextFailure)
+        {
+            throw createContextFailure;
+        }
+
         var id = $"fake-ctx-{Interlocked.Increment(ref _nextContextId)}";
         Interlocked.Increment(ref _contextsCreated);
         var effectiveSystem = Capabilities.HasFlag(BackendCapabilities.SystemPromptContext) ? systemPrompt : null;
@@ -445,6 +450,9 @@ public sealed class FakeBackendOptions
     /// finally, standing immediately before the context is disposed — that trips it.
     /// </summary>
     public bool ThrowFromCancellationRegistration { get; set; }
+
+    /// <summary>Exception thrown when <see cref="FakeBackend.CreateContext"/> is called.</summary>
+    public Exception? CreateContextFailure { get; set; }
 
     /// <summary>
     /// When set, <see cref="FakeBackend.GetUsablePromptLength"/> throws this instead of answering,

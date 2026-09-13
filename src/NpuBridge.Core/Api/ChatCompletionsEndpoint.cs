@@ -139,6 +139,7 @@ internal sealed class ChatCompletionsEndpoint
                     // 7. The context: checked out of the cache when the transcript extends a cached
                     // prefix, created fresh otherwise, and refused here -- before a token is generated --
                     // when a backend with a preflight says the prompt does not fit (D55).
+                    generationAttempted = true;
                     var acquisition = session.Acquire();
                     if (acquisition.Failure is { } refused)
                     {
@@ -189,7 +190,6 @@ internal sealed class ChatCompletionsEndpoint
                         var watcher = limits.IsEmpty ? null : new CutWatcher(limits);
                         var sink = DeltaSink.ToWatcher(stopwatch, watcher);
 
-                        generationAttempted = true;
                         var generation = backend.GenerateAsync(
                             attemptLease.Context,
                             attemptLease.Prompt,

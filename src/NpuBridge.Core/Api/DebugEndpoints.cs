@@ -133,10 +133,10 @@ public static class DebugEndpoints
                     return systemTextFailure.ToResult();
                 }
 
+                generationAttempted = true;
                 context = backend.CreateContext(request.System);
                 var usable = backend.GetUsablePromptLength(context, request.Prompt);
 
-                generationAttempted = true;
                 var result = await backend.GenerateAsync(
                     context,
                     request.Prompt,

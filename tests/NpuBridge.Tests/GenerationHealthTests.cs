@@ -146,6 +146,44 @@ public class GenerationHealthTests
         host.AssertNoLeak();
     }
 
+    [Fact]
+    public async Task Backend_calls_before_generation_record_faults_and_a_success_clears_them()
+    {
+        var options = new FakeBackendOptions
+        {
+            CreateContextFailure = new InvalidOperationException("CreateContext RPC unavailable"),
+        };
+        var fake = new FakeBackend(options);
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        Assert.Equal(HttpStatusCode.BadGateway, (await PostChatAsync(host, ChatBody.User())).StatusCode);
+        host.AssertNoLeak();
+        Assert.Equal(HttpStatusCode.BadGateway, (await PostChatAsync(host, ChatBody.User())).StatusCode);
+        host.AssertNoLeak();
+
+        var afterCreateFailures = await ReadHealthAsync(host);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, afterCreateFailures.StatusCode);
+        Assert.Equal("degraded", afterCreateFailures.Body.GetProperty("status").GetString());
+        Assert.Equal(2, afterCreateFailures.Body.GetProperty("consecutive_backend_faults").GetInt32());
+
+        options.CreateContextFailure = null;
+        options.PreflightFailure = new InvalidOperationException("Preflight RPC unavailable");
+        Assert.Equal(HttpStatusCode.BadGateway, (await PostChatAsync(host, ChatBody.User())).StatusCode);
+        host.AssertNoLeak();
+
+        var afterPreflightFailure = await ReadHealthAsync(host);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, afterPreflightFailure.StatusCode);
+        Assert.Equal(3, afterPreflightFailure.Body.GetProperty("consecutive_backend_faults").GetInt32());
+
+        options.PreflightFailure = null;
+        Assert.Equal(HttpStatusCode.OK, (await PostChatAsync(host, ChatBody.User())).StatusCode);
+        host.AssertNoLeak();
+
+        var recovered = await ReadHealthAsync(host);
+        Assert.Equal(HttpStatusCode.OK, recovered.StatusCode);
+        Assert.Equal(0, recovered.Body.GetProperty("consecutive_backend_faults").GetInt32());
+    }
+
     private static Task<HttpResponseMessage> PostChatAsync(BridgeTestHost host, object body) =>
         host.Client.PostAsJsonAsync("/v1/chat/completions", body);
 

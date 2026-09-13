@@ -95,6 +95,7 @@ internal sealed class CompletionsEndpoint
                 var stopwatch = Stopwatch.StartNew();
                 while (true)
                 {
+                    generationAttempted = true;
                     var acquisition = session.Acquire();
                     if (acquisition.Failure is { } refused)
                     {
@@ -114,7 +115,6 @@ internal sealed class CompletionsEndpoint
                         var watcher = limits.IsEmpty ? null : new CutWatcher(limits);
                         var sink = DeltaSink.ToWatcher(stopwatch, watcher);
 
-                        generationAttempted = true;
                         var generation = backend.GenerateAsync(
                             attemptLease.Context,
                             attemptLease.Prompt,

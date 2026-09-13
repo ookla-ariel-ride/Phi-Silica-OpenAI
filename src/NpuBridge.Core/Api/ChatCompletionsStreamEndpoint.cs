@@ -175,6 +175,7 @@ internal sealed class ChatCompletionsStreamEndpoint
             {
                 while (true)
                 {
+                    generationAttempted = true;
                     var acquisition = session.Acquire();
                     if (acquisition.Failure is { } refused)
                     {
@@ -196,7 +197,6 @@ internal sealed class ChatCompletionsStreamEndpoint
                         var generationCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                         Interlocked.Exchange(ref currentGenerationCts, generationCts)?.Dispose();
 
-                        generationAttempted = true;
                         var result = await prepared.Backend.GenerateAsync(
                             attemptLease.Context,
                             attemptLease.Prompt,
