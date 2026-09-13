@@ -45,6 +45,17 @@ public class HealthzTests
     }
 
     [Fact]
+    public async Task Ready_backend_with_unknown_context_window_writes_null()
+    {
+        await using var host = await BridgeTestHost.StartAsync(new FakeBackend());
+
+        var json = await ReadJson(await host.Client.GetAsync("/healthz"));
+
+        Assert.True(json.TryGetProperty("context_window_tokens", out var contextWindowTokens));
+        Assert.Equal(JsonValueKind.Null, contextWindowTokens.ValueKind);
+    }
+
+    [Fact]
     public async Task Loading_backend_reports_503_then_200_once_initialized()
     {
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

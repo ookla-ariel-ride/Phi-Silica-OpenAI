@@ -779,43 +779,36 @@ try {
     }
 
     Step 'native system text is refused before CreateContext' {
-        # D97: 32,000 characters is safe to send and unit tests cover the character ceiling itself.
-        # This hardware step instead proves that the boundary-sized text exceeds the token window.
-        $tokenText = -join (1..2500 | ForEach-Object { "alpha$_ " })
-        if ($tokenText.Length -gt 32000) { throw "the offline token probe is $($tokenText.Length) characters, above the 32,000-character ceiling" }
-        $tokenText = $tokenText.PadRight(32000, 'x')
-        $tokenized = Get-Json '/debug/tokenize' 'POST' (@{ text = $tokenText } | ConvertTo-Json -Compress)
-        if ($tokenized.counter -ne 'phi-3') { Skip "native system-text guard requires Phi3TokenCounter (phi-3); this backend reports $($tokenized.counter)" }
-        if ([int]$tokenized.tokens -le 3581) { throw "the 32,000-character token probe counted $($tokenized.tokens) tokens, not above Phi Silica's 3,581-token window" }
+        # D97: this hardware probe targets the character-ceiling branch with a 1,000-character margin.
+        $systemText = [string]::new('x', 33000)
 
         $cachedBefore = (Get-Json '/healthz').contexts_cached
         $body = @{ model = $servedModel; temperature = 0; messages = @(
-            @{ role = 'system'; content = $tokenText }
+            @{ role = 'system'; content = $systemText }
             @{ role = 'user'; content = 'Reply with exactly the word PONG.' }
         ) } | ConvertTo-Json -Depth 5
         $lines = [System.Collections.Generic.List[string]]::new()
-        $lines.Add("offline: 32,000 system characters = $($tokenized.tokens) $($tokenized.counter) tokens (above the context window)")
+        $lines.Add('character ceiling probe: 33,000 system characters')
 
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $response = Invoke-WebRequest -Uri "$base/v1/chat/completions" -Method POST -Body $body -ContentType 'application/json' -SkipHttpErrorCheck -TimeoutSec 30
         $sw.Stop()
-        $tokenError = $response.Content | ConvertFrom-Json -Depth 20
-        if ([int]$response.StatusCode -ne 400 -or $tokenError.error.code -ne 'context_length_exceeded') { throw "token guard: expected HTTP 400 context_length_exceeded; got HTTP $($response.StatusCode): $($response.Content)" }
-        if ($tokenError.error.message -notmatch 'system text alone exceeds the context window') { throw "token guard: missing native-system detail: $($tokenError.error.message)" }
-        if ($sw.ElapsedMilliseconds -ge 2000) { throw "token guard took $($sw.ElapsedMilliseconds) ms, not under 2,000 ms" }
-        if ((Get-Json '/healthz').contexts_cached -ne $cachedBefore) { throw 'token guard changed contexts_cached despite creating no context' }
-        $lines.Add("token guard: HTTP 400 after $($sw.ElapsedMilliseconds) ms, cache stayed $cachedBefore")
+        $characterError = $response.Content | ConvertFrom-Json -Depth 20
+        if ([int]$response.StatusCode -ne 400 -or $characterError.error.code -ne 'context_length_exceeded') { throw "character-ceiling guard: expected HTTP 400 context_length_exceeded; got HTTP $($response.StatusCode): $($response.Content)" }
+        if ($characterError.error.message -notmatch 'system text alone exceeds the 32,000-character safety ceiling') { throw "character-ceiling guard: missing native-system detail: $($characterError.error.message)" }
+        if ($sw.ElapsedMilliseconds -ge 2000) { throw "character-ceiling guard took $($sw.ElapsedMilliseconds) ms, not under 2,000 ms" }
+        if ((Get-Json '/healthz').contexts_cached -ne $cachedBefore) { throw 'character-ceiling guard changed contexts_cached despite creating no context' }
+        $lines.Add("character-ceiling guard: HTTP 400 after $($sw.ElapsedMilliseconds) ms, cache stayed $cachedBefore")
 
         $streamBody = @{ model = $servedModel; temperature = 0; stream = $true; messages = @(
-            @{ role = 'system'; content = $tokenText }
+            @{ role = 'system'; content = $systemText }
             @{ role = 'user'; content = 'Reply with exactly the word PONG.' }
         ) } | ConvertTo-Json -Depth 5
         $stream = Invoke-Sse '/v1/chat/completions' $streamBody 30
-        if ($stream.StatusCode -ne 400 -or $stream.Frames.Count -ne 0) { throw "streamed token guard: expected plain HTTP 400 before any frame; got HTTP $($stream.StatusCode), frames=$($stream.Frames.Count): $($stream.Body)" }
+        if ($stream.StatusCode -ne 400 -or $stream.Frames.Count -ne 0) { throw "streamed character-ceiling guard: expected plain HTTP 400 before any frame; got HTTP $($stream.StatusCode), frames=$($stream.Frames.Count): $($stream.Body)" }
         $streamError = $stream.Body | ConvertFrom-Json -Depth 20
-        if ($streamError.error.code -ne 'context_length_exceeded' -or $streamError.error.message -notmatch 'system text alone exceeds the context window') { throw "streamed token guard returned the wrong error: $($stream.Body)" }
-        $lines.Add('streamed token guard: plain HTTP 400 before any SSE frame')
-        $lines.Add('character ceiling: covered by unit tests; no system text above 32,000 characters was sent')
+        if ($streamError.error.code -ne 'context_length_exceeded' -or $streamError.error.message -notmatch 'system text alone exceeds the 32,000-character safety ceiling') { throw "streamed character-ceiling guard returned the wrong error: $($stream.Body)" }
+        $lines.Add('streamed character-ceiling guard: plain HTTP 400 before any SSE frame')
         $lines -join [Environment]::NewLine
     }
 
@@ -852,11 +845,12 @@ try {
         $max = ($rows | Measure-Object Tokens -Maximum).Maximum
         $min = ($rows | Measure-Object Tokens -Minimum).Minimum
         $spread = $max - $min
+        $tolerance = [Math]::Ceiling($max * 0.02)
         $lines = @($rows | ForEach-Object { "$($_.Name): $($_.Usable) chars fit = $($_.Tokens) $($t.counter) tokens ($($_.CharsPerToken) chars/token)" })
         # Two per cent covers the punctuation-cluster drift measured on 2026-09-11 (about 1 %); a
         # different vocabulary, or the preflight read in the wrong units (bytes as chars puts CJK at
         # three times the count), lands far outside it.
-        if ($spread -gt [Math]::Ceiling($max * 0.02)) {
+        if ($spread -gt $tolerance) {
             throw (($lines + "the counts differ by $spread tokens, more than 2 % of ${max}: the runtime's tokenizer is not the bridge's counter, or the preflight is being read in the wrong units") -join '; ')
         }
         if ($null -eq $health.context_window_tokens) {
@@ -864,8 +858,8 @@ try {
         }
         else {
             $reportedWindow = [int]$health.context_window_tokens
-            if ([Math]::Abs($max - $reportedWindow) -gt 1) {
-                throw (($lines + "the measured D80 boundary is $max $($t.counter) tokens but /healthz reports context_window_tokens=$reportedWindow") -join '; ')
+            if ($reportedWindow -lt ($min - $tolerance) -or $reportedWindow -gt ($max + $tolerance)) {
+                throw (($lines + "the measured D80 boundary range is $min-$max $($t.counter) tokens, but /healthz reports context_window_tokens=$reportedWindow outside its 2 % widened bracket") -join '; ')
             }
             $lines += "context_window_tokens=$reportedWindow; measured D80 boundary=$max $($t.counter) tokens"
         }

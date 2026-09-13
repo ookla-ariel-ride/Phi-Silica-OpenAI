@@ -4,10 +4,8 @@ using NpuBridge.Backends;
 namespace NpuBridge.Api;
 
 /// <summary>Refuses native system text that would make creating a model context unsafe or useless.</summary>
-public static class SystemTextGuard
+internal static class SystemTextGuard
 {
-    // D94 / issue #29: CreateContext crashes the Windows model host above the measured boundary.
-    public const int NativeSystemTextCharacterCeiling = 32_000;
 
     /// <summary>
     /// Returns the normal prompt-overflow failure before a native system text reaches
@@ -16,9 +14,8 @@ public static class SystemTextGuard
     internal static GenerationFailure? RefusalFor(
         ILanguageModelBackend backend,
         string? nativeSystemText,
-        bool includesToolDefinitions,
-        int? nativeSystemTokens = null) =>
-        Evaluate(backend, nativeSystemText, includesToolDefinitions, nativeSystemTokens, countForUsage: false).Failure;
+        bool includesToolDefinitions) =>
+        Evaluate(backend, nativeSystemText, includesToolDefinitions, nativeSystemTokens: null, countForUsage: false).Failure;
 
     /// <summary>
     /// Checks native system text before preparation computes its usage count. The character ceiling is
@@ -44,11 +41,11 @@ public static class SystemTextGuard
             return (null, 0);
         }
 
-        if (nativeSystemText.Length > NativeSystemTextCharacterCeiling)
+        if (nativeSystemText.Length > BackendLimits.NativeSystemTextCharacterCeiling)
         {
             return (Overflow(
                 string.Create(CultureInfo.InvariantCulture,
-                    $"Native system text alone exceeds the {NativeSystemTextCharacterCeiling:N0}-character safety ceiling: {nativeSystemText.Length:N0} characters."),
+                    $"Native system text alone exceeds the {BackendLimits.NativeSystemTextCharacterCeiling:N0}-character safety ceiling: {nativeSystemText.Length:N0} characters."),
                 includesToolDefinitions), 0);
         }
 
