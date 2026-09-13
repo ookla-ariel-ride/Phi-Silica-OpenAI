@@ -22,6 +22,7 @@ namespace NpuBridge.Api;
 /// <param name="Backend">The ready backend from the lifecycle snapshot.</param>
 /// <param name="Rendered">The prompt template's output, kept whole so callers can log the placement.</param>
 /// <param name="NativeSystem">System text to hand to <c>CreateContext</c>, or null when it was folded into the prompt.</param>
+/// <param name="NativeSystemTokens">The native system text's count, measured once during preparation; zero when there is no native system text.</param>
 /// <param name="Sampling">Already normalised: null when the backend cannot sample or the request set nothing.</param>
 /// <param name="Limits">The client-side cut: <c>max_tokens</c>/<c>max_completion_tokens</c> and <c>stop</c>.</param>
 /// <param name="PromptChars">Characters the model actually sees: the prompt, plus native system text.</param>
@@ -38,6 +39,7 @@ internal sealed record PreparedChatRequest(
     ILanguageModelBackend Backend,
     RenderedPrompt Rendered,
     string? NativeSystem,
+    int NativeSystemTokens,
     SamplingOptions? Sampling,
     OutputLimits Limits,
     int PromptChars,
@@ -377,6 +379,20 @@ internal static class ChatRequestPreparer
             // separately through the native context.
             promptChars = rendered.Prompt.Length + (nativeSystem?.Length ?? 0);
 
+            // Native system text never changes across --truncate-history retries. Count it once here,
+            // before a scheduler slot is taken, and reuse that count for both the wire-level guard and
+            // every later transcript-usage calculation.
+            var nativeSystemTokens = nativeSystem is null ? 0 : backend.TokenCounter.Count(nativeSystem);
+            var systemTextFailure = SystemTextGuard.RefusalFor(
+                backend, nativeSystem, catalog is not null, nativeSystemTokens);
+            if (systemTextFailure is not null)
+            {
+                ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs: 0, tokens: 0,
+                    status: GenerationStatus.PromptLargerThanContext.ToString(), finish: "-",
+                    httpStatus: systemTextFailure.StatusCode);
+                return ChatRequestPreparation.Failed(systemTextFailure.ToResult());
+            }
+
             if (options.Verbose)
             {
                 logger.LogInformation(
@@ -395,6 +411,7 @@ internal static class ChatRequestPreparer
                 Backend: backend,
                 Rendered: rendered,
                 NativeSystem: nativeSystem,
+                NativeSystemTokens: nativeSystemTokens,
                 Sampling: sampling is null || sampling.IsEmpty ? null : sampling,
                 Limits: OutputLimits.From(request, backend.TokenCounter),
                 PromptChars: promptChars,

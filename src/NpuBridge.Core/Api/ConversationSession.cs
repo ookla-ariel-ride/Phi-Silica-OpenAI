@@ -254,16 +254,10 @@ internal sealed class ConversationSession
     {
         while (true)
         {
-            var acquisition = Lookup();
-            if (acquisition.Failure is not null)
-            {
-                return acquisition;
-            }
-
-            var lease = acquisition.Lease!;
+            var lease = Lookup();
             if (!_preflight)
             {
-                return acquisition;
+                return ContextAcquisition.Acquired(lease);
             }
 
             // Guarded: the lease is owned here until it is handed back, and the caller's finally
@@ -407,7 +401,7 @@ internal sealed class ConversationSession
         }
     }
 
-    private ContextAcquisition Lookup()
+    private ContextLease Lookup()
     {
         var systemText = _prepared.Rendered.SystemText;
         var backend = _prepared.Backend;
@@ -423,7 +417,8 @@ internal sealed class ConversationSession
         // usage.prompt_tokens, in the backend's own count (D80). The native system text is counted on
         // its own: the runtime holds it in the context, outside the prompt string.
         var counter = backend.TokenCounter;
-        var transcriptTokens = counter.Count(full.Prompt) + (nativeSystem is null ? 0 : counter.Count(nativeSystem));
+        // The preparer already counted this immutable native system text for the wire-level guard.
+        var transcriptTokens = counter.Count(full.Prompt) + (nativeSystem is null ? 0 : _prepared.NativeSystemTokens);
 
         var checkout = _cache.CheckoutLongest(ConversationKey.PrefixKeys(systemText, _turns));
         if (checkout is not null)
@@ -439,19 +434,13 @@ internal sealed class ConversationSession
                     _prepared.RequestId, checkout.Context.Id, checkout.Prefix.TurnCount, tail.Count, prompt);
             }
 
-            return ContextAcquisition.Acquired(new ContextLease(_cache, checkout.Context, prompt, cacheHit: true, checkout.Prefix.Key,
-                tailTurns: tail.Count, promptChars: prompt.Length, transcriptChars, transcriptTokens, systemText, _turns));
-        }
-
-        var systemTextFailure = SystemTextGuard.RefusalFor(backend, nativeSystem, _prepared.ToolInstructions is not null);
-        if (systemTextFailure is not null)
-        {
-            return ContextAcquisition.Refused(systemTextFailure);
+            return new ContextLease(_cache, checkout.Context, prompt, cacheHit: true, checkout.Prefix.Key,
+                tailTurns: tail.Count, promptChars: prompt.Length, transcriptChars, transcriptTokens, systemText, _turns);
         }
 
         var context = backend.CreateContext(nativeSystem);
-        return ContextAcquisition.Acquired(new ContextLease(_cache, context, full.Prompt, cacheHit: false, cacheKey: null,
-            tailTurns: _turns.Count, promptChars: transcriptChars, transcriptChars, transcriptTokens, systemText, _turns));
+        return new ContextLease(_cache, context, full.Prompt, cacheHit: false, cacheKey: null,
+            tailTurns: _turns.Count, promptChars: transcriptChars, transcriptChars, transcriptTokens, systemText, _turns);
     }
 
     private List<ChatMessage> Transcript()
@@ -497,6 +486,6 @@ internal sealed class ConversationSession
             : "Send a shorter conversation, or start the bridge with --truncate-history to drop the oldest turns instead.";
         var detail = $"Backend '{_prepared.Backend.ModelId}' can take {usable} characters of {where}; the transcript is {lease.TranscriptChars} characters over {_turns.Count} turn(s). {hint}";
 
-        return GenerationFailure.FromStatus(new GenerationResult(string.Empty, GenerationStatus.PromptLargerThanContext, detail))!;
+        return GenerationFailure.ContextLengthExceeded(detail);
     }
 }

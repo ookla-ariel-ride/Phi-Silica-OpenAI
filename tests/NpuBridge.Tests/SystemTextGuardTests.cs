@@ -176,6 +176,62 @@ public class SystemTextGuardTests
     }
 
     [Fact]
+    public async Task Native_system_text_refusal_bypasses_a_busy_queue_and_preserves_the_rolling_mean()
+    {
+        var clock = new ManualTimeProvider(new DateTimeOffset(2026, 9, 12, 12, 0, 0, TimeSpan.Zero));
+        var generationGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            ContextWindowTokens = 100,
+            StartGate = generationGate,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake,
+            options: new BridgeOptions { Backend = BackendKind.Fake, QueueCapacity = 1 }, time: clock);
+
+        // The running generation owns the worker but is not queued itself.
+        var running = PostChatAsync(host, "safe");
+        await TestWait.UntilAsync(() => fake.Calls.Count == 1);
+
+        // Preparation runs before ScheduleAsync, so this streamed request returns a normal JSON 400
+        // without spending the worker's slot or committing an SSE keep-alive.
+        var refusedTask = PostChatAsync(host, new string('s', 500), stream: true);
+        await TestWait.UntilAsync(() => refusedTask.IsCompleted);
+        var refused = await refusedTask;
+        Assert.Equal(HttpStatusCode.BadRequest, refused.StatusCode);
+        Assert.Equal("application/json", refused.Content.Headers.ContentType?.MediaType);
+        Assert.DoesNotContain(": keep-alive", await refused.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+        Assert.Equal(0, host.Scheduler.QueueDepth);
+        Assert.Single(fake.Calls);
+
+        // Make the only admitted generation take two scheduler seconds. Its duration is the mean that
+        // a later full-queue response must use; a guarded refusal must not add a zero-duration job.
+        clock.Advance(TimeSpan.FromSeconds(2));
+        generationGate.SetResult();
+        Assert.Equal(HttpStatusCode.OK, (await running).StatusCode);
+
+        var schedulerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var schedulerGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var held = host.Scheduler.ScheduleAsync(async _ =>
+        {
+            schedulerEntered.SetResult();
+            await schedulerGate.Task;
+            return 0;
+        }, CancellationToken.None);
+        await schedulerEntered.Task;
+
+        var queued = host.Scheduler.ScheduleAsync(_ => Task.FromResult(0), CancellationToken.None);
+        await TestWait.UntilAsync(() => host.Scheduler.QueueDepth == 1);
+        var rejected = await host.Scheduler.ScheduleAsync(_ => Task.FromResult(0), CancellationToken.None);
+
+        Assert.Equal(ScheduleResultKind.Rejected, rejected.Kind);
+        Assert.Equal(2, rejected.RetryAfterSeconds);
+
+        schedulerGate.SetResult();
+        await Task.WhenAll(held, queued);
+        host.AssertNoLeak();
+    }
+
+    [Fact]
     public async Task Debug_generate_uses_the_same_guard_before_context_creation()
     {
         var fake = new FakeBackend(new FakeBackendOptions { ContextWindowTokens = 100 });

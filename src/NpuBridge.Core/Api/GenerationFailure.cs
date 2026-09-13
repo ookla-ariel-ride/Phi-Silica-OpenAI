@@ -35,12 +35,7 @@ internal sealed record GenerationFailure(int StatusCode, OpenAiErrorBody Body)
         {
             GenerationStatus.Complete or GenerationStatus.ContentFiltered or GenerationStatus.BlockedByPolicy => null,
 
-            GenerationStatus.PromptLargerThanContext => new GenerationFailure(
-                StatusCodes.Status400BadRequest,
-                OpenAiError.Body(
-                    $"The prompt is longer than the model's context window. {result.Detail}".Trim(),
-                    OpenAiError.InvalidRequest,
-                    code: "context_length_exceeded")),
+            GenerationStatus.PromptLargerThanContext => ContextLengthExceeded(result.Detail),
 
             GenerationStatus.Cancelled => new GenerationFailure(
                 StatusCodes.Status502BadGateway,
@@ -69,6 +64,14 @@ internal sealed record GenerationFailure(int StatusCode, OpenAiErrorBody Body)
                 OpenAiError.Server,
                 code: "backend_error"));
     }
+
+    /// <summary>The request cannot fit within the model's context window.</summary>
+    public static GenerationFailure ContextLengthExceeded(string? detail) =>
+        new(StatusCodes.Status400BadRequest,
+            OpenAiError.Body(
+                $"The prompt is longer than the model's context window. {detail}".Trim(),
+                OpenAiError.InvalidRequest,
+                code: "context_length_exceeded"));
 
     /// <summary>
     /// The generation queue (chunk 8, <see cref="GenerationScheduler"/>) was already full when this

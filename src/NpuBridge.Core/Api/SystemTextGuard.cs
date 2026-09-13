@@ -16,7 +16,8 @@ internal static class SystemTextGuard
     public static GenerationFailure? RefusalFor(
         ILanguageModelBackend backend,
         string? nativeSystemText,
-        bool includesToolDefinitions)
+        bool includesToolDefinitions,
+        int? nativeSystemTokens = null)
     {
         ArgumentNullException.ThrowIfNull(backend);
         if (nativeSystemText is null)
@@ -34,7 +35,7 @@ internal static class SystemTextGuard
 
         if (backend.ContextWindowTokens is { } windowTokens)
         {
-            var systemTokens = backend.TokenCounter.Count(nativeSystemText);
+            var systemTokens = nativeSystemTokens ?? backend.TokenCounter.Count(nativeSystemText);
             if (systemTokens >= windowTokens)
             {
                 return Overflow(
@@ -54,7 +55,6 @@ internal static class SystemTextGuard
             detail += " Rendered tool definitions are included in that count.";
         }
 
-        return GenerationFailure.FromStatus(
-            new GenerationResult(string.Empty, GenerationStatus.PromptLargerThanContext, detail))!;
+        return GenerationFailure.ContextLengthExceeded(detail);
     }
 }
