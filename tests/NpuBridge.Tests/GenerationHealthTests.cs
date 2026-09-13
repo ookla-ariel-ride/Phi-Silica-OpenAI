@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using NpuBridge.Backends;
 using NpuBridge.Backends.Fake;
 using NpuBridge.Tokenizers;
 
@@ -147,6 +148,53 @@ public class GenerationHealthTests
 
         Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
         Assert.Equal(1, health.Body.GetProperty("consecutive_backend_faults").GetInt32());
+        host.AssertNoLeak();
+    }
+
+    [Fact]
+    public async Task Debug_generation_with_a_preflight_known_overflow_does_not_change_health()
+    {
+        var options = new FakeBackendOptions
+        {
+            FailAfterTokens = 0,
+            FailureStatus = GenerationStatus.Error,
+        };
+        var fake = new FakeBackend(options);
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        async Task<HttpResponseMessage> PostPreflightKnownOverflowAsync()
+        {
+            var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var callsBefore = fake.Calls.Count;
+            options.MaxPromptChars = 1;
+            options.StartGate = startGate;
+
+            var responseTask = host.Client.PostAsJsonAsync("/debug/generate", new { prompt = "too long" });
+            await TestWait.UntilAsync(() => fake.Calls.Count == callsBefore + 1);
+            options.MaxPromptChars = 100;
+            startGate.SetResult();
+            var response = await responseTask;
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            Assert.Equal(1, document.RootElement.GetProperty("usable_prompt_chars").GetInt32());
+            return response;
+        }
+
+        Assert.Equal(HttpStatusCode.OK, (await PostPreflightKnownOverflowAsync()).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await PostPreflightKnownOverflowAsync()).StatusCode);
+
+        var unchanged = await ReadHealthAsync(host);
+        Assert.Equal(HttpStatusCode.OK, unchanged.StatusCode);
+        Assert.Equal(0, unchanged.Body.GetProperty("consecutive_backend_faults").GetInt32());
+        Assert.Equal(JsonValueKind.Null, unchanged.Body.GetProperty("last_generation").ValueKind);
+
+        options.StartGate = null;
+        var fittingResponse = await host.Client.PostAsJsonAsync("/debug/generate", new { prompt = "fits" });
+        var afterFittingFailure = await ReadHealthAsync(host);
+
+        Assert.Equal(HttpStatusCode.OK, fittingResponse.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, afterFittingFailure.StatusCode);
+        Assert.Equal(1, afterFittingFailure.Body.GetProperty("consecutive_backend_faults").GetInt32());
+        Assert.Equal("backend_fault", afterFittingFailure.Body.GetProperty("last_generation").GetProperty("outcome").GetString());
         host.AssertNoLeak();
     }
 
