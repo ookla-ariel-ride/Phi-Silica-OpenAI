@@ -32,6 +32,8 @@ public class HealthzTests
         Assert.Equal(4, json.GetProperty("context_cache_capacity").GetInt32());
         Assert.Equal(0, json.GetProperty("context_cache_hits").GetInt64());
         Assert.Equal(0, json.GetProperty("context_cache_misses").GetInt64());
+        Assert.Equal(JsonValueKind.Null, json.GetProperty("last_generation").ValueKind);
+        Assert.Equal(0, json.GetProperty("consecutive_backend_faults").GetInt32());
         Assert.Equal(1000, json.GetProperty("first_keep_alive_ms").GetInt32());
         Assert.Equal(15000, json.GetProperty("keep_alive_interval_ms").GetInt32());
         Assert.False(json.GetProperty("first_run_compile_likely").GetBoolean());

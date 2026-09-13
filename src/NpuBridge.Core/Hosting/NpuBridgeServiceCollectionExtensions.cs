@@ -31,6 +31,7 @@ public static class NpuBridgeServiceCollectionExtensions
         services.TryAddSingleton(TimeProvider.System);
         services.TryAddSingleton<IProcessIdentity>(NoProcessIdentity.Instance);
         services.TryAddSingleton<IgnoredParameterLog>();
+        services.TryAddSingleton<GenerationHealth>();
 
         // The context cache is owned by the lifecycle below, which disposes the cached contexts before
         // the model they belong to: a LanguageModelContext must not outlive its LanguageModel.

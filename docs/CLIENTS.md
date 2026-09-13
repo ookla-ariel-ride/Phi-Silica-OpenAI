@@ -16,7 +16,7 @@ on a fact measured on hardware, the number is here rather than repeated from `do
 | `POST /v1/chat/completions` | chat, streaming and non-streaming |
 | `POST /v1/completions` | the legacy prompt-in, text-out shape (see the `curl` section below) |
 | `GET /v1/models`, `GET /v1/models/{id}` | the served model id, for a client's own discovery step |
-| `GET /healthz` | 200 once ready, 503 otherwise; also `queue_depth`, `queue_capacity` and the context-cache counters |
+| `GET /healthz` | 200 once ready, 503 otherwise; a 503 `degraded` means the model loaded but recent generations failed, so back off instead of retrying hot; also `queue_depth`, `queue_capacity` and the context-cache counters |
 | `POST /debug/generate`, `POST /debug/tokenize` | loopback-only diagnostics, not part of the OpenAI-shaped surface a client should call |
 
 README's own "Endpoints" section has the full detail on each; this list exists so a client's

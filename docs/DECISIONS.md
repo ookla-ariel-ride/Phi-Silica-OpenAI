@@ -1894,7 +1894,6 @@ under the calls the client will echo, not the text the model wrote) is also stil
 hardware, because the multi-step cell never read `context_cache_hits` around its two turns. Both are
 on issue #21's successor work rather than closed by it.
 
-
 **D97. Native system text is rejected before context creation.** Issue #29 showed that the normal
 preflight was too late for native placement: `CreateContext(systemText)` consumes the system text first,
 and D94 measured the Windows model host fail-fast at 44,000 characters. On a cache miss, the bridge now
@@ -1914,3 +1913,29 @@ ceiling.
 truncated-turns header. Folded placement is unchanged: its system text is part of the ordinary prompt and
 continues through the existing preflight. Rendered tool definitions are part of native system text, and
 the refusal says so when they contributed to the count.
+
+**D98. Health reflects generation outcomes, not a probe.** Issue #30 found a Phi Silica process that
+still reported `ready` after generations had stopped reaching the model. `/healthz` now records real
+terminal generation outcomes: a backend exception, `Error`, or an unrequested `Cancelled` is a backend
+fault; `Complete`, a cut-induced cancellation, and filtered or policy-blocked output are successful
+runtime answers. Validation, preflight refusals, queue outcomes, client aborts and other work that did
+not call the backend leave the record alone. A health check does not generate its own probe because the
+single-worker scheduler would contend with client traffic and spend NPU time on every poll.
+
+Two consecutive backend faults return `503` with `status: degraded` and the last fault message. One
+fault stays `ready` because the known first-generation RPC flake has cleared on retry. A successful
+answer resets the counter. Degraded is advisory: `BackendLifecycle.IsReady` and request admission stay
+unchanged so a runtime that self-heals can demonstrate recovery instead of being hidden behind a
+refusal.
+
+Automatic model recreation is deferred. D94 records two wedges with different recovery behavior: one
+cleared after several minutes, while the other persisted until restart. Recreating a shared model handle
+without knowing whether those are one fault could make the self-healing case worse. The degraded state
+is the trigger to evaluate if later evidence establishes a safe policy.
+
+**2026-09-13 addendum.** An exception from any backend call inside a scheduled attempt, including
+`CreateContext`, `GetUsablePromptLength`, and `GenerateAsync`, is a backend fault; a preflight that
+returns a refusal is not. At 00:28, a fresh bridge reported `/healthz` ready after a 14 s load, then its
+first generation took 1,580 ms and returned 502 `The RPC server is unavailable`. Twenty-six more calls
+returned 502 in 3 to 16 ms. The Application log had no `WorkloadsSessionHost` crash, and no oversized
+prompt had been sent.

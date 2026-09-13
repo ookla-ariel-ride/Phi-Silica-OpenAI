@@ -199,6 +199,7 @@ internal static class StreamingPipeline
         string backendName,
         PreparedChatRequest prepared,
         ConversationSession session,
+        GenerationHealth generationHealth,
         CancellationToken aborted)
     {
         var scheduled = await generation.ConfigureAwait(false);
@@ -215,7 +216,7 @@ internal static class StreamingPipeline
 
         if (admission != SchedulerOutcome.Completed)
         {
-            var schedulerFailure = SchedulerAdmission.FailureFor(admission, scheduled.RetryAfterSeconds);
+            var schedulerFailure = SchedulerAdmission.FailureFor(admission, scheduled.RetryAfterSeconds, generationHealth);
 
             // Only meaningful (and only safe to set -- headers are read-only once the response has
             // started) before the first byte, which the shared helper is what knows; FailAsync below is

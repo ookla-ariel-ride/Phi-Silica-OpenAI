@@ -46,6 +46,7 @@ internal sealed class ChatCompletionsStreamEndpoint
         StreamingOptions streaming,
         ContextCache cache,
         GenerationScheduler scheduler,
+        GenerationHealth generationHealth,
         TimeProvider time,
         ILogger logger)
     {
@@ -106,6 +107,8 @@ internal sealed class ChatCompletionsStreamEndpoint
         var cancelledByCut = false;
 
         var queueWaitMs = 0.0;
+        var generationAttempted = false;
+        var outcomeClassified = false;
 
         // The current attempt's lease, assigned from *inside* the scheduled closure the instant Acquire
         // hands one over rather than from the value that closure returns. The difference is the whole
@@ -173,6 +176,7 @@ internal sealed class ChatCompletionsStreamEndpoint
             {
                 while (true)
                 {
+                    generationAttempted = true;
                     var acquisition = session.Acquire();
                     if (acquisition.Failure is { } refused)
                     {
@@ -253,7 +257,7 @@ internal sealed class ChatCompletionsStreamEndpoint
             if (generation.IsCompleted)
             {
                 var immediateResult = await StreamingPipeline.ReportSchedulerOutcomeAsync(
-                    generation, sse, http, logger, requestId, backendName, prepared, session, aborted)
+                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, aborted)
                     .ConfigureAwait(false);
                 if (immediateResult.Handled)
                 {
@@ -281,7 +285,7 @@ internal sealed class ChatCompletionsStreamEndpoint
                 }
 
                 var schedulerOutcome = await StreamingPipeline.ReportSchedulerOutcomeAsync(
-                    generation, sse, http, logger, requestId, backendName, prepared, session, aborted)
+                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, aborted)
                     .ConfigureAwait(false);
                 if (schedulerOutcome.Handled)
                 {
@@ -332,7 +336,7 @@ internal sealed class ChatCompletionsStreamEndpoint
                 }
 
                 var schedulerOutcome = await StreamingPipeline.ReportSchedulerOutcomeAsync(
-                    generation, sse, http, logger, requestId, backendName, prepared, session, aborted)
+                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, aborted)
                     .ConfigureAwait(false);
                 if (schedulerOutcome.Handled)
                 {
@@ -345,7 +349,7 @@ internal sealed class ChatCompletionsStreamEndpoint
             else
             {
                 var schedulerOutcome = await StreamingPipeline.ReportSchedulerOutcomeAsync(
-                    generation, sse, http, logger, requestId, backendName, prepared, session, aborted)
+                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, aborted)
                     .ConfigureAwait(false);
                 if (schedulerOutcome.Handled)
                 {
@@ -394,7 +398,8 @@ internal sealed class ChatCompletionsStreamEndpoint
             // the same order and for the same reasons. See GenerationOutcome for why a Cancelled the
             // handler asked for is not a failure while every other status still is, and why "the cut
             // caused it" is the flag set beside the CancelAsync above rather than the cutter's state.
-            var outcome = GenerationOutcome.Classify(result, cancelledByCut);
+            var outcome = GenerationOutcome.Classify(result, cancelledByCut, generationHealth, totalMs);
+            outcomeClassified = true;
             if (outcome.Failure is { } failure)
             {
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
@@ -550,7 +555,7 @@ internal sealed class ChatCompletionsStreamEndpoint
         // A cancellation that reaches here is a generation that failed, and is reported as one.
         catch (Exception ex)
         {
-            var failure = GenerationFailure.FromException(ex);
+            var failure = GenerationFailure.FromException(ex, generationAttempted && !outcomeClassified ? generationHealth : null, stopwatch.Elapsed.TotalMilliseconds);
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
                 status: ex.GetType().Name, finish: "-",
                 httpStatus: sse.Started ? StatusCodes.Status200OK : failure.StatusCode,

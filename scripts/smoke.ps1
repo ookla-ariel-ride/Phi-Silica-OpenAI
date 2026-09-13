@@ -366,6 +366,7 @@ try {
                 $last = $r.Content | ConvertFrom-Json
                 if ($r.StatusCode -eq 200) { break }
                 if ($last.status -eq 'failed') { throw "backend failed: $($last.error)" }
+                if ($last.status -eq 'degraded') { throw "backend is degraded: $($last.last_generation.error)" }
             } catch [System.Net.Http.HttpRequestException] { }
             Start-Sleep -Seconds 2
         }
@@ -1374,6 +1375,11 @@ tokenizer on phi-silica; these ratios are both assumptions checked on one real g
 
         $lines.Add("verdict for the log: D52 shipped a ${firstKeepAliveMs} ms first keep-alive as a reasoned default and said this script owed the measurement. The numbers above are it (D52, D55).")
         $lines -join "`n"
+    }
+
+    InfoStep 'final generation health' {
+        $health = Get-Json '/healthz' -expect 200,503
+        "last_generation=$($health.last_generation | ConvertTo-Json -Compress -Depth 5) consecutive_backend_faults=$($health.consecutive_backend_faults)"
     }
 } finally {
     if ($proc) {

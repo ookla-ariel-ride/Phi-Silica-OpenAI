@@ -1,5 +1,6 @@
 using System.Globalization;
 using Microsoft.AspNetCore.Http;
+using NpuBridge.Backends;
 
 namespace NpuBridge.Api;
 
@@ -89,14 +90,20 @@ internal static class SchedulerAdmission
     /// callers branch on <see cref="Classify{TResult}"/>'s result before ever reaching this, so reaching
     /// it for either would itself be the bug.
     /// </summary>
-    public static GenerationFailure FailureFor(SchedulerOutcome outcome, int retryAfterSeconds) =>
+    public static GenerationFailure FailureFor(
+        SchedulerOutcome outcome,
+        int retryAfterSeconds,
+        GenerationHealth? health = null,
+        double durationMs = 0) =>
         outcome switch
         {
             SchedulerOutcome.QueueFull => GenerationFailure.QueueFull(retryAfterSeconds),
             SchedulerOutcome.QueueShuttingDown => GenerationFailure.QueueShuttingDown(),
             SchedulerOutcome.BackendThrewCancellation => GenerationFailure.FromException(
                 new OperationCanceledException(
-                    "The backend's generation ended by throwing OperationCanceledException instead of reporting a Cancelled status (adapter contract violation, D82).")),
+                    "The backend's generation ended by throwing OperationCanceledException instead of reporting a Cancelled status (adapter contract violation, D82)."),
+                health,
+                durationMs),
             _ => throw new ArgumentOutOfRangeException(nameof(outcome), outcome, "Completed and ClientGone have no failure to report; the caller must branch before reaching this."),
         };
 

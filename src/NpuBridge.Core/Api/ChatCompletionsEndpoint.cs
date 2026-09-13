@@ -60,6 +60,7 @@ internal sealed class ChatCompletionsEndpoint
         IgnoredParameterLog ignoredLog,
         ContextCache cache,
         GenerationScheduler scheduler,
+        GenerationHealth generationHealth,
         TimeProvider time,
         ILogger<ChatCompletionsEndpoint> logger,
         ILogger<ChatCompletionsStreamEndpoint> streamLogger)
@@ -86,7 +87,7 @@ internal sealed class ChatCompletionsEndpoint
         if (prepared.Request.Stream == true)
         {
             return await ChatCompletionsStreamEndpoint
-                .StreamAsync(http, prepared, options, streaming, cache, scheduler, time, streamLogger)
+                .StreamAsync(http, prepared, options, streaming, cache, scheduler, generationHealth, time, streamLogger)
                 .ConfigureAwait(false) ?? Results.Empty;
         }
 
@@ -114,6 +115,9 @@ internal sealed class ChatCompletionsEndpoint
         // clauses, which run for a throw at any point including before scheduling, can still log the
         // best value they have.
         var queueWaitMs = 0.0;
+        var elapsed = Stopwatch.StartNew();
+        var generationAttempted = false;
+        var outcomeClassified = false;
 
         try
         {
@@ -137,6 +141,7 @@ internal sealed class ChatCompletionsEndpoint
                     // 7. The context: checked out of the cache when the transcript extends a cached
                     // prefix, created fresh otherwise, and refused here -- before a token is generated --
                     // when a backend with a preflight says the prompt does not fit (D55).
+                    generationAttempted = true;
                     var acquisition = session.Acquire();
                     if (acquisition.Failure is { } refused)
                     {
@@ -266,7 +271,7 @@ internal sealed class ChatCompletionsEndpoint
                 // BackendThrewCancellation (502, fix round 1 Finding 1) -- none of which ever reached the
                 // closure above in the first two cases, so no context exists to dispose beyond what the
                 // finally already handles (null).
-                var schedulerFailure = SchedulerAdmission.FailureFor(admission, scheduled.RetryAfterSeconds);
+                var schedulerFailure = SchedulerAdmission.FailureFor(admission, scheduled.RetryAfterSeconds, generationHealth);
                 SchedulerAdmission.ApplyRetryAfter(http.Response, admission, scheduled.RetryAfterSeconds);
 
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, prepared.PromptChars, ttftMs: 0, tokens: 0,
@@ -317,7 +322,8 @@ internal sealed class ChatCompletionsEndpoint
             // Error, filtered, or content: one classification, shared with the streaming path, so the two
             // shapes cannot describe the same generation differently. See GenerationOutcome for why the
             // cut is consulted as the flag recorded at the cancel rather than as the cutter's state.
-            var outcome = GenerationOutcome.Classify(result, cancelledByCut);
+            var outcome = GenerationOutcome.Classify(result, cancelledByCut, generationHealth, totalMs);
+            outcomeClassified = true;
 
             if (outcome.Failure is { } failure)
             {
@@ -413,7 +419,7 @@ internal sealed class ChatCompletionsEndpoint
         // answered the identical event with a 502 and the ordinary error body.
         catch (Exception ex)
         {
-            var failure = GenerationFailure.FromException(ex);
+            var failure = GenerationFailure.FromException(ex, generationAttempted && !outcomeClassified ? generationHealth : null, elapsed.Elapsed.TotalMilliseconds);
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
                 status: ex.GetType().Name, finish: "-", httpStatus: failure.StatusCode,
                 cache: CacheLabel(lease), tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns,
