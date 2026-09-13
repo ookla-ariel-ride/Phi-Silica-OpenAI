@@ -1893,3 +1893,77 @@ incidentally. The tool-call round trip through the context cache (D83's ruling t
 under the calls the client will echo, not the text the model wrote) is also still unverified on
 hardware, because the multi-step cell never read `context_cache_hits` around its two turns. Both are
 on issue #21's successor work rather than closed by it.
+
+**D97. Native system text is rejected before context creation.** Issue #29 showed that the normal
+preflight was too late for native placement: `CreateContext(systemText)` consumes the system text first,
+and D94 measured the Windows model host fail-fast at 44,000 characters. On a cache miss, the bridge now
+checks a non-null native system text before it calls `CreateContext`. More than 32,000 characters is
+refused as a hard safety ceiling below D94's measured boundary. When a backend has a measured usable
+window, text whose backend-token count is at least that window is also refused because it leaves no room
+for the prompt. The failure uses the existing `PromptLargerThanContext` mapping and returns HTTP 400
+`context_length_exceeded` without creating a context.
+
+Phi Silica reports the D80-measured 3,581-token usable window as a backend constant. The smoke boundary
+check verifies that number on hardware, so the constant is checked rather than assumed. Discovering the
+window during each initialization is deferred to `docs/FUTURE.md`; it would add a context and preflight
+probe that needs its own hardware validation. A backend whose window is unknown still gets the character
+ceiling.
+
+`--truncate-history` cannot shrink system text, so this refusal does not enter the drop loop or attach a
+truncated-turns header. Folded placement is unchanged: its system text is part of the ordinary prompt and
+continues through the existing preflight. Rendered tool definitions are part of native system text, and
+the refusal says so when they contributed to the count.
+
+**2026-09-12 addendum.** The guard now runs in `ChatRequestPreparer`, before a request enters
+`GenerationScheduler`. A busy queue therefore returns the normal HTTP 400 without taking a slot or
+changing the rolling duration that sets `Retry-After`. `PhiSilicaBackend.CreateContext` also checks the
+same ceiling for direct adapter callers. `/healthz` exposes `context_window_tokens`, and the D80 smoke
+step compares it with the measured boundary on hardware. The native-system smoke step sends at most
+32,000 characters; unit tests cover the character ceiling.
+
+**D98. Health reflects generation outcomes, not a probe.** Issue #30 found a Phi Silica process that
+still reported `ready` after generations had stopped reaching the model. `/healthz` now records real
+terminal generation outcomes: a backend exception, `Error`, or an unrequested `Cancelled` is a backend
+fault; `Complete`, a cut-induced cancellation, and filtered or policy-blocked output are successful
+runtime answers. Validation, preflight refusals, queue outcomes, client aborts and other work that did
+not call the backend leave the record alone. A health check does not generate its own probe because the
+single-worker scheduler would contend with client traffic and spend NPU time on every poll.
+
+Two consecutive backend faults return `503` with `status: degraded` and the last fault message. One
+fault stays `ready` because the known first-generation RPC flake has cleared on retry. A successful
+answer resets the counter. Degraded is advisory: `BackendLifecycle.IsReady` and request admission stay
+unchanged so a runtime that self-heals can demonstrate recovery instead of being hidden behind a
+refusal.
+
+Automatic model recreation is deferred. D94 records two wedges with different recovery behavior: one
+cleared after several minutes, while the other persisted until restart. Recreating a shared model handle
+without knowing whether those are one fault could make the self-healing case worse. The degraded state
+is the trigger to evaluate if later evidence establishes a safe policy.
+
+**2026-09-12 (evening, local) addendum.** An exception from any backend call inside a scheduled attempt, including
+`CreateContext`, `GetUsablePromptLength`, and `GenerateAsync`, is a backend fault; a preflight that
+returns a refusal is not. At 17:28 local (00:28 UTC on 2026-09-13; this machine, its commits and the Windows Application log are on Pacific time, the Sidequest board stamps UTC), a fresh bridge reported `/healthz` ready after a 14 s load, then its
+first generation took 1,580 ms and returned 502 `The RPC server is unavailable`. Twenty-six more calls
+returned 502 in 3 to 16 ms. The Application log had no `WorkloadsSessionHost` crash, and no oversized
+prompt had been sent.
+
+**2026-09-12 (late evening, local) addendum, second.** `/debug/generate` runs its prompt even when the
+preflight has answered that it does not fit (the endpoint exists to measure the raw backend, and
+`smoke.ps1`'s D52 step relies on that), and the runtime answers such a prompt with a generic `Error`
+after seconds (D55, D80). That `Error` is not recorded as a backend fault: when the preflight answered
+and `usable < prompt.Length`, the attempt records nothing, the same as a preflight refusal on the chat
+shapes. Two oversized debug prompts had turned a healthy bridge `degraded` before this. A *thrown*
+exception on the same prompt still records a fault, deliberately: a throw from any backend call is the
+wedge signature this state exists to surface, and suppressing it would hide the wedge whenever an
+operator retried an oversized prompt. Found by the whole-branch review of PR #36.
+
+**D99. The streamed tool-call shape agrees with the JSON shape on hardware, the cache round trip hits, and the wire fields sit where D83 said.**
+Issue #31's measurement, run with `scripts/tool-probe.ps1 -Stream -Include ToolCountSweep,WindowOccupancy,MultiStep -Runs 3 -HeadlineRuns 3 -OccupancyCells '70%'` against a bridge built from `main` at 9003a06 (the #29 guard and the SQ-9/SQ-10 probe fixes in), build 29648, `temperature: 0`, on 2026-09-12 at 17:37 local (00:37 UTC on 2026-09-13). 34 calls, every one HTTP 200.
+
+- **Parity.** Six streamed runs (three at one tool, three at 70 % window occupancy) were each paired with a JSON run of the identical request. After removing `index` and `id` and ordering keys canonically, the assembled `tool_calls` were byte-identical to the JSON shape's on all six pairs, and `finish_reason` was `tool_calls` on both sides every time. `id` is minted per response and differs by design. Key order differs by shape and is not a defect: the JSON shape writes `id, function, type`, the streamed chunk writes `index, id, type, function`. The first attempt at this comparison called every pair a mismatch because it compared ids and key order; the probe now records both as informational.
+- **Shape checks.** Every element on both shapes carried a non-empty `id`, `type: "function"`, `function.name` and a string `function.arguments`. `index` was present as an integer on every streamed element and absent from every JSON element. The `tool_calls` <=> `finish_reason` biconditional held both ways on all 34 replies.
+- **Cache round trip.** Bracketing the multi-step cell with `/healthz` reads: `context_cache_hits` 0 -> 1 and `context_cache_misses` 27 -> 28 across turn 2. The second turn of a tool round trip is served from the cached context, which is the case D83's keying rule exists for.
+- **Latency.** At one tool: JSON 2,423 to 2,718 ms, streamed 2,642 to 2,902 ms. At 70 % occupancy (11,949 characters, 2,502 tokens of rendered block): JSON 18,103 to 18,280 ms, streamed 18,007 to 18,420 ms. Buffering the whole reply behind keep-alives costs nothing measurable over the JSON shape.
+- **One model behaviour, not a bridge defect.** On the multi-step second turn the model answered with a fenced `{"tool_calls": []}` and nothing else; `ToolCallParser` correctly treated the empty array as content (D83: a bare or empty array declares no call), so the client received the fence as prose with `finish_reason: stop`. An earlier run of the same cell (17:18 local, `main` at eaf98b1) answered "Yes, it's wise to bring an umbrella." The two transcripts differ only in the turn-1 call id, so this is the model's sensitivity to the transcript, not non-determinism. Whether the bridge should swallow an empty `tool_calls` fence is deferred (`docs/FUTURE.md`).
+
+The run between those two (17:28 local) is not a measurement of anything in this entry: the runtime was wedged from the first call (issue #30, D98's addendum), all 27 calls were 502, and the probe's own reporting of that run had two bugs that SQ-10 fixed (a 502 pair was reported as a parity mismatch; the occupancy trailer claimed no 502 had been seen after stopping on one). Raw files: `tool-probe-stream-run1-2026-09-12.json`, `tool-probe-stream-run3-clean-2026-09-13.json` and their transcripts, session scratchpad.

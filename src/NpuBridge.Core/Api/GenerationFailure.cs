@@ -35,12 +35,7 @@ internal sealed record GenerationFailure(int StatusCode, OpenAiErrorBody Body)
         {
             GenerationStatus.Complete or GenerationStatus.ContentFiltered or GenerationStatus.BlockedByPolicy => null,
 
-            GenerationStatus.PromptLargerThanContext => new GenerationFailure(
-                StatusCodes.Status400BadRequest,
-                OpenAiError.Body(
-                    $"The prompt is longer than the model's context window. {result.Detail}".Trim(),
-                    OpenAiError.InvalidRequest,
-                    code: "context_length_exceeded")),
+            GenerationStatus.PromptLargerThanContext => ContextLengthExceeded(result.Detail),
 
             GenerationStatus.Cancelled => new GenerationFailure(
                 StatusCodes.Status502BadGateway,
@@ -58,9 +53,10 @@ internal sealed record GenerationFailure(int StatusCode, OpenAiErrorBody Body)
     }
 
     /// <summary>A backend that threw rather than returning a status.</summary>
-    public static GenerationFailure FromException(Exception exception)
+    public static GenerationFailure FromException(Exception exception, GenerationHealth? health = null, double durationMs = 0)
     {
         ArgumentNullException.ThrowIfNull(exception);
+        health?.RecordException(exception, durationMs);
         return new GenerationFailure(
             StatusCodes.Status502BadGateway,
             OpenAiError.Body(
@@ -68,6 +64,14 @@ internal sealed record GenerationFailure(int StatusCode, OpenAiErrorBody Body)
                 OpenAiError.Server,
                 code: "backend_error"));
     }
+
+    /// <summary>The request cannot fit within the model's context window.</summary>
+    public static GenerationFailure ContextLengthExceeded(string? detail) =>
+        new(StatusCodes.Status400BadRequest,
+            OpenAiError.Body(
+                $"The prompt is longer than the model's context window. {detail}".Trim(),
+                OpenAiError.InvalidRequest,
+                code: "context_length_exceeded"));
 
     /// <summary>
     /// The generation queue (chunk 8, <see cref="GenerationScheduler"/>) was already full when this
@@ -134,9 +138,14 @@ internal sealed record GenerationOutcome(GenerationResult Result, GenerationFail
     /// True when this handler cancelled the generation because the cut fired. Recorded at the cancel
     /// rather than inferred afterwards — see the type's own remarks.
     /// </param>
-    public static GenerationOutcome Classify(GenerationResult result, bool cancelledByCut)
+    public static GenerationOutcome Classify(
+        GenerationResult result,
+        bool cancelledByCut,
+        GenerationHealth? health = null,
+        double durationMs = 0)
     {
         ArgumentNullException.ThrowIfNull(result);
+        health?.Record(result, cancelledByCut, durationMs);
 
         if (result.Status is GenerationStatus.ContentFiltered or GenerationStatus.BlockedByPolicy)
         {

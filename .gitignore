@@ -104,3 +104,6 @@ skills-lock.json
 
 # Claude Code per-user project settings (model-gateway writes a machine-local endpoint here)
 .claude/settings.local.json
+
+# Toolshed observability plugin state (machine-local)
+.claude/settings.local.*.json

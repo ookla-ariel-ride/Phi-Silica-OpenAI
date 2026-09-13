@@ -85,6 +85,7 @@ public static class DebugEndpoints
         DebugGenerateRequest? request,
         BackendLifecycle lifecycle,
         GenerationScheduler scheduler,
+        GenerationHealth generationHealth,
         HttpContext http)
     {
         // Fail closed: an unknown remote address is not a loopback address.
@@ -123,10 +124,20 @@ public static class DebugEndpoints
             var callbacks = 0;
 
             IModelContext? context = null;
+            var generationAttempted = false;
+            var outcomeClassified = false;
             try
             {
+                var systemTextFailure = SystemTextGuard.RefusalFor(backend, request.System, includesToolDefinitions: false);
+                if (systemTextFailure is not null)
+                {
+                    return systemTextFailure.ToResult();
+                }
+
+                generationAttempted = true;
                 context = backend.CreateContext(request.System);
                 var usable = backend.GetUsablePromptLength(context, request.Prompt);
+                var preflightKnownOverflow = usable is { } usablePromptChars && usablePromptChars < request.Prompt.Length;
 
                 var result = await backend.GenerateAsync(
                     context,
@@ -143,6 +154,12 @@ public static class DebugEndpoints
 
                 stopwatch.Stop();
                 var totalMs = stopwatch.Elapsed.TotalMilliseconds;
+                if (!http.RequestAborted.IsCancellationRequested)
+                {
+                    _ = GenerationOutcome.Classify(result, cancelledByCut: false,
+                        health: preflightKnownOverflow ? null : generationHealth, durationMs: totalMs);
+                    outcomeClassified = true;
+                }
                 var ttftMs = callbacks == 0 ? totalMs : firstTokenTicks * 1000.0 / Stopwatch.Frequency;
                 var decodeMs = totalMs - ttftMs;
                 double? cps = callbacks > 1 && decodeMs > 0 ? (callbacks - 1) * 1000.0 / decodeMs : null;
@@ -164,7 +181,10 @@ public static class DebugEndpoints
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                return OpenAiError.Result(StatusCodes.Status502BadGateway, $"Backend threw: {ex.GetType().Name}: {ex.Message}", OpenAiError.Server, code: "backend_error");
+                return GenerationFailure.FromException(
+                    ex,
+                    generationAttempted && !outcomeClassified ? generationHealth : null,
+                    stopwatch.Elapsed.TotalMilliseconds).ToResult();
             }
             finally
             {
@@ -184,7 +204,7 @@ public static class DebugEndpoints
             return scheduled.Result!;
         }
 
-        var failure = SchedulerAdmission.FailureFor(admission, scheduled.RetryAfterSeconds);
+        var failure = SchedulerAdmission.FailureFor(admission, scheduled.RetryAfterSeconds, generationHealth);
         SchedulerAdmission.ApplyRetryAfter(http.Response, admission, scheduled.RetryAfterSeconds);
         return failure.ToResult();
     }

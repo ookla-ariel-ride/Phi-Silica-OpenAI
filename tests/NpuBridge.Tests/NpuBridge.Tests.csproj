@@ -9,8 +9,10 @@
     <RootNamespace>NpuBridge.Tests</RootNamespace>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
+    <!-- SystemTextGuard's wire text is culture-invariant; its regression test needs a real de-DE host culture. -->
+    <InvariantGlobalization>false</InvariantGlobalization>
     <!-- Analyzer rules that fight test naming/style. -->
-    <NoWarn>$(NoWarn);CA1707;CA2007;CA1861</NoWarn>
+    <NoWarn>$(NoWarn);CA1707;CA2007;CA1861;CA1305</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

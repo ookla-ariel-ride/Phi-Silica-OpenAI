@@ -17,6 +17,7 @@ land here instead of widening the chunk. Each entry says where it came from and 
 - **Embeddings endpoint.** Phi Silica exposes `GenerateEmbeddingVectors`; `/v1/embeddings` is a small
   wrapper. Aion has no equivalent.
 - **Context TTL / idle expiry** in the context cache, in addition to LRU.
+- **Per-build context-window discovery.** Phi Silica currently exposes the D80-measured 3,581-token usable window as a backend constant for D97's native-system guard. A future initialization probe could create an empty context, call the preflight on long ASCII input, and convert the result with the backend counter. It needs hardware validation and must never use an unsafe system prompt.
 - **Listener auth** (bearer token) for anyone who binds beyond localhost.
 - **Content-filter option pass-through** (`ContentFilterOptions` on Phi Silica).
 - **LoRA adapters** (`LanguageModelOptions.LowRankAdapter`).
@@ -54,6 +55,32 @@ land here instead of widening the chunk. Each entry says where it came from and 
   `Task.WaitAsync` uses today, which is a production change and so out of scope for a coverage-only
   task. A genuine client-disconnect mid-stream is covered on both endpoints as of task 3b (fix round 1).
 
+## 2026-09-12 wave leftovers (issues #29, #30, #31)
+
+- **An empty `tool_calls` fence reaches the client as content** (issue #33, D99). On the second turn
+  of a tool round trip the model answered with a fenced `{"tool_calls": []}` and nothing else;
+  `ToolCallParser` correctly treats an empty array as no call, so the client got the fence as prose
+  with `finish_reason: stop`. Options: strip a reply that is nothing but an empty fence (hides what the
+  model did), or document that clients treat it as "no answer" and re-ask. Either way the tool block's
+  instructions could tell the model to answer in prose when no tool applies; one `tool-probe.ps1` cell
+  would measure whether that removes it.
+- **`/healthz` fault attribution leftovers** (issue #34, from the second review of the #30 fix). The
+  armed window that makes a `CreateContext` throw count as a backend fault also covers in-process work
+  before classification (the cut, the raw-output log, the tokenizer calls in the session lookup and the
+  system-text guard), so a bridge-internal throw there after a good generation is labelled
+  `backend_fault`; closing it means the recorder learning "a backend call was made" from
+  `ConversationSession`. Also: an SSE write failure ahead of `RequestAborted` can record a fault (a
+  narrow pre-existing race); the cut-counts-as-success test reaches the cut-cancelled branch only
+  probabilistically and needs a mid-generation gate on `FakeBackend` (D54); `duration_ms` is 0 for the
+  scheduler-routed cancellation fault and the JSON shapes' fault duration includes the queue wait;
+  ten other `/healthz` reads in `smoke.ps1` still expect only 200; no test pins that the #29 guard's
+  refusal records nothing, and the `CreateContext`-throw case is pinned on the chat JSON shape only.
+- **Serena is unusable by concurrent worktree executors** (observed 2026-09-12 during this wave). The
+  serena MCP server is one process per session with one active project; three Sidequest executors in
+  separate worktrees all edited through it and every edit landed in whichever worktree had activated
+  serena last. Until the upstream fix, dispatch briefs forbid serena in executors; this session's
+  orchestrator still uses it for reads. Worth an upstream report on the Toolshed repository.
+
 ## 2026-09-11 test coverage audit
 
 Three subagent audits (options against tests, the uncovered lines of a coverlet report, the smoke
@@ -65,13 +92,12 @@ issues filed that day. `coverlet.collector` is now in the test project; run
 `dotnet test --collect:"XPlat Code Coverage"` for the report.
 The first six unit tests and the smoke script's first three items landed on 2026-09-11 (D79); the
 rest of both issues stays open, as does the CI job.
-- **Recreate the model after a runtime RPC fault.** Twice on 2026-09-11 the first generation after a
-  Phi Silica start failed with `COMException: The remote procedure call failed`, and every later
-  generation in that process failed with `The RPC server is unavailable (0x800706BA)`; nothing in the
-  Application log, and a restart cleared it. The bridge maps both to 502 `backend_error` and keeps
-  serving a dead handle. `PhiSilicaBackend` could dispose and recreate the `LanguageModel` (and drop
-  every cached context) when a generation fails with an RPC-class HRESULT, or `/healthz` could at
-  least turn 503 after one. Needs a decision on whether to retry the request that hit the fault.
+- **Recreate the model after a runtime RPC fault.** `/healthz` now reports `degraded` after two
+  consecutive backend faults, which is the measurable trigger for evaluating recovery. Do not recreate
+  automatically yet: D94 records a crash-induced wedge that self-healed after several minutes and a
+  separate sustained RPC wedge that only a process restart cleared. Recreating the shared model handle
+  could prolong the first case, and it is unknown whether the two episodes are one fault. Revisit after
+  more evidence establishes a safe recovery policy and whether to retry the request that found it.
 - **Keep-alive waits driven by the injected `TimeProvider`.** `WaitForFirstDeltaAsync` times its wait
   on the wall clock, so a test can prove a non-positive first delay is accepted but not what it falls
   back to (zero or any non-negative span would pass), and the disabled-interval test's zero row leans

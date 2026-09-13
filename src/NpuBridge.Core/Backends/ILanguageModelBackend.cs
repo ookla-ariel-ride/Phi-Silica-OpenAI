@@ -45,6 +45,12 @@ public interface ILanguageModelBackend : IAsyncDisposable
     Tokenizers.ITokenCounter TokenCounter { get; }
 
     /// <summary>
+    /// Measured usable context-window size in this backend's tokens, or <c>null</c> when it is unknown.
+    /// A known window lets the native-system-text guard refuse text that would leave no prompt room.
+    /// </summary>
+    int? ContextWindowTokens => null;
+
+    /// <summary>
     /// Backend-specific facts surfaced verbatim in <c>/healthz</c> (for example <c>laf_status</c>).
     /// Keys are snake_case; values must be JSON-serialisable.
     /// </summary>

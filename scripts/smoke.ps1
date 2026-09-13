@@ -366,6 +366,7 @@ try {
                 $last = $r.Content | ConvertFrom-Json
                 if ($r.StatusCode -eq 200) { break }
                 if ($last.status -eq 'failed') { throw "backend failed: $($last.error)" }
+                if ($last.status -eq 'degraded') { throw "backend is degraded: $($last.last_generation.error)" }
             } catch [System.Net.Http.HttpRequestException] { }
             Start-Sleep -Seconds 2
         }
@@ -777,6 +778,47 @@ try {
         $lines -join "`n"
     }
 
+    Step 'native system text is refused before CreateContext' {
+        # D97: 32,000 characters is safe to send and unit tests cover the character ceiling itself.
+        # This hardware step instead proves that the boundary-sized text exceeds the token window.
+        $tokenText = -join (1..2500 | ForEach-Object { "alpha$_ " })
+        if ($tokenText.Length -gt 32000) { throw "the offline token probe is $($tokenText.Length) characters, above the 32,000-character ceiling" }
+        $tokenText = $tokenText.PadRight(32000, 'x')
+        $tokenized = Get-Json '/debug/tokenize' 'POST' (@{ text = $tokenText } | ConvertTo-Json -Compress)
+        if ($tokenized.counter -ne 'phi-3') { Skip "native system-text guard requires Phi3TokenCounter (phi-3); this backend reports $($tokenized.counter)" }
+        if ([int]$tokenized.tokens -le 3581) { throw "the 32,000-character token probe counted $($tokenized.tokens) tokens, not above Phi Silica's 3,581-token window" }
+
+        $cachedBefore = (Get-Json '/healthz').contexts_cached
+        $body = @{ model = $servedModel; temperature = 0; messages = @(
+            @{ role = 'system'; content = $tokenText }
+            @{ role = 'user'; content = 'Reply with exactly the word PONG.' }
+        ) } | ConvertTo-Json -Depth 5
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add("offline: 32,000 system characters = $($tokenized.tokens) $($tokenized.counter) tokens (above the context window)")
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $response = Invoke-WebRequest -Uri "$base/v1/chat/completions" -Method POST -Body $body -ContentType 'application/json' -SkipHttpErrorCheck -TimeoutSec 30
+        $sw.Stop()
+        $tokenError = $response.Content | ConvertFrom-Json -Depth 20
+        if ([int]$response.StatusCode -ne 400 -or $tokenError.error.code -ne 'context_length_exceeded') { throw "token guard: expected HTTP 400 context_length_exceeded; got HTTP $($response.StatusCode): $($response.Content)" }
+        if ($tokenError.error.message -notmatch 'system text alone exceeds the context window') { throw "token guard: missing native-system detail: $($tokenError.error.message)" }
+        if ($sw.ElapsedMilliseconds -ge 2000) { throw "token guard took $($sw.ElapsedMilliseconds) ms, not under 2,000 ms" }
+        if ((Get-Json '/healthz').contexts_cached -ne $cachedBefore) { throw 'token guard changed contexts_cached despite creating no context' }
+        $lines.Add("token guard: HTTP 400 after $($sw.ElapsedMilliseconds) ms, cache stayed $cachedBefore")
+
+        $streamBody = @{ model = $servedModel; temperature = 0; stream = $true; messages = @(
+            @{ role = 'system'; content = $tokenText }
+            @{ role = 'user'; content = 'Reply with exactly the word PONG.' }
+        ) } | ConvertTo-Json -Depth 5
+        $stream = Invoke-Sse '/v1/chat/completions' $streamBody 30
+        if ($stream.StatusCode -ne 400 -or $stream.Frames.Count -ne 0) { throw "streamed token guard: expected plain HTTP 400 before any frame; got HTTP $($stream.StatusCode), frames=$($stream.Frames.Count): $($stream.Body)" }
+        $streamError = $stream.Body | ConvertFrom-Json -Depth 20
+        if ($streamError.error.code -ne 'context_length_exceeded' -or $streamError.error.message -notmatch 'system text alone exceeds the context window') { throw "streamed token guard returned the wrong error: $($stream.Body)" }
+        $lines.Add('streamed token guard: plain HTTP 400 before any SSE frame')
+        $lines.Add('character ceiling: covered by unit tests; no system text above 32,000 characters was sent')
+        $lines -join [Environment]::NewLine
+    }
+
     # The D80 measurement, repeated per build: the preflight is the runtime's own tokenizer answering
     # "this many characters fit", so if the bridge's counter is the runtime's, every text's fitting
     # prefix counts the same number of tokens. Three texts with very different characters per token;
@@ -788,6 +830,7 @@ try {
         # without the preflight's numbers, so no generation is spent finding out first.
         $t = Get-Json '/debug/tokenize' 'POST' (@{ text = 'probe' } | ConvertTo-Json -Compress)
         if ($t.counter -eq 'chars/4') { Skip "$Backend counts chars/4: no measured tokenizer to compare with the preflight" }
+        $health = Get-Json '/healthz'
 
         $fox = ('The quick brown fox jumps over the lazy dog. ' * 5000) + "`nSummarize the text above in one sentence."
         $json = '[' + ((1..3000 | ForEach-Object { "{`"id`":$_,`"value`":$(($_ * 7919) % 10007),`"tag`":`"item-$_`"}" }) -join ',') + ']'
@@ -815,6 +858,16 @@ try {
         # three times the count), lands far outside it.
         if ($spread -gt [Math]::Ceiling($max * 0.02)) {
             throw (($lines + "the counts differ by $spread tokens, more than 2 % of ${max}: the runtime's tokenizer is not the bridge's counter, or the preflight is being read in the wrong units") -join '; ')
+        }
+        if ($null -eq $health.context_window_tokens) {
+            $lines += 'context_window_tokens is null; D80 boundary cross-check skipped'
+        }
+        else {
+            $reportedWindow = [int]$health.context_window_tokens
+            if ([Math]::Abs($max - $reportedWindow) -gt 1) {
+                throw (($lines + "the measured D80 boundary is $max $($t.counter) tokens but /healthz reports context_window_tokens=$reportedWindow") -join '; ')
+            }
+            $lines += "context_window_tokens=$reportedWindow; measured D80 boundary=$max $($t.counter) tokens"
         }
         ($lines + "spread $spread tokens; the usable window of an empty context is about $max $($t.counter) tokens") -join "`n"
     }
@@ -1321,6 +1374,11 @@ tokenizer on phi-silica; these ratios are both assumptions checked on one real g
 
         $lines.Add("verdict for the log: D52 shipped a ${firstKeepAliveMs} ms first keep-alive as a reasoned default and said this script owed the measurement. The numbers above are it (D52, D55).")
         $lines -join "`n"
+    }
+
+    InfoStep 'final generation health' {
+        $health = Get-Json '/healthz' -expect 200,503
+        "last_generation=$($health.last_generation | ConvertTo-Json -Compress -Depth 5) consecutive_backend_faults=$($health.consecutive_backend_faults)"
     }
 } finally {
     if ($proc) {

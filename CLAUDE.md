@@ -15,13 +15,14 @@ bypass the tool-call emulation rather than use it.
 
 **All eight chunks of `docs/PLAN.md` are built and merged; there is no next chunk.** Work from here
 is GitHub issues. `docs/PLAN.md` is the signed-off design; `docs/DECISIONS.md` records why things are
-the way they are, decision by decision (D1 to D96), and is where the chunk-by-chunk history this
+the way they are, decision by decision (D1 to D99), and is where the chunk-by-chunk history this
 section used to duplicate actually lives; `docs/SESSION-HANDOFF.md` carries the current state and
 what to do next; `docs/FUTURE.md` holds deferred work. Read the handoff first; update DECISIONS and
 FUTURE whenever work changes a choice or defers something.
 
-Current state: 932 tests pass (last confirmed by CI on 2026-09-12), `smoke.ps1 -Backend phi-silica` passes clean on hardware, and the
-repository is `ookla-ariel-ride/npu-bridge`.
+Current state: 950 tests pass (last run by the Sidequest integration gate on `7a3207c`, 2026-09-12), `smoke.ps1 -Backend phi-silica`
+passes clean on hardware (2026-09-12, evening: all steps, 0 skipped, 6 informational; `/healthz` `context_window_tokens` 3581 matched the
+measured D80 boundary exactly), and the repository is `ookla-ariel-ride/npu-bridge`.
 
 Standing facts that will cost you a session if you do not know them:
 
@@ -43,8 +44,9 @@ Standing facts that will cost you a session if you do not know them:
   can use this bridge at all. Compliance below that boundary is near-perfect; the window is the
   constraint, not the model's protocol discipline.
 
-Open issues carry the rest: #24 to #28 are chunk 8's known leftovers, #29 to #31 came out of the
-issue #21 measurement (#29 is the serious one — see the crash warning under Commands), and #2, #11,
+Open issues carry the rest: #24 to #28 are chunk 8's known leftovers; #29 to #31 (the issue #21
+findings) shipped on 2026-09-12 as D97 to D99 and left #33 (an empty `tool_calls` fence delivered as
+content), #34 (healthz fault-attribution leftovers) and #35 (system-text guard leftovers); #2, #11,
 #14 to #17, #19 and #22 are longer-running.
 
 ## Machine reality
@@ -79,7 +81,7 @@ dotnet run --project src/NpuBridge -- --backend fake --verbose   # run the exe (
 .\scripts\identity.ps1 -Install                # sparse package identity for Phi Silica; installs the runtime dep; prints the PFN
 .\scripts\identity.ps1 -Status                 # is the package registered, which PFN
 .\scripts\smoke.ps1 -Backend phi-silica        # real NPU run: health, models, /debug/generate, chat (JSON and SSE), the cut, the cache hit, the overflow refusal and --truncate-history (on a second server), the D80 tokenizer boundary check, the D53/D55 measurements, the tool-call compliance probe (-ToolProbeRuns, default 5), the chunk 8 concurrency steps (two requests really queue; --queue-capacity 1 admits one and 429s the rest) and /v1/completions on both shapes, teardown
-.\scripts\tool-probe.ps1 -Include WindowOccupancy -Runs 8   # issue #21 hard-case tool-call measurement against a RUNNING bridge; five dimensions (tool count, schema depth, system-prompt pressure, multi-step, window occupancy), -JsonOut for the numbers. Never sends >32K chars of system text: above ~44K the Windows model host fail-fasts (D94)
+.\scripts\tool-probe.ps1 -Include WindowOccupancy -Runs 8   # issue #21 hard-case tool-call measurement against a RUNNING bridge; five dimensions (tool count, schema depth, system-prompt pressure, multi-step, window occupancy), -Stream checks JSON/SSE tool-call parity, -SelfTest checks the parser without a bridge, and -JsonOut writes the numbers. Never sends >32K chars of system text: above ~44K the Windows model host fail-fasts (D94)
 NpuBridge.exe task install|status|uninstall    # logon task that starts Phi Silica with identity (install/uninstall elevated)
 NpuBridge.exe service install|start|stop|uninstall   # Windows service for aion/fake (elevated)
 ```
@@ -101,7 +103,7 @@ unavailable` in 3 to 17 ms, `/healthz` still says `ready` (issue #30), a bridge 
 it, and the host processes are protected so they cannot be killed. It self-heals after minutes. This is
 easy to trigger by accident, because tool emulation renders the tool block into the system text — a
 real agent's toolset is ~37 KB on the wire. Find limits with `POST /debug/tokenize`, not by sending the request.
-"RPC server is unavailable" persisting past one retry means this happened; wait it out.
+"RPC server is unavailable" persisting past one retry means this happened; wait it out. The bridge now refuses native system text above 32,000 characters or the backend's known window token count before `CreateContext` (D97); the warning still applies to bare backend calls and to `/debug/generate` on builds before this change.
 
 Aion's SDK NuGet is not on nuget.org. It comes from the sample repo's GitHub release
 (`AionInstructPreview.Text.Framework.1.0.0.nupkg`) and lives in `nuget-local/`, wired by `nuget.config`.
@@ -166,6 +168,7 @@ context is in the cache or disposed, never both, never neither.
 HTTP → ChatRequestPreparer (shared by both shapes, and by /v1/completions after the model-id check):
        body → validate DTO → backend readiness
      → ignored-parameter warnings → placement → PromptTemplate (messages → system + transcript)
+     → native system guard (character ceiling and context-window tokens) → 400 context_length_exceeded
      → OutputLimits (max_tokens/stop) → PreparedChatRequest
      → GenerationScheduler.ScheduleAsync: bounded queue (--queue-capacity), one worker
          queue full      → 429 + Retry-After (depth x rolling mean), rate_limit_error/queue_full
@@ -336,13 +339,16 @@ Live today:
   `x-npu-bridge-truncated-turns: N` (turns dropped) to the response once a generation is attempted on
   the truncated transcript; the 400 refusal carries no header. On a stream that had already sent
   a keep-alive when a status-driven truncation happened, the header cannot be sent and the log says so.
+- **Native system-text guard (D97).** During preparation, before the scheduler, the bridge refuses native system text when it exceeds 32,000 characters or a backend's known usable context window in tokens. It uses the same 400 `context_length_exceeded` envelope, takes no queue slot, does not create a context, and does not retry with `--truncate-history`; folded placement remains governed by the normal preflight.
 - **The context cache** (D71, D72): a request whose transcript extends a cached prefix (ending in an
   assistant turn, longest match wins) generates on that context with only the tail rendered, in the
   marker format; a context goes back in only after a `Complete`, uncut generation, under the key of
   the transcript plus the reply. `usage.prompt_tokens` estimates the whole transcript on a hit and a
   miss alike; the log line's `prompt_chars` is what was sent, and it also carries `cache=hit|miss`,
   `tail_turns=N` and `truncated_turns=N`. `/healthz` reports `contexts_cached`,
-  `context_cache_capacity`, `context_cache_hits` and `context_cache_misses`.
+  `context_cache_capacity`, `context_cache_hits`, `context_cache_misses`, `last_generation`,
+  `consecutive_backend_faults` and `context_window_tokens`. It returns `503 degraded` after two consecutive backend faults while
+  still admitting requests, so a later successful generation can clear the state.
 - Token counts in `usage` are the backend's counter's (D80): Phi-3 tokens on Phi Silica, `ceil(chars/4)`
   on Aion and the fake (D44). `prompt_tokens` counts the whole rendered transcript plus the native
   system text, the same on a hit and a miss; on a stream, `completion_tokens` counts the text the

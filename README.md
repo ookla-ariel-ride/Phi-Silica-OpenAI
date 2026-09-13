@@ -163,7 +163,7 @@ Keep-alive comments hold the connection open while that happens.
 |---|---|
 | `POST /v1/chat/completions` | chat completions, streaming and non-streaming |
 | `POST /v1/completions` | the legacy text-completion shape, streaming and non-streaming |
-| `GET /healthz` | backend state, load time, package identity, the context cache's count and hit/miss counters, the queue's depth and capacity, the streaming keep-alive timings, diagnostics. 200 when ready, 503 otherwise |
+| `GET /healthz` | backend state, load time, package identity, context-cache and queue counters, streaming keep-alive timings, diagnostics, `last_generation`, and `consecutive_backend_faults`. Returns 200 while ready with fewer than two consecutive backend faults; returns 503 when loading, unavailable, or degraded |
 | `GET /v1/models`, `GET /v1/models/{id}` | the active model id |
 | `POST /debug/generate` | one literal prompt into the backend with timing. Diagnostic, loopback only |
 | `POST /debug/tokenize` | the backend's token count of a literal text, and which counter answered. Diagnostic, loopback only, works while the model loads |
@@ -299,11 +299,12 @@ process, `tool_choice: "none"` for one request.
 
 One safety note for anyone probing these limits. A system prompt much over 40,000 characters does not
 merely overflow: it crashes the Windows model host and leaves the NPU unusable for the whole machine
-for several minutes (`docs/DECISIONS.md` D94, issue #29). Two things make that worse than it sounds —
-`/healthz` keeps reporting `ready` the entire time, so the bridge looks healthy while nothing can
-generate, and a client that retries on 502 turns one impossible request into 30 to 40 seconds of NPU
-time. Treat 40,000 as the ceiling rather than the 44,000 where it was first seen to break, and find
-the boundary with `POST /debug/tokenize` rather than by sending the request.
+for several minutes (`docs/DECISIONS.md` D94, issue #29). After two consecutive backend faults,
+`/healthz` returns 503 with `status: degraded`, the latest outcome, and the fault count. The bridge
+still admits requests so a runtime that recovers can clear the degraded state. A client that keeps
+retrying 502 responses can still spend 30 to 40 seconds of NPU time on an impossible request. Treat
+40,000 as the ceiling rather than the 44,000 where it was first seen to break, and find the boundary with
+`POST /debug/tokenize` rather than by sending the request.
 
 ## Configuration
 

@@ -93,6 +93,9 @@ public sealed record HealthResponse(
     int ContextCacheCapacity,
     long ContextCacheHits,
     long ContextCacheMisses,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] GenerationHealthSnapshot? LastGeneration,
+    int ConsecutiveBackendFaults,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? ContextWindowTokens,
     int FirstKeepAliveMs,
     int KeepAliveIntervalMs,
     string? Error,
@@ -108,19 +111,26 @@ internal static class HealthEndpoint
         TimeProvider time,
         ContextCache cache,
         StreamingOptions streaming,
-        GenerationScheduler scheduler)
+        GenerationScheduler scheduler,
+        GenerationHealth generationHealth)
     {
         var snapshot = lifecycle.Snapshot;
         var now = time.GetUtcNow();
         var elapsed = snapshot.LoadingElapsed(now);
 
-        var status = snapshot.Kind switch
-        {
-            BackendStateKind.Ready => "ready",
-            BackendStateKind.Loading => "loading",
-            BackendStateKind.Failed => "failed",
-            _ => "not_started",
-        };
+        var health = generationHealth.Snapshot;
+        var lastGeneration = health.LastGeneration;
+        var consecutiveBackendFaults = health.ConsecutiveBackendFaults;
+        var degraded = snapshot.Kind == BackendStateKind.Ready && consecutiveBackendFaults >= 2;
+        var status = degraded
+            ? "degraded"
+            : snapshot.Kind switch
+            {
+                BackendStateKind.Ready => "ready",
+                BackendStateKind.Loading => "loading",
+                BackendStateKind.Failed => "failed",
+                _ => "not_started",
+            };
 
         var body = new HealthResponse(
             Status: status,
@@ -137,13 +147,18 @@ internal static class HealthEndpoint
             ContextCacheCapacity: cache.Capacity,
             ContextCacheHits: cache.Hits,
             ContextCacheMisses: cache.Misses,
+            LastGeneration: lastGeneration,
+            ConsecutiveBackendFaults: consecutiveBackendFaults,
+            ContextWindowTokens: lifecycle.Backend.ContextWindowTokens,
             FirstKeepAliveMs: (int)streaming.FirstKeepAliveDelay.TotalMilliseconds,
             KeepAliveIntervalMs: (int)streaming.KeepAliveInterval.TotalMilliseconds,
-            Error: snapshot.Error,
+            Error: degraded ? lastGeneration?.Error : snapshot.Error,
             Diagnostics: lifecycle.Backend.Diagnostics);
 
         http.Response.Headers.CacheControl = "no-store";
-        var code = snapshot.Kind == BackendStateKind.Ready ? StatusCodes.Status200OK : StatusCodes.Status503ServiceUnavailable;
+        var code = snapshot.Kind == BackendStateKind.Ready && !degraded
+            ? StatusCodes.Status200OK
+            : StatusCodes.Status503ServiceUnavailable;
         if (snapshot.Kind == BackendStateKind.Loading)
         {
             http.Response.Headers.RetryAfter = "10";

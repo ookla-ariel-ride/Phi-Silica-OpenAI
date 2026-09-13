@@ -417,7 +417,8 @@ internal sealed class ConversationSession
         // usage.prompt_tokens, in the backend's own count (D80). The native system text is counted on
         // its own: the runtime holds it in the context, outside the prompt string.
         var counter = backend.TokenCounter;
-        var transcriptTokens = counter.Count(full.Prompt) + (nativeSystem is null ? 0 : counter.Count(nativeSystem));
+        // The preparer already counted this immutable native system text for the wire-level guard.
+        var transcriptTokens = counter.Count(full.Prompt) + (nativeSystem is null ? 0 : _prepared.NativeSystemTokens);
 
         var checkout = _cache.CheckoutLongest(ConversationKey.PrefixKeys(systemText, _turns));
         if (checkout is not null)
@@ -485,6 +486,6 @@ internal sealed class ConversationSession
             : "Send a shorter conversation, or start the bridge with --truncate-history to drop the oldest turns instead.";
         var detail = $"Backend '{_prepared.Backend.ModelId}' can take {usable} characters of {where}; the transcript is {lease.TranscriptChars} characters over {_turns.Count} turn(s). {hint}";
 
-        return GenerationFailure.FromStatus(new GenerationResult(string.Empty, GenerationStatus.PromptLargerThanContext, detail))!;
+        return GenerationFailure.ContextLengthExceeded(detail);
     }
 }
