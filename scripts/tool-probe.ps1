@@ -180,28 +180,50 @@ function Get-ToolCallShapeViolations($calls, [string] $finishReason, [bool] $isS
     $violations.ToArray()
 }
 
-# Produces the precise JSON compared by the parity check. It copies every wire field except index, so an
-# unexpected extra field also makes the byte comparison fail instead of being normalised away.
-function ConvertTo-CanonicalToolCallJson($calls) {
-    $canonical = [System.Collections.Generic.List[object]]::new()
-    foreach ($call in @($calls | Where-Object { $null -ne $_ })) {
+# Canonicalise objects recursively so key insertion order never affects parity. At the call-object
+# boundary, omit wire metadata that is expected to differ between response shapes or responses.
+function ConvertTo-CanonicalValue($value, [bool] $omitCallMetadata = $false) {
+    if ($null -eq $value) { return $null }
+    if ($value -is [string] -or $value.GetType().IsPrimitive -or $value -is [decimal]) { return $value }
+    if ($value -is [System.Collections.IDictionary]) {
         $copy = [ordered]@{}
-        foreach ($property in $call.PSObject.Properties) {
-            if ($property.Name -eq 'index') { continue }
-            if ($property.Name -eq 'function' -and $null -ne $property.Value) {
-                $functionCopy = [ordered]@{}
-                foreach ($functionProperty in $property.Value.PSObject.Properties) {
-                    $functionCopy[$functionProperty.Name] = $functionProperty.Value
-                }
-                $copy[$property.Name] = [pscustomobject] $functionCopy
-            }
-            else {
-                $copy[$property.Name] = $property.Value
-            }
+        foreach ($key in @($value.Keys | Sort-Object)) {
+            $copy[[string] $key] = ConvertTo-CanonicalValue $value[$key]
         }
-        $canonical.Add([pscustomobject] $copy)
+        return [pscustomobject] $copy
     }
-    ConvertTo-Json -InputObject $canonical.ToArray() -Compress -Depth 10
+    if ($value -is [System.Collections.IEnumerable]) {
+        return @($value | ForEach-Object { ConvertTo-CanonicalValue $_ })
+    }
+
+    $copy = [ordered]@{}
+    foreach ($property in @($value.PSObject.Properties | Sort-Object Name)) {
+        if ($omitCallMetadata -and ($property.Name -eq 'index' -or $property.Name -eq 'id')) { continue }
+        $copy[$property.Name] = ConvertTo-CanonicalValue $property.Value
+    }
+    [pscustomobject] $copy
+}
+
+function Get-ToolCallIds($calls) {
+    @($calls | Where-Object { $null -ne $_ } | ForEach-Object {
+        if ($_.PSObject.Properties.Name -contains 'id') { [string] $_.id } else { $null }
+    })
+}
+
+function Get-ToolCallKeyOrder($calls) {
+    @($calls | Where-Object { $null -ne $_ } | ForEach-Object {
+        $callOrder = (@($_.PSObject.Properties.Name) -join ',')
+        $function = if ($_.PSObject.Properties.Name -contains 'function') { $_.function } else { $null }
+        $functionOrder = if ($null -ne $function) { (@($function.PSObject.Properties.Name) -join ',') } else { '' }
+        "call=[$callOrder]; function=[$functionOrder]"
+    }) -join ' | '
+}
+
+function ConvertTo-CanonicalToolCallJson($calls) {
+    $canonical = @($calls | Where-Object { $null -ne $_ } | ForEach-Object {
+        ConvertTo-CanonicalValue $_ $true
+    })
+    ConvertTo-Json -InputObject $canonical -Compress -Depth 10
 }
 
 function Compare-ToolCallShapes($jsonCalls, [string] $jsonFinishReason, $streamCalls, [string] $streamFinishReason) {
@@ -209,9 +231,16 @@ function Compare-ToolCallShapes($jsonCalls, [string] $jsonFinishReason, $streamC
     $streamSerialisation = ConvertTo-CanonicalToolCallJson $streamCalls
     $callsIdentical = $jsonSerialisation -ceq $streamSerialisation
     $finishReasonIdentical = $jsonFinishReason -ceq $streamFinishReason
+    $jsonKeyOrder = Get-ToolCallKeyOrder $jsonCalls
+    $streamKeyOrder = Get-ToolCallKeyOrder $streamCalls
     [pscustomobject]@{
         JsonToolCalls = $jsonSerialisation
         StreamToolCalls = $streamSerialisation
+        JsonToolCallIds = @(Get-ToolCallIds $jsonCalls)
+        StreamToolCallIds = @(Get-ToolCallIds $streamCalls)
+        JsonKeyOrder = $jsonKeyOrder
+        StreamKeyOrder = $streamKeyOrder
+        KeyOrderDifferent = $jsonKeyOrder -cne $streamKeyOrder
         JsonFinishReason = $jsonFinishReason
         StreamFinishReason = $streamFinishReason
         ToolCallsIdentical = $callsIdentical
@@ -373,6 +402,9 @@ function Invoke-StreamParityRuns([string] $dimension, [string] $cell, $jsonRuns,
             JsonStatusCode = $jsonFacts.StatusCode; StreamStatusCode = $streamFacts.StatusCode
             JsonFinishReason = $comparison.JsonFinishReason; StreamFinishReason = $comparison.StreamFinishReason
             JsonToolCalls = $comparison.JsonToolCalls; StreamToolCalls = $comparison.StreamToolCalls
+            JsonToolCallIds = @($comparison.JsonToolCallIds); StreamToolCallIds = @($comparison.StreamToolCallIds)
+            JsonKeyOrder = $comparison.JsonKeyOrder; StreamKeyOrder = $comparison.StreamKeyOrder
+            KeyOrderDifferent = $comparison.KeyOrderDifferent
             StreamDone = $streamFacts.StreamDone; StreamParseErrors = @($streamFacts.StreamParseErrors)
         }
         $streamRow = [pscustomobject]@{
@@ -390,6 +422,9 @@ function Invoke-StreamParityRuns([string] $dimension, [string] $cell, $jsonRuns,
             $evidence = "json tool_calls=$($comparison.JsonToolCalls); stream tool_calls=$($comparison.StreamToolCalls); json finish=$($comparison.JsonFinishReason); stream finish=$($comparison.StreamFinishReason); comparable=$comparable"
             Add-Defect $context 'stream tool-call parity mismatch' $evidence
         }
+        if ($comparison.KeyOrderDifferent) {
+            Write-Info "$cell stream run=$($i + 1): informational key order differs (json=$($comparison.JsonKeyOrder); stream=$($comparison.StreamKeyOrder)); ids json=$($comparison.JsonToolCallIds -join ',') stream=$($comparison.StreamToolCallIds -join ',')"
+        }
         Write-Info "$cell stream run=$($i + 1): HTTP $($streamFacts.StatusCode) finish=$($streamFacts.FinishReason) parity=$verdict ($($streamResult.LatencyMs)ms)"
     }
     $cellVerdict = if (@($parities | Where-Object { $_.Verdict -eq 'MISMATCH' }).Count -eq 0) { 'identical' } else { 'MISMATCH' }
@@ -401,12 +436,12 @@ function Invoke-ToolProbeSelfTest {
     $fixtureSse = @'
 : keep-alive
 data: {"choices":[{"delta":{"role":"assistant"}}]}
-data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"location\":\""}}]}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_stream","type":"function","function":{"name":"get_weather","arguments":"{\"location\":\""}}]}}]}
 data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Paris\"}"}}]}}]}
 data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
 data: [DONE]
 '@
-    $jsonMessage = '{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"location\":\"Paris\"}"}}]}' | ConvertFrom-Json -Depth 12
+    $jsonMessage = '{"tool_calls":[{"function":{"arguments":"{\"location\":\"Paris\"}","name":"get_weather"},"type":"function","id":"call_json"}]}' | ConvertFrom-Json -Depth 12
     $assembled = ConvertFrom-ToolCallSse $fixtureSse
     if (-not $assembled.Done -or $assembled.FrameCount -ne 4 -or @($assembled.ParseErrors).Count -ne 0) { throw 'SSE fixture did not assemble cleanly' }
     if (@($assembled.Calls).Count -ne 1 -or $assembled.Calls[0].function.arguments -ne '{"location":"Paris"}') { throw 'SSE fixture did not concatenate arguments by index' }
@@ -414,7 +449,10 @@ data: [DONE]
 
     $same = Compare-ToolCallShapes $jsonMessage.tool_calls 'tool_calls' $assembled.Calls $assembled.FinishReason
     if (-not $same.Identical) { throw "expected identical parity, got JSON=$($same.JsonToolCalls) stream=$($same.StreamToolCalls)" }
-    Write-Host 'SELFTEST: parity identical passed'
+    if ($same.JsonToolCallIds[0] -eq $same.StreamToolCallIds[0] -or -not $same.KeyOrderDifferent) {
+        throw 'parity fixture did not exercise distinct ids and key order'
+    }
+    Write-Host "SELFTEST: parity identical passed (ids json=$($same.JsonToolCallIds -join ',') stream=$($same.StreamToolCallIds -join ','); key order differs)"
 
     $mutated = $fixtureSse.Replace('Paris\"}', 'Lyon\"}')
     $different = ConvertFrom-ToolCallSse $mutated
