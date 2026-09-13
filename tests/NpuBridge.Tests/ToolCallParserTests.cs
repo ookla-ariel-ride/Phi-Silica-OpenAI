@@ -99,6 +99,51 @@ public class ToolCallParserTests
         Assert.Equal("""{"tz":"UTC"}""", call.Arguments);
     }
 
+    [Theory]
+    [InlineData("""{"name":"get_time"}""")]
+    [InlineData("```json\n{\"name\":\"get_time\"}\n```")]
+    public void An_offered_zero_argument_tool_in_short_form_is_a_call(string reply)
+    {
+        var calls = ToolCallParser.Parse(reply, ["get_time"]);
+
+        Assert.NotNull(calls);
+        var call = Assert.Single(calls);
+        Assert.Equal("get_time", call.Name);
+        Assert.Equal("{}", call.Arguments);
+    }
+
+    [Fact]
+    public void An_unoffered_or_catalog_free_zero_argument_short_form_is_content()
+    {
+        const string reply = """{"name":"get_time"}""";
+
+        Assert.Null(ToolCallParser.Parse(reply, ["get_weather"]));
+        Assert.Null(ToolCallParser.Parse(reply));
+    }
+
+    [Theory]
+    [InlineData("```json\n{\"name\":\"Ada\"}\n```")]
+    [InlineData("""Here is the record: {"name":"Ada"}.""")]
+    public void A_bare_name_in_prose_remains_content_when_its_name_is_not_offered(string reply)
+    {
+        Assert.Null(ToolCallParser.Parse(reply, ["get_time"]));
+    }
+
+    [Fact]
+    public void A_bare_array_remains_content_even_when_it_names_an_offered_tool()
+    {
+        Assert.Null(ToolCallParser.Parse("""The staff list is [{"name":"Ada"},{"name":"Grace"}].""", ["Ada"]));
+    }
+
+    [Fact]
+    public void An_unwrapped_call_with_arguments_is_surfaced_even_when_its_name_is_not_offered()
+    {
+        var calls = ToolCallParser.Parse("""{"name":"not_offered","arguments":{}}""", ["get_time"]);
+
+        Assert.NotNull(calls);
+        Assert.Equal("not_offered", Assert.Single(calls).Name);
+    }
+
     [Fact]
     public void A_bare_array_of_calls_is_read_without_its_wrapper()
     {
@@ -256,6 +301,14 @@ public class ToolCallParserTests
     public void A_tool_definition_echoed_back_is_not_a_call(string reply)
     {
         Assert.Null(ToolCallParser.Parse(reply));
+    }
+
+    [Fact]
+    public void An_offered_tool_definition_echoed_back_is_not_a_zero_argument_call()
+    {
+        Assert.Null(ToolCallParser.Parse(
+            """{"name":"get_time","parameters":{"type":"object"}}""",
+            ["get_time"]));
     }
 
     /// <summary>

@@ -1069,7 +1069,18 @@ function Invoke-SystemPromptPressureProbe {
 function Invoke-MultiStepProbe {
     Write-Section 'dimension 4: multi-step -- a tool result fed back on a second turn (one case)'
     $question = 'What is the weather in Paris right now?'
-    $tools = @(Get-WeatherTool)
+    # This cell alone offers a zero-argument tool so the next hardware run can measure whether the
+    # model uses its short {"name":"get_time"} form without changing the other dimensions' counts.
+    $tools = @(
+        (Get-WeatherTool)
+        @{
+            type     = 'function'
+            function = @{
+                name        = 'get_time'
+                description = 'Get the current time'
+            }
+        }
+    )
 
     $firstCallJson = $null
     $attempts = 0

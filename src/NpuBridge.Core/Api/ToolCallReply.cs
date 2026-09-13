@@ -34,7 +34,7 @@ internal static class ToolCallReply
             return null;
         }
 
-        var parsed = ToolCallParser.Parse(content);
+        var parsed = ToolCallParser.Parse(content, tools.Names);
         if (parsed is null)
         {
             return null;
