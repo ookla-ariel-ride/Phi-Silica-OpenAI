@@ -1947,6 +1947,16 @@ first generation took 1,580 ms and returned 502 `The RPC server is unavailable`.
 returned 502 in 3 to 16 ms. The Application log had no `WorkloadsSessionHost` crash, and no oversized
 prompt had been sent.
 
+**2026-09-12 (late evening, local) addendum, second.** `/debug/generate` runs its prompt even when the
+preflight has answered that it does not fit (the endpoint exists to measure the raw backend, and
+`smoke.ps1`'s D52 step relies on that), and the runtime answers such a prompt with a generic `Error`
+after seconds (D55, D80). That `Error` is not recorded as a backend fault: when the preflight answered
+and `usable < prompt.Length`, the attempt records nothing, the same as a preflight refusal on the chat
+shapes. Two oversized debug prompts had turned a healthy bridge `degraded` before this. A *thrown*
+exception on the same prompt still records a fault, deliberately: a throw from any backend call is the
+wedge signature this state exists to surface, and suppressing it would hide the wedge whenever an
+operator retried an oversized prompt. Found by the whole-branch review of PR #36.
+
 **D99. The streamed tool-call shape agrees with the JSON shape on hardware, the cache round trip hits, and the wire fields sit where D83 said.**
 Issue #31's measurement, run with `scripts/tool-probe.ps1 -Stream -Include ToolCountSweep,WindowOccupancy,MultiStep -Runs 3 -HeadlineRuns 3 -OccupancyCells '70%'` against a bridge built from `main` at 9003a06 (the #29 guard and the SQ-9/SQ-10 probe fixes in), build 29648, `temperature: 0`, on 2026-09-12 at 17:37 local (00:37 UTC on 2026-09-13). 34 calls, every one HTTP 200.
 
