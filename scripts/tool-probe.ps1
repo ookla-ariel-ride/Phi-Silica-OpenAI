@@ -380,6 +380,27 @@ function Get-HealthzSnapshot {
     }
 }
 
+function Get-ToolCallParityAssessment($jsonFacts, $streamFacts) {
+    $comparison = Compare-ToolCallShapes $jsonFacts.Calls $jsonFacts.FinishReason $streamFacts.Calls $streamFacts.FinishReason
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    if ($jsonFacts.StatusCode -ne 200 -or $streamFacts.StatusCode -ne 200) {
+        $reasons.Add("HTTP statuses are not both 200 (json=$($jsonFacts.StatusCode), stream=$($streamFacts.StatusCode))")
+    }
+    if (@($jsonFacts.Calls).Count -eq 0 -or @($streamFacts.Calls).Count -eq 0) {
+        $reasons.Add("tool_calls missing (json=$(@($jsonFacts.Calls).Count), stream=$(@($streamFacts.Calls).Count))")
+    }
+    if (-not $streamFacts.StreamDone) { $reasons.Add('stream did not end with data: [DONE]') }
+    if (@($streamFacts.StreamParseErrors).Count -gt 0) { $reasons.Add('stream had SSE parse errors') }
+    $comparable = $reasons.Count -eq 0
+    $verdict = if (-not $comparable) { 'not comparable' } elseif ($comparison.Identical) { 'identical' } else { 'MISMATCH' }
+    [pscustomobject]@{
+        Comparison = $comparison
+        Comparable = $comparable
+        Verdict = $verdict
+        Reason = $reasons -join '; '
+    }
+}
+
 function Invoke-StreamParityRuns([string] $dimension, [string] $cell, $jsonRuns, [hashtable] $body, [int] $runCount) {
     $parities = [System.Collections.Generic.List[object]]::new()
     for ($i = 0; $i -lt $runCount; $i++) {
@@ -391,12 +412,11 @@ function Invoke-StreamParityRuns([string] $dimension, [string] $cell, $jsonRuns,
         $streamFacts = Get-ChatFacts $streamResult
         $jsonRun = $jsonRuns[$i]
         $jsonFacts = $jsonRun.Facts
-        $comparison = Compare-ToolCallShapes $jsonFacts.Calls $jsonFacts.FinishReason $streamFacts.Calls $streamFacts.FinishReason
-        $comparable = $jsonFacts.StatusCode -eq 200 -and $streamFacts.StatusCode -eq 200 -and $streamFacts.StreamDone -and @($streamFacts.StreamParseErrors).Count -eq 0
-        if (-not $comparable) {
-            $comparison.Identical = $false
-        }
-        $verdict = if ($comparison.Identical) { 'identical' } else { 'MISMATCH' }
+        $assessment = Get-ToolCallParityAssessment $jsonFacts $streamFacts
+        $comparison = $assessment.Comparison
+        $comparable = $assessment.Comparable
+        $verdict = $assessment.Verdict
+        $reason = $assessment.Reason
         $parity = [pscustomobject]@{
             Dimension = $dimension; Cell = $cell; Run = $i + 1; Verdict = $verdict; Comparable = $comparable
             JsonStatusCode = $jsonFacts.StatusCode; StreamStatusCode = $streamFacts.StatusCode
@@ -406,28 +426,31 @@ function Invoke-StreamParityRuns([string] $dimension, [string] $cell, $jsonRuns,
             JsonKeyOrder = $comparison.JsonKeyOrder; StreamKeyOrder = $comparison.StreamKeyOrder
             KeyOrderDifferent = $comparison.KeyOrderDifferent
             StreamDone = $streamFacts.StreamDone; StreamParseErrors = @($streamFacts.StreamParseErrors)
+            Reason = $reason
         }
         $streamRow = [pscustomobject]@{
             Dimension = $dimension; Cell = $cell; Run = $i + 1; StatusCode = $streamFacts.StatusCode
             FinishReason = $streamFacts.FinishReason; LatencyMs = $streamResult.LatencyMs
             Called = $streamFacts.Called; ToolNames = $streamFacts.ToolNames -join ','
             ToolCalls = $streamFacts.Calls; StreamDone = $streamFacts.StreamDone
-            StreamParseErrors = @($streamFacts.StreamParseErrors); ParityVerdict = $verdict
+            StreamParseErrors = @($streamFacts.StreamParseErrors); ParityVerdict = $verdict; ParityReason = $reason
         }
         $script:parityResults.Add($parity)
         $script:streamedCalls.Add($streamRow)
         $script:calls.Add($streamRow)
         $parities.Add($parity)
-        if (-not $comparison.Identical) {
+        if ($verdict -eq 'MISMATCH') {
             $evidence = "json tool_calls=$($comparison.JsonToolCalls); stream tool_calls=$($comparison.StreamToolCalls); json finish=$($comparison.JsonFinishReason); stream finish=$($comparison.StreamFinishReason); comparable=$comparable"
             Add-Defect $context 'stream tool-call parity mismatch' $evidence
         }
         if ($comparison.KeyOrderDifferent) {
             Write-Info "$cell stream run=$($i + 1): informational key order differs (json=$($comparison.JsonKeyOrder); stream=$($comparison.StreamKeyOrder)); ids json=$($comparison.JsonToolCallIds -join ',') stream=$($comparison.StreamToolCallIds -join ',')"
         }
-        Write-Info "$cell stream run=$($i + 1): HTTP $($streamFacts.StatusCode) finish=$($streamFacts.FinishReason) parity=$verdict ($($streamResult.LatencyMs)ms)"
+        Write-Info "$cell stream run=$($i + 1): HTTP json=$($jsonFacts.StatusCode) stream=$($streamFacts.StatusCode) finish=$($streamFacts.FinishReason) parity=$verdict$(if ($reason) { " reason=$reason" }) ($($streamResult.LatencyMs)ms)"
     }
-    $cellVerdict = if (@($parities | Where-Object { $_.Verdict -eq 'MISMATCH' }).Count -eq 0) { 'identical' } else { 'MISMATCH' }
+    $mismatchN = @($parities | Where-Object { $_.Verdict -eq 'MISMATCH' }).Count
+    $notComparableN = @($parities | Where-Object { $_.Verdict -eq 'not comparable' }).Count
+    $cellVerdict = if ($mismatchN -gt 0) { 'MISMATCH' } elseif ($notComparableN -gt 0) { "not comparable ($notComparableN/$runCount pairs)" } else { 'identical' }
     Write-Info "stream parity: $cellVerdict"
     $script:cells.Add([pscustomobject]@{ Dimension = $dimension; Cell = "$cell (stream)"; Runs = $runCount; Summary = "stream parity: $cellVerdict" })
 }
@@ -459,6 +482,20 @@ data: [DONE]
     $mismatch = Compare-ToolCallShapes $jsonMessage.tool_calls 'tool_calls' $different.Calls $different.FinishReason
     if ($mismatch.Identical) { throw 'expected mutated argument to produce MISMATCH' }
     Write-Host 'SELFTEST: parity mismatch detected'
+
+    $stream502Facts = [pscustomobject]@{
+        StatusCode = 502; FinishReason = $null; Calls = @(); StreamDone = $false; StreamParseErrors = @()
+    }
+    $json200Facts = [pscustomobject]@{
+        StatusCode = 200; FinishReason = 'tool_calls'; Calls = @($jsonMessage.tool_calls)
+    }
+    $defectsBeforeNotComparable = $script:defects.Count
+    $notComparable = Get-ToolCallParityAssessment $json200Facts $stream502Facts
+    if ($notComparable.Verdict -ne 'not comparable' -or $notComparable.Comparable -or $script:defects.Count -ne $defectsBeforeNotComparable -or
+        $notComparable.Reason -notmatch 'stream=502') {
+        throw "expected 502 stream fixture to be not comparable without a defect row, got verdict=$($notComparable.Verdict) reason=$($notComparable.Reason)"
+    }
+    Write-Host 'SELFTEST: 502 stream parity is not comparable without defect'
 
     $missingId = [pscustomobject]@{ index = 0; type = 'function'; function = [pscustomobject]@{ name = 'get_weather'; arguments = '{}' } }
     $jsonWithIndex = [pscustomobject]@{ id = 'call_2'; index = 0; type = 'function'; function = [pscustomobject]@{ name = 'get_weather'; arguments = '{}' } }
@@ -1482,6 +1519,9 @@ function Invoke-WindowOccupancyProbe {
     $cliff502 = $null
     $degradeAt = $null
     $deadAtCell = $null
+    $deadStatus = $null
+    $observedHttp400 = $false
+    $observedHttp502 = $false
     $completedCells = 0
 
     foreach ($cell in $plan) {
@@ -1495,8 +1535,11 @@ function Invoke-WindowOccupancyProbe {
         $live = Test-BackendLivenessWithRetry
         Write-Info "liveness check before cell $($cell.Label): HTTP $($live.StatusCode) ok=$($live.Ok) ($($live.LatencyMs)ms)"
         if (-not $live.Ok) {
+            if ($live.StatusCode -eq 400) { $observedHttp400 = $true }
+            if ($live.StatusCode -eq 502) { $observedHttp502 = $true }
             Write-Host "    BACKEND DEAD before cell $($cell.Label): HTTP $($live.StatusCode) $($live.ErrorMessage) -- stopping the sweep now. $completedCells of $($plan.Count) cells completed." -ForegroundColor Red
             $deadAtCell = $cell.Label
+            $deadStatus = $live.StatusCode
             break
         }
 
@@ -1527,6 +1570,8 @@ function Invoke-WindowOccupancyProbe {
                 catch { $argsValid = $false }
             }
 
+            if ($facts.StatusCode -eq 400) { $observedHttp400 = $true }
+            if ($facts.StatusCode -eq 502) { $observedHttp502 = $true }
             if ($facts.StatusCode -eq 400 -and $null -eq $cliff400) { $cliff400 = $built }
             if ($facts.StatusCode -eq 502 -and $null -eq $cliff502) { $cliff502 = $built }
             if ($null -eq $degradeAt -and $facts.StatusCode -eq 200 -and (-not $correctTool -or -not $argsValid -or -not $argsCorrect)) {
@@ -1568,12 +1613,17 @@ function Invoke-WindowOccupancyProbe {
     if ($deadAtCell) {
         Write-Host "    SWEEP STOPPED EARLY: backend died before cell '$deadAtCell'. $completedCells of $($plan.Count) cells completed before the failure." -ForegroundColor Red
     }
-    if ($degradeAt) { Write-Host "    compliance first degraded at ~$degradeAt% of the window (still HTTP 200)" -ForegroundColor Magenta }
+    if ($deadAtCell -and $deadStatus -eq 502) {
+        Write-Host "    sweep stopped on a 502 at cell '$deadAtCell'" -ForegroundColor Red
+    }
+    elseif ($degradeAt) { Write-Host "    compliance first degraded at ~$degradeAt% of the window (still HTTP 200)" -ForegroundColor Magenta }
     else { Write-Host '    no compliance degradation observed on any HTTP 200 cell (only the hard 400/502 failures, if any)' -ForegroundColor Magenta }
     if ($cliff400) { Write-Host "    200->400 flip: first seen at $($cliff400.Chars) chars / $($cliff400.Tokens) tokens" -ForegroundColor Magenta }
-    else { Write-Host '    no HTTP 400 observed in this sweep' -ForegroundColor Magenta }
+    elseif (-not $observedHttp400) { Write-Host '    no HTTP 400 observed in this sweep' -ForegroundColor Magenta }
+    else { Write-Host '    HTTP 400 observed in this sweep' -ForegroundColor Magenta }
     if ($cliff502) { Write-Host "    400->502 flip: first seen at $($cliff502.Chars) chars / $($cliff502.Tokens) tokens" -ForegroundColor Magenta }
-    else { Write-Host '    no HTTP 502 observed in this sweep' -ForegroundColor Magenta }
+    elseif (-not $observedHttp502) { Write-Host '    no HTTP 502 observed in this sweep' -ForegroundColor Magenta }
+    elseif (-not ($deadAtCell -and $deadStatus -eq 502)) { Write-Host '    HTTP 502 observed in this sweep' -ForegroundColor Magenta }
 
     [pscustomobject]@{ DegradeAtPct = $degradeAt; Cliff400 = $cliff400; Cliff502 = $cliff502; DeadAtCell = $deadAtCell; CompletedCells = $completedCells; PlannedCells = $plan.Count }
 }
