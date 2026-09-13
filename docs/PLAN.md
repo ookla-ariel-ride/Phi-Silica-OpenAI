@@ -331,7 +331,7 @@ tool-call probe that reports pass/fail over N runs.
 
 - `GenerationScheduler`: one worker task reading a bounded `Channel<GenerationJob>`
   (`--queue-capacity`, default 4). Enqueue failure → 429 with `Retry-After: <estimate>` (queue depth ×
-  rolling average generation seconds, min 1).
+  the mean duration of the last 16 generations, min 1).
 - Each job carries the request's `CancellationToken`; a job cancelled while *queued* is dropped
   without touching the model.
 - The worker never starts a job until the previous op has fully completed, even after `Cancel()`.

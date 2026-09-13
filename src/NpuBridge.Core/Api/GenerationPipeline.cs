@@ -76,6 +76,14 @@ internal static class GenerationPipeline
     }
 
     /// <summary>
+    /// The log line's <c>cache=</c> field: <c>hit</c>, <c>miss</c>, or <c>-</c> for a request that never
+    /// got as far as a context. Four copies of this one expression existed — one per endpoint — until
+    /// <see cref="StreamingPipeline"/> took two of them and <see cref="JsonPipeline"/> the other two;
+    /// it lives down here because both pipelines can reach it and neither owns it.
+    /// </summary>
+    public static string CacheLabel(ContextLease? lease) => lease is null ? "-" : lease.CacheHit ? "hit" : "miss";
+
+    /// <summary>
     /// The whole model output, verbatim, under <c>--verbose</c>. The one place the raw text is logged:
     /// what a client is shown has been through the cut and the status mapping, so this is how a
     /// question about the model rather than about the bridge gets answered.

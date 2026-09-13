@@ -102,10 +102,16 @@ public sealed class BackendLifecycle : IHostedService, IAsyncDisposable
         _cache?.Dispose();
 
         // Give an in-flight initialization a moment to observe cancellation; never block shutdown on it.
-        // A stubborn runtime is handled by DisposeAsync's grace period instead.
-        var finished = await Task.WhenAny(_initialization, Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken))
-            .ConfigureAwait(false);
-        if (finished != _initialization)
+        // A stubborn runtime is handled by DisposeAsync's grace period instead. WaitAsync rather than
+        // WhenAny against a never-completing Task.Delay: that delay stayed registered on the host's
+        // token whenever initialization won the race, which is every ordinary shutdown; WaitAsync
+        // disposes its own registration either way. Initialization never faults (RunInitializationAsync
+        // catches everything into the snapshot), so cancellation is the only way out of the await.
+        try
+        {
+            await _initialization.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
         {
             _logger.LogWarning("Backend {Backend} was still initializing at shutdown; disposal will wait up to {Grace}s for it.",
                 _backend.DisplayName, DisposeGracePeriod.TotalSeconds);
@@ -122,8 +128,13 @@ public sealed class BackendLifecycle : IHostedService, IAsyncDisposable
         _disposed = true;
         await _shutdown.CancelAsync().ConfigureAwait(false);
 
-        var finished = await Task.WhenAny(_initialization, Task.Delay(DisposeGracePeriod)).ConfigureAwait(false);
-        if (finished != _initialization)
+        // WaitAsync for the same reason StopAsync uses it: the Task.Delay this replaced kept a timer
+        // alive for the whole grace period every time initialization finished first.
+        try
+        {
+            await _initialization.WaitAsync(DisposeGracePeriod).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
         {
             _logger.LogError("Backend {Backend} did not finish initializing within {Grace}s; disposing it anyway.",
                 _backend.DisplayName, DisposeGracePeriod.TotalSeconds);

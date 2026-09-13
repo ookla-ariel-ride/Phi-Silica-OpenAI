@@ -170,7 +170,12 @@ internal static class StreamingPipeline
         return null;
     }
 
-    public static string CacheLabel(ContextLease? lease) => lease is null ? "-" : lease.CacheHit ? "hit" : "miss";
+    /// <summary>
+    /// Kept as the streamed shapes' entry point, forwarding to the one implementation in
+    /// <see cref="GenerationPipeline"/> now that the JSON shapes share it too: the label means the same
+    /// thing on all four endpoints, so it cannot live in a type only two of them use.
+    /// </summary>
+    public static string CacheLabel(ContextLease? lease) => GenerationPipeline.CacheLabel(lease);
 
     /// <summary>
     /// Awaits the scheduled attempt and reports whatever it means for the client: a real

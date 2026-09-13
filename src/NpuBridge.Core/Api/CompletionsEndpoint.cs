@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
@@ -30,11 +29,13 @@ public static class CompletionsEndpoints
 /// close, wherever the request came from. <c>tools</c> do not exist on this wire shape at all, so
 /// unlike <see cref="ChatCompletionsEndpoint"/> there is no tool-call branch to consider here.
 ///
-/// The scheduler wiring mirrors <see cref="ChatCompletionsEndpoint"/> exactly, including the two
-/// controller rulings task 2 already paid for: <see cref="ConversationSession.Acquire"/> runs inside
-/// the scheduled closure (never outside it, so it cannot race a running generation for the one shared
-/// handle), and the lease is published to this method's own <c>lease</c> variable the instant
-/// <c>Acquire</c> hands it over, never carried back only on the closure's return value.
+/// "The exact same code" is now literally that: chunk 8 shipped it as a byte-identical copy of the
+/// chat endpoint's scheduled closure, and <see cref="JsonPipeline"/> is that copy folded into one,
+/// including the two controller rulings task 2 already paid for —
+/// <see cref="ConversationSession.Acquire"/> runs inside the scheduled closure (never outside it, so it
+/// cannot race a running generation for the one shared handle), and the lease is published to the
+/// pipeline's own variable the instant <c>Acquire</c> hands it over, never carried back only on the
+/// closure's return value (D85).
 /// </summary>
 internal sealed class CompletionsEndpoint
 {
@@ -75,202 +76,18 @@ internal sealed class CompletionsEndpoint
                 .ConfigureAwait(false) ?? Results.Empty;
         }
 
-        var requestId = prepared.RequestId;
-        var backendName = prepared.BackendName;
-        var backend = prepared.Backend;
-
-        var limits = prepared.Limits;
-        var session = new ConversationSession(prepared, cache, options, logger);
-
-        // Published from *inside* the scheduled closure, the instant Acquire hands one over -- see
-        // ChatCompletionsEndpoint's fuller account of why (D43 + D51, chunk 8 fix round 1).
-        ContextLease? lease = null;
-        var queueWaitMs = 0.0;
-        var elapsed = Stopwatch.StartNew();
-        var generationAttempted = false;
-        var outcomeClassified = false;
-
-        try
-        {
-            var scheduled = await scheduler.ScheduleAsync(async ct =>
-            {
-                var stopwatch = Stopwatch.StartNew();
-                while (true)
-                {
-                    generationAttempted = true;
-                    var acquisition = session.Acquire();
-                    if (acquisition.Failure is { } refused)
-                    {
-                        return ChatAttemptResult.Refused(refused);
-                    }
-
-                    var attemptLease = acquisition.Lease!;
-                    lease = attemptLease;
-
-                    try
-                    {
-                        session.ApplyTruncationHeader(http.Response);
-
-                        using var generationCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                        var cancelledByCut = false;
-
-                        var watcher = limits.IsEmpty ? null : new CutWatcher(limits);
-                        var sink = DeltaSink.ToWatcher(stopwatch, watcher);
-
-                        var generation = backend.GenerateAsync(
-                            attemptLease.Context,
-                            attemptLease.Prompt,
-                            prepared.Sampling,
-                            sink.OnDelta,
-                            generationCts.Token);
-
-                        if (watcher is not null)
-                        {
-                            await Task.WhenAny(generation, watcher.Signal).ConfigureAwait(false);
-                            if (watcher.Signal.IsCompleted)
-                            {
-                                cancelledByCut = true;
-                                await GenerationPipeline.CancelGuardedAsync(generationCts, logger, requestId, "at the cut").ConfigureAwait(false);
-                            }
-                        }
-
-                        var result = await generation.ConfigureAwait(false);
-
-                        if (result.Status == GenerationStatus.PromptLargerThanContext && session.TryDropOldestExchange())
-                        {
-                            attemptLease.Dispose();
-                            continue;
-                        }
-
-                        var totalMs = stopwatch.Elapsed.TotalMilliseconds;
-                        var ttftMs = sink.TtftMs(totalMs);
-                        return ChatAttemptResult.Generated(result, cancelledByCut, ttftMs, totalMs);
-                    }
-                    catch
-                    {
-                        attemptLease.Dispose();
-                        throw;
-                    }
-                }
-            }, http.RequestAborted).ConfigureAwait(false);
-
-            queueWaitMs = scheduled.QueueWait.TotalMilliseconds;
-
-            var admission = SchedulerAdmission.Classify(scheduled, http.RequestAborted.IsCancellationRequested);
-            if (admission == SchedulerOutcome.ClientGone)
-            {
-                ChatRequestMetrics.LogRequest(logger, requestId, backendName, prepared.PromptChars, ttftMs: 0, tokens: 0,
-                    status: scheduled.Kind.ToString(), finish: "-", httpStatus: 0,
-                    truncatedTurns: session.DroppedTurns, queueWaitMs: queueWaitMs);
-                return Results.Empty;
-            }
-
-            if (admission != SchedulerOutcome.Completed)
-            {
-                var schedulerFailure = SchedulerAdmission.FailureFor(admission, scheduled.RetryAfterSeconds, generationHealth);
-                SchedulerAdmission.ApplyRetryAfter(http.Response, admission, scheduled.RetryAfterSeconds);
-
-                ChatRequestMetrics.LogRequest(logger, requestId, backendName, prepared.PromptChars, ttftMs: 0, tokens: 0,
-                    status: admission.ToString(), finish: "-", httpStatus: schedulerFailure.StatusCode,
-                    truncatedTurns: session.DroppedTurns, queueWaitMs: queueWaitMs);
-                return schedulerFailure.ToResult();
-            }
-
-            var attempt = scheduled.Result!;
-
-            if (attempt.Refusal is { } attemptRefused)
-            {
-                ChatRequestMetrics.LogRequest(logger, requestId, backendName, prepared.PromptChars, ttftMs: 0, tokens: 0,
-                    status: GenerationStatus.PromptLargerThanContext.ToString(), finish: "-", httpStatus: attemptRefused.StatusCode,
-                    truncatedTurns: session.DroppedTurns, queueWaitMs: queueWaitMs);
-                return attemptRefused.ToResult();
-            }
-
-            var result = attempt.Result!;
-            var cancelledByCut = attempt.CancelledByCut;
-            var ttftMs = attempt.TtftMs;
-            var totalMs = attempt.TotalMs;
-            var cacheLabel = lease!.CacheHit ? "hit" : "miss";
-            var promptChars = lease.PromptChars;
-
-            GenerationPipeline.LogRawOutput(logger, options, requestId, result);
-
-            if (result.Status == GenerationStatus.Cancelled && http.RequestAborted.IsCancellationRequested)
-            {
-                ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
-                    status: result.Status.ToString(), finish: "-", httpStatus: 0,
-                    cache: cacheLabel, tailTurns: lease.TailTurns, truncatedTurns: session.DroppedTurns,
-                    queueWaitMs: queueWaitMs);
-                return Results.Empty;
-            }
-
-            // The client-side cut and the shared status classification, exactly as the chat shape runs
-            // them: same OutputCutter, same GenerationOutcome, so the same generated text yields the
-            // same reply and finish reason regardless of which endpoint asked for it.
-            var cut = limits.Cut(result.Text);
-            var outcome = GenerationOutcome.Classify(result, cancelledByCut, generationHealth, totalMs);
-            outcomeClassified = true;
-
-            if (outcome.Failure is { } failure)
-            {
-                ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, tokens: 0,
-                    status: result.Status.ToString(), finish: "-", httpStatus: failure.StatusCode,
-                    cache: cacheLabel, tailTurns: lease.TailTurns, truncatedTurns: session.DroppedTurns,
-                    queueWaitMs: queueWaitMs);
-                return failure.ToResult();
-            }
-
-            var content = outcome.Filtered ? string.Empty : cut.Text;
-            var finishReason = outcome.FinishReason(cut.FinishReason);
-
-            // Back into the cache -- the rule is GenerationOutcome's, and the finally disposes every
-            // context it refuses (D11, D43). No tool calls exist on this endpoint, so unlike the chat
-            // shape there is nothing but the plain reply text to store.
-            if (outcome.KeepsContext(cut.FinishReason))
-            {
-                lease.Keep(result.Text);
-            }
-
-            var promptTokens = lease.TranscriptTokens;
-            var completionTokens = backend.TokenCounter.TokensCovering(result.Text, content.Length);
-
-            var body = new CompletionResponse(
-                Id: requestId,
-                Created: time.GetUtcNow().ToUnixTimeSeconds(),
-                Model: backend.ModelId,
-                Choices: [new CompletionChoice(content, 0, finishReason)],
-                Usage: CompletionUsage.For(promptTokens, completionTokens));
-
-            ChatRequestMetrics.LogRequest(logger, requestId, backendName, promptChars, ttftMs, completionTokens,
-                result.Status.ToString(), finishReason, StatusCodes.Status200OK, totalMs,
-                cache: cacheLabel, tailTurns: lease.TailTurns, truncatedTurns: session.DroppedTurns,
-                queueWaitMs: queueWaitMs);
-
-            return Results.Json(body, JsonDefaults.Options);
-        }
-        catch (Exception ex) when (http.RequestAborted.IsCancellationRequested)
-        {
-            ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
-                status: ex is OperationCanceledException ? nameof(GenerationStatus.Cancelled) : ex.GetType().Name,
-                finish: "-", httpStatus: 0,
-                cache: CacheLabel(lease), tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns,
-                queueWaitMs: queueWaitMs);
-            return Results.Empty;
-        }
-        catch (Exception ex)
-        {
-            var failure = GenerationFailure.FromException(ex, generationAttempted && !outcomeClassified ? generationHealth : null, elapsed.Elapsed.TotalMilliseconds);
-            ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
-                status: ex.GetType().Name, finish: "-", httpStatus: failure.StatusCode,
-                cache: CacheLabel(lease), tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns,
-                queueWaitMs: queueWaitMs);
-            return failure.ToResult();
-        }
-        finally
-        {
-            lease?.Dispose();
-        }
+        // The generation phase is JsonPipeline's, shared byte for byte with /v1/chat/completions --
+        // which is the point: a second copy of it is what D56 and D57 record drifting. This endpoint
+        // keeps only the legacy wire shape, built below from the pipeline's JsonReply.
+        return await JsonPipeline.RunAsync(http, prepared, options, cache, scheduler, generationHealth, time, logger,
+            reply => new CompletionResponse(
+                Id: reply.Id,
+                Created: reply.Created,
+                Model: reply.Model,
+                // Content is null only where the reply was reshaped into tool_calls, and `tools` does
+                // not exist on this wire shape at all -- the catalog phase one builds for it is always
+                // null, so that branch cannot fire here.
+                Choices: [new CompletionChoice(reply.Content!, 0, reply.FinishReason)],
+                Usage: reply.Usage)).ConfigureAwait(false);
     }
-
-    private static string CacheLabel(ContextLease? lease) => lease is null ? "-" : lease.CacheHit ? "hit" : "miss";
 }
