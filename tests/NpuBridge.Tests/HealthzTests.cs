@@ -13,6 +13,7 @@ public class HealthzTests
     public async Task Ready_backend_reports_200_with_expected_fields()
     {
         await using var host = await BridgeTestHost.StartAsync(
+            new FakeBackend(new FakeBackendOptions { ContextWindowTokens = 3_581 }),
             options: new BridgeOptions { Backend = BackendKind.Fake, QueueCapacity = 7 },
             identity: new StaticProcessIdentity("NpuBridge_1.0.0.0_arm64__abc", "NpuBridge_abc"));
 
@@ -34,6 +35,7 @@ public class HealthzTests
         Assert.Equal(0, json.GetProperty("context_cache_misses").GetInt64());
         Assert.Equal(JsonValueKind.Null, json.GetProperty("last_generation").ValueKind);
         Assert.Equal(0, json.GetProperty("consecutive_backend_faults").GetInt32());
+        Assert.Equal(3_581, json.GetProperty("context_window_tokens").GetInt32());
         Assert.Equal(1000, json.GetProperty("first_keep_alive_ms").GetInt32());
         Assert.Equal(15000, json.GetProperty("keep_alive_interval_ms").GetInt32());
         Assert.False(json.GetProperty("first_run_compile_likely").GetBoolean());
