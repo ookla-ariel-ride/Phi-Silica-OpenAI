@@ -107,7 +107,8 @@ internal sealed class ChatCompletionsStreamEndpoint
         var cancelledByCut = false;
 
         var queueWaitMs = 0.0;
-        var generationAttempted = false;
+        var backendCalls = new BackendCallTracker();
+        var attemptDurationMs = 0.0;
         var outcomeClassified = false;
 
         // The current attempt's lease, assigned from *inside* the scheduled closure the instant Acquire
@@ -174,10 +175,12 @@ internal sealed class ChatCompletionsStreamEndpoint
             // collection is neither thread-safe nor mutable after the response has started.
             generation = scheduler.ScheduleAsync(async ct =>
             {
-                while (true)
+                var attemptStopwatch = Stopwatch.StartNew();
+                try
                 {
-                    generationAttempted = true;
-                    var acquisition = session.Acquire();
+                    while (true)
+                {
+                    var acquisition = session.Acquire(backendCalls);
                     if (acquisition.Failure is { } refused)
                     {
                         channel.Writer.TryComplete();
@@ -198,12 +201,12 @@ internal sealed class ChatCompletionsStreamEndpoint
                         var generationCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                         Interlocked.Exchange(ref currentGenerationCts, generationCts)?.Dispose();
 
-                        var result = await prepared.Backend.GenerateAsync(
+                        var result = await backendCalls.AwaitAsync(backendCalls.Invoke(() => prepared.Backend.GenerateAsync(
                             attemptLease.Context,
                             attemptLease.Prompt,
                             prepared.Sampling,
                             sink.OnDelta,
-                            generationCts.Token).ConfigureAwait(false);
+                            generationCts.Token))).ConfigureAwait(false);
 
                         // Not one delta, and the backend says the prompt was too long. On a backend
                         // without a preflight this is the only way it can say so; with
@@ -219,8 +222,8 @@ internal sealed class ChatCompletionsStreamEndpoint
                         }
 
                         channel.Writer.TryComplete();
-                        var totalMs = stopwatch.Elapsed.TotalMilliseconds;
-                        var ttftMs = sink.TtftMs(totalMs);
+                        var totalMs = attemptStopwatch.Elapsed.TotalMilliseconds;
+                        var ttftMs = sink.TtftMs(stopwatch.Elapsed.TotalMilliseconds);
                         return ChatAttemptResult.Generated(result, cancelledByCut, ttftMs, totalMs);
                     }
                     catch
@@ -232,6 +235,11 @@ internal sealed class ChatCompletionsStreamEndpoint
                         attemptLease.Dispose();
                         throw;
                     }
+                }
+                }
+                finally
+                {
+                    attemptDurationMs = attemptStopwatch.Elapsed.TotalMilliseconds;
                 }
             }, aborted);
 
@@ -257,7 +265,7 @@ internal sealed class ChatCompletionsStreamEndpoint
             if (generation.IsCompleted)
             {
                 var immediateResult = await StreamingPipeline.ReportSchedulerOutcomeAsync(
-                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, aborted)
+                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, backendCalls, () => attemptDurationMs, aborted)
                     .ConfigureAwait(false);
                 if (immediateResult.Handled)
                 {
@@ -285,7 +293,7 @@ internal sealed class ChatCompletionsStreamEndpoint
                 }
 
                 var schedulerOutcome = await StreamingPipeline.ReportSchedulerOutcomeAsync(
-                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, aborted)
+                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, backendCalls, () => attemptDurationMs, aborted)
                     .ConfigureAwait(false);
                 if (schedulerOutcome.Handled)
                 {
@@ -336,7 +344,7 @@ internal sealed class ChatCompletionsStreamEndpoint
                 }
 
                 var schedulerOutcome = await StreamingPipeline.ReportSchedulerOutcomeAsync(
-                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, aborted)
+                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, backendCalls, () => attemptDurationMs, aborted)
                     .ConfigureAwait(false);
                 if (schedulerOutcome.Handled)
                 {
@@ -349,7 +357,7 @@ internal sealed class ChatCompletionsStreamEndpoint
             else
             {
                 var schedulerOutcome = await StreamingPipeline.ReportSchedulerOutcomeAsync(
-                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, aborted)
+                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, backendCalls, () => attemptDurationMs, aborted)
                     .ConfigureAwait(false);
                 if (schedulerOutcome.Handled)
                 {
@@ -398,7 +406,7 @@ internal sealed class ChatCompletionsStreamEndpoint
             // the same order and for the same reasons. See GenerationOutcome for why a Cancelled the
             // handler asked for is not a failure while every other status still is, and why "the cut
             // caused it" is the flag set beside the CancelAsync above rather than the cutter's state.
-            var outcome = GenerationOutcome.Classify(result, cancelledByCut, generationHealth, totalMs);
+            var outcome = GenerationOutcome.Classify(result, cancelledByCut, generationHealth, attemptDurationMs);
             outcomeClassified = true;
             if (outcome.Failure is { } failure)
             {
@@ -555,7 +563,7 @@ internal sealed class ChatCompletionsStreamEndpoint
         // A cancellation that reaches here is a generation that failed, and is reported as one.
         catch (Exception ex)
         {
-            var failure = GenerationFailure.FromException(ex, generationAttempted && !outcomeClassified ? generationHealth : null, stopwatch.Elapsed.TotalMilliseconds);
+            var failure = GenerationFailure.FromException(ex, backendCalls.Caught(ex) && !outcomeClassified ? generationHealth : null, attemptDurationMs);
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
                 status: ex.GetType().Name, finish: "-",
                 httpStatus: sse.Started ? StatusCodes.Status200OK : failure.StatusCode,

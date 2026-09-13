@@ -38,6 +38,46 @@ internal sealed record ChatAttemptResult(
 }
 
 /// <summary>
+/// Identifies exceptions raised by an invocation of the model backend. Callers use it to distinguish a
+/// backend fault from bridge work that happens to run after a backend call, such as cutting output or
+/// tokenizing usage.
+/// </summary>
+internal sealed class BackendCallTracker
+{
+    private Exception? _exception;
+
+    public bool Faulted => Volatile.Read(ref _exception) is not null;
+
+    public T Invoke<T>(Func<T> call)
+    {
+        try
+        {
+            return call();
+        }
+        catch (Exception ex)
+        {
+            Volatile.Write(ref _exception, ex);
+            throw;
+        }
+    }
+
+    public async Task<T> AwaitAsync<T>(Task<T> task)
+    {
+        try
+        {
+            return await task.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Volatile.Write(ref _exception, ex);
+            throw;
+        }
+    }
+
+    public bool Caught(Exception exception) => ReferenceEquals(Volatile.Read(ref _exception), exception);
+}
+
+/// <summary>
 /// The parts of phase two that are the same whichever shape the reply takes. Both
 /// <see cref="ChatCompletionsEndpoint"/> and <see cref="ChatCompletionsStreamEndpoint"/> drive one
 /// generation, time its first delta, may cancel it early, and then report what came back; only the

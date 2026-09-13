@@ -16,6 +16,8 @@ public sealed partial class FakeBackend : ILanguageModelBackend
     private int _contextsDisposed;
     private int _nextContextId;
     private int _preflightCalls;
+    private int _deltasEmitted;
+    private int _cancellationsObserved;
     private bool _initialized;
     private bool _disposed;
 
@@ -51,6 +53,12 @@ public sealed partial class FakeBackend : ILanguageModelBackend
 
     /// <summary>Contexts created and not yet disposed. Leak tests assert this returns to zero.</summary>
     public int ActiveContexts => ContextsCreated - ContextsDisposed;
+
+    /// <summary>Number of deltas delivered to callbacks across this backend's generations.</summary>
+    public int DeltasEmitted => Volatile.Read(ref _deltasEmitted);
+
+    /// <summary>Number of times an in-flight generation observed its caller's cancellation request.</summary>
+    public int CancellationsObserved => Volatile.Read(ref _cancellationsObserved);
 
     /// <summary>Every generation request, in order.</summary>
     public IReadOnlyList<FakeGenerationRequest> Calls
@@ -172,6 +180,7 @@ public sealed partial class FakeBackend : ILanguageModelBackend
         // be stopped on demand looks like, and it is the case the caller's cancel-drain-dispose ordering
         // exists for -- disposing the context while this is still running is a use-after-dispose.
         bool ObservesCancellation() => _options.CancellationGate?.Task.IsCompleted ?? true;
+        using var observedCancellation = cancellationToken.Register(() => Interlocked.Increment(ref _cancellationsObserved));
 
         if (_options.ThrowFromCancellationRegistration)
         {
@@ -228,6 +237,17 @@ public sealed partial class FakeBackend : ILanguageModelBackend
             else
             {
                 onDelta(token);
+            }
+
+            Interlocked.Increment(ref _deltasEmitted);
+
+            // Held after the configured delta and before the next token's cancellation check. Unlike
+            // the start and first-token gates it deliberately ignores cancellation while held: a test
+            // can prove its cutter asked the backend to stop, then release this gate and make that stop
+            // the only path to the next token.
+            if (emitted == _options.DeltaGateAfterTokens)
+            {
+                await WaitAtGateAsync(_options.DeltaGate, CancellationToken.None).ConfigureAwait(false);
             }
         }
 
@@ -394,6 +414,17 @@ public sealed class FakeBackendOptions
     /// asserted as an ordering instead of as a millisecond bound that a loaded machine will break.
     /// </summary>
     public TaskCompletionSource? FirstTokenGate { get; set; }
+
+    /// <summary>
+    /// While set and incomplete, the generation pauses after the configured number of deltas and before
+    /// it can produce the next token. It ignores cancellation while held so a test can observe a
+    /// client-side cut, release the gate, and prove the backend then observes that cancellation without
+    /// a timing race.
+    /// </summary>
+    public TaskCompletionSource? DeltaGate { get; set; }
+
+    /// <summary>The number of deltas to deliver before <see cref="DeltaGate"/> holds the next token.</summary>
+    public int DeltaGateAfterTokens { get; set; } = 1;
 
     /// <summary>
     /// While set and incomplete, the generation ignores the cancellation token entirely: it keeps

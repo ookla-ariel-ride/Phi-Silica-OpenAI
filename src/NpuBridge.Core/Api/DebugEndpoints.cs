@@ -110,6 +110,8 @@ public static class DebugEndpoints
 
         var backend = lifecycle.Backend;
         var sampling = new SamplingOptions(request.Temperature, request.TopP, request.TopK);
+        var backendCalls = new BackendCallTracker();
+        var attemptDurationMs = 0.0;
 
         // Chunk 8, task-2-brief.md integration decision 5: this endpoint used to create its context
         // outside any queueing (D40's deferral, and the docs/FUTURE.md chunk 2 entry it names -- both
@@ -124,7 +126,6 @@ public static class DebugEndpoints
             var callbacks = 0;
 
             IModelContext? context = null;
-            var generationAttempted = false;
             var outcomeClassified = false;
             try
             {
@@ -134,12 +135,11 @@ public static class DebugEndpoints
                     return systemTextFailure.ToResult();
                 }
 
-                generationAttempted = true;
-                context = backend.CreateContext(request.System);
-                var usable = backend.GetUsablePromptLength(context, request.Prompt);
+                context = backendCalls.Invoke(() => backend.CreateContext(request.System));
+                var usable = backendCalls.Invoke(() => backend.GetUsablePromptLength(context, request.Prompt));
                 var preflightKnownOverflow = usable is { } usablePromptChars && usablePromptChars < request.Prompt.Length;
 
-                var result = await backend.GenerateAsync(
+                var result = await backendCalls.AwaitAsync(backendCalls.Invoke(() => backend.GenerateAsync(
                     context,
                     request.Prompt,
                     sampling.IsEmpty ? null : sampling,
@@ -150,7 +150,7 @@ public static class DebugEndpoints
                             Interlocked.Exchange(ref firstTokenTicks, stopwatch.ElapsedTicks);
                         }
                     },
-                    ct);
+                    ct))).ConfigureAwait(false);
 
                 stopwatch.Stop();
                 var totalMs = stopwatch.Elapsed.TotalMilliseconds;
@@ -190,11 +190,12 @@ public static class DebugEndpoints
             {
                 return GenerationFailure.FromException(
                     ex,
-                    generationAttempted && !outcomeClassified ? generationHealth : null,
+                    backendCalls.Caught(ex) && !outcomeClassified ? generationHealth : null,
                     stopwatch.Elapsed.TotalMilliseconds).ToResult();
             }
             finally
             {
+                attemptDurationMs = stopwatch.Elapsed.TotalMilliseconds;
                 context?.Dispose();
             }
         }, http.RequestAborted).ConfigureAwait(false);
@@ -210,7 +211,11 @@ public static class DebugEndpoints
             return scheduled.Result!;
         }
 
-        var failure = SchedulerAdmission.FailureFor(admission, scheduled.RetryAfterSeconds, generationHealth);
+        var failure = SchedulerAdmission.FailureFor(
+            admission,
+            scheduled.RetryAfterSeconds,
+            backendCalls.Faulted ? generationHealth : null,
+            attemptDurationMs);
         SchedulerAdmission.ApplyRetryAfter(http.Response, admission, scheduled.RetryAfterSeconds);
         return failure.ToResult();
     }

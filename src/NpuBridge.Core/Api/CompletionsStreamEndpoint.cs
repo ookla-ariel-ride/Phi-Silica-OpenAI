@@ -78,7 +78,8 @@ internal sealed class CompletionsStreamEndpoint
         var cancelledByCut = false;
 
         var queueWaitMs = 0.0;
-        var generationAttempted = false;
+        var backendCalls = new BackendCallTracker();
+        var attemptDurationMs = 0.0;
         var outcomeClassified = false;
 
         // Published from *inside* the scheduled closure -- see the type-level remarks and
@@ -109,10 +110,12 @@ internal sealed class CompletionsStreamEndpoint
         {
             generation = scheduler.ScheduleAsync(async ct =>
             {
-                while (true)
+                var attemptStopwatch = Stopwatch.StartNew();
+                try
                 {
-                    generationAttempted = true;
-                    var acquisition = session.Acquire();
+                    while (true)
+                {
+                    var acquisition = session.Acquire(backendCalls);
                     if (acquisition.Failure is { } refused)
                     {
                         channel.Writer.TryComplete();
@@ -127,12 +130,12 @@ internal sealed class CompletionsStreamEndpoint
                         var generationCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                         Interlocked.Exchange(ref currentGenerationCts, generationCts)?.Dispose();
 
-                        var result = await prepared.Backend.GenerateAsync(
+                        var result = await backendCalls.AwaitAsync(backendCalls.Invoke(() => prepared.Backend.GenerateAsync(
                             attemptLease.Context,
                             attemptLease.Prompt,
                             prepared.Sampling,
                             sink.OnDelta,
-                            generationCts.Token).ConfigureAwait(false);
+                            generationCts.Token))).ConfigureAwait(false);
 
                         if (result.Status == GenerationStatus.PromptLargerThanContext && session.TryDropOldestExchange())
                         {
@@ -141,8 +144,8 @@ internal sealed class CompletionsStreamEndpoint
                         }
 
                         channel.Writer.TryComplete();
-                        var totalMs = stopwatch.Elapsed.TotalMilliseconds;
-                        var ttftMs = sink.TtftMs(totalMs);
+                        var totalMs = attemptStopwatch.Elapsed.TotalMilliseconds;
+                        var ttftMs = sink.TtftMs(stopwatch.Elapsed.TotalMilliseconds);
                         return ChatAttemptResult.Generated(result, cancelledByCut, ttftMs, totalMs);
                     }
                     catch
@@ -151,6 +154,11 @@ internal sealed class CompletionsStreamEndpoint
                         attemptLease.Dispose();
                         throw;
                     }
+                }
+                }
+                finally
+                {
+                    attemptDurationMs = attemptStopwatch.Elapsed.TotalMilliseconds;
                 }
             }, aborted);
 
@@ -168,7 +176,7 @@ internal sealed class CompletionsStreamEndpoint
             if (generation.IsCompleted)
             {
                 var immediateResult = await StreamingPipeline.ReportSchedulerOutcomeAsync(
-                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, aborted)
+                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, backendCalls, () => attemptDurationMs, aborted)
                     .ConfigureAwait(false);
                 if (immediateResult.Handled)
                 {
@@ -207,7 +215,7 @@ internal sealed class CompletionsStreamEndpoint
                 }
 
                 var schedulerOutcome = await StreamingPipeline.ReportSchedulerOutcomeAsync(
-                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, aborted)
+                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, backendCalls, () => attemptDurationMs, aborted)
                     .ConfigureAwait(false);
                 if (schedulerOutcome.Handled)
                 {
@@ -220,7 +228,7 @@ internal sealed class CompletionsStreamEndpoint
             else
             {
                 var schedulerOutcome = await StreamingPipeline.ReportSchedulerOutcomeAsync(
-                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, aborted)
+                    generation, sse, http, logger, requestId, backendName, prepared, session, generationHealth, backendCalls, () => attemptDurationMs, aborted)
                     .ConfigureAwait(false);
                 if (schedulerOutcome.Handled)
                 {
@@ -255,7 +263,7 @@ internal sealed class CompletionsStreamEndpoint
                 return null;
             }
 
-            var outcome = GenerationOutcome.Classify(result, cancelledByCut, generationHealth, totalMs);
+            var outcome = GenerationOutcome.Classify(result, cancelledByCut, generationHealth, attemptDurationMs);
             outcomeClassified = true;
             if (outcome.Failure is { } failure)
             {
@@ -324,7 +332,7 @@ internal sealed class CompletionsStreamEndpoint
         }
         catch (Exception ex)
         {
-            var failure = GenerationFailure.FromException(ex, generationAttempted && !outcomeClassified ? generationHealth : null, stopwatch.Elapsed.TotalMilliseconds);
+            var failure = GenerationFailure.FromException(ex, backendCalls.Caught(ex) && !outcomeClassified ? generationHealth : null, attemptDurationMs);
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
                 status: ex.GetType().Name, finish: "-",
                 httpStatus: sse.Started ? StatusCodes.Status200OK : failure.StatusCode,
