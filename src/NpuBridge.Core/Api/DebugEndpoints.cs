@@ -126,7 +126,6 @@ public static class DebugEndpoints
             var callbacks = 0;
 
             IModelContext? context = null;
-            var outcomeClassified = false;
             try
             {
                 var systemTextFailure = SystemTextGuard.RefusalFor(backend, request.System, includesToolDefinitions: false);
@@ -158,7 +157,6 @@ public static class DebugEndpoints
                 {
                     _ = GenerationOutcome.Classify(result, cancelledByCut: false,
                         health: preflightKnownOverflow ? null : generationHealth, durationMs: totalMs);
-                    outcomeClassified = true;
                 }
                 var ttftMs = callbacks == 0 ? totalMs : firstTokenTicks * 1000.0 / Stopwatch.Frequency;
                 var decodeMs = totalMs - ttftMs;
@@ -190,7 +188,7 @@ public static class DebugEndpoints
             {
                 return GenerationFailure.FromException(
                     ex,
-                    backendCalls.Caught(ex) && !outcomeClassified ? generationHealth : null,
+                    backendCalls.Caught(ex) ? generationHealth : null,
                     stopwatch.Elapsed.TotalMilliseconds).ToResult();
             }
             finally
@@ -206,6 +204,11 @@ public static class DebugEndpoints
         // A queued client cancellation is client-gone just as it is for the OpenAI endpoints; the
         // scheduler's shutdown outcome remains distinguishable when RequestAborted was not set.
         var admission = SchedulerAdmission.Classify(scheduled, http.RequestAborted.IsCancellationRequested);
+        if (admission == SchedulerOutcome.ClientGone)
+        {
+            return Results.Empty;
+        }
+
         if (admission == SchedulerOutcome.Completed)
         {
             return scheduled.Result!;
@@ -214,8 +217,8 @@ public static class DebugEndpoints
         var failure = SchedulerAdmission.FailureFor(
             admission,
             scheduled.RetryAfterSeconds,
-            backendCalls.Faulted ? generationHealth : null,
-            attemptDurationMs);
+            health: null,
+            durationMs: attemptDurationMs);
         SchedulerAdmission.ApplyRetryAfter(http.Response, admission, scheduled.RetryAfterSeconds);
         return failure.ToResult();
     }

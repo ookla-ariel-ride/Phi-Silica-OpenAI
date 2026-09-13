@@ -85,7 +85,6 @@ internal static class JsonPipeline
         var queueWaitMs = 0.0;
         var backendCalls = new BackendCallTracker();
         var attemptDurationMs = 0.0;
-        var outcomeClassified = false;
 
         try
         {
@@ -167,16 +166,14 @@ internal static class JsonPipeline
                             sink.OnDelta,
                             generationCts.Token));
 
-                        // Whichever comes first. When the cut has fired, cancel here -- on this thread,
-                        // guarded -- and then wait for the generation to end as it would have anyway. The
-                        // overshoot is a delta or two and costs nothing: the cut itself is applied to the
-                        // final text below.
+                        // Whichever comes first. When the watcher signals because the cut fired or it
+                        // faulted, cancel here -- on this thread, guarded -- and then wait for the
+                        // generation to end as it would have anyway. The overshoot is a delta or two and
+                        // costs nothing: the cut itself is applied to the final text below.
                         //
-                        // "Has the cut fired" rather than "did the cut win the race": a generation that
-                        // ends in the same instant the watcher trips is still cancelled, so the flag
-                        // beside the cancel means the same thing here as on the stream, which cancels
-                        // whenever a delta trips the cutter no matter what the generation has done since.
-                        // Cancelling a finished generation is a no-op.
+                        // A watcher fault is retained by the sink and rethrown after the cancelled
+                        // generation drains. It must not count as a cut: only a normal watcher signal
+                        // lets a Cancelled backend result map to the client-side cut outcome.
                         //
                         // Skipped when the request set no limits: there is no watcher, so nothing can
                         // ever complete the other half of the race, and awaiting the generation alone
@@ -186,8 +183,13 @@ internal static class JsonPipeline
                             await Task.WhenAny(generation, watcher.Signal).ConfigureAwait(false);
                             if (watcher.Signal.IsCompleted)
                             {
-                                cancelledByCut = true;
-                                await GenerationPipeline.CancelGuardedAsync(generationCts, logger, requestId, "at the cut").ConfigureAwait(false);
+                                var watcherFaulted = sink.BridgeFault is not null;
+                                cancelledByCut = !watcherFaulted;
+                                await GenerationPipeline.CancelGuardedAsync(
+                                    generationCts,
+                                    logger,
+                                    requestId,
+                                    watcherFaulted ? "after a cutter fault" : "at the cut").ConfigureAwait(false);
                             }
                         }
 
@@ -304,7 +306,6 @@ internal static class JsonPipeline
             // shapes cannot describe the same generation differently. See GenerationOutcome for why the
             // cut is consulted as the flag recorded at the cancel rather than as the cutter's state.
             var outcome = GenerationOutcome.Classify(result, cancelledByCut, generationHealth, totalMs);
-            outcomeClassified = true;
 
             if (outcome.Failure is { } failure)
             {
@@ -399,7 +400,7 @@ internal static class JsonPipeline
         // answered the identical event with a 502 and the ordinary error body.
         catch (Exception ex)
         {
-            var failure = GenerationFailure.FromException(ex, backendCalls.Caught(ex) && !outcomeClassified ? generationHealth : null, attemptDurationMs);
+            var failure = GenerationFailure.FromException(ex, backendCalls.Caught(ex) ? generationHealth : null, attemptDurationMs);
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
                 status: ex.GetType().Name, finish: "-", httpStatus: failure.StatusCode,
                 cache: GenerationPipeline.CacheLabel(lease), tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns,

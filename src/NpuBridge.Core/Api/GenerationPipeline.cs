@@ -224,6 +224,7 @@ internal sealed class DeltaSink
         catch (Exception ex)
         {
             Interlocked.CompareExchange(ref _bridgeFault, ex, null);
+            _watcher?.SignalFault();
         }
     }
 }
@@ -253,8 +254,14 @@ internal sealed class CutWatcher
 
     public CutWatcher(OutputLimits limits) => _cutter = new OutputCutter(limits);
 
-    /// <summary>Completes once the model should be stopped, and never faults. Never completes if no limit fires.</summary>
+    /// <summary>
+    /// Completes once the model should be stopped or the watcher faults, and never faults itself.
+    /// Never completes if no limit fires and no watcher fault occurs.
+    /// </summary>
     public Task Signal => _signal.Task;
+
+    /// <summary>Signals that a watcher fault needs the model stopped before the request reports it.</summary>
+    public void SignalFault() => _signal.TrySetResult();
 
     /// <summary>
     /// One delta, from the backend's thread. Locked because the cutter is not thread-safe and a runtime
