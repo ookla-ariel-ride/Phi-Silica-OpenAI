@@ -157,6 +157,7 @@ internal sealed class DeltaSink
     private readonly Stopwatch _stopwatch;
     private readonly ChannelWriter<string>? _writer;
     private readonly CutWatcher? _watcher;
+    private Exception? _bridgeFault;
     private long _firstTokenTicks;
     private int _count;
 
@@ -199,6 +200,9 @@ internal sealed class DeltaSink
     /// </summary>
     public double TtftMs(double totalMs) => Count == 0 ? totalMs : FirstTokenTicks * 1000.0 / Stopwatch.Frequency;
 
+    /// <summary>The first bridge-side failure raised by the non-streaming cut watcher.</summary>
+    public Exception? BridgeFault => Volatile.Read(ref _bridgeFault);
+
     public void OnDelta(string delta)
     {
         if (Interlocked.Increment(ref _count) == 1)
@@ -213,7 +217,14 @@ internal sealed class DeltaSink
         // makes. Unbounded channel: TryWrite only fails once the writer is completed, which happens
         // after GenerateAsync has returned and so after the last callback.
         _writer?.TryWrite(delta);
-        _watcher?.Accept(delta);
+        try
+        {
+            _watcher?.Accept(delta);
+        }
+        catch (Exception ex)
+        {
+            Interlocked.CompareExchange(ref _bridgeFault, ex, null);
+        }
     }
 }
 

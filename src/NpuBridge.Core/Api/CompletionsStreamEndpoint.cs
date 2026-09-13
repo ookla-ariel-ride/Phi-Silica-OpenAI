@@ -144,9 +144,7 @@ internal sealed class CompletionsStreamEndpoint
                         }
 
                         channel.Writer.TryComplete();
-                        var totalMs = attemptStopwatch.Elapsed.TotalMilliseconds;
-                        var ttftMs = sink.TtftMs(stopwatch.Elapsed.TotalMilliseconds);
-                        return ChatAttemptResult.Generated(result, cancelledByCut, ttftMs, totalMs);
+                        return ChatAttemptResult.Generated(result, cancelledByCut, 0, 0);
                     }
                     catch
                     {
