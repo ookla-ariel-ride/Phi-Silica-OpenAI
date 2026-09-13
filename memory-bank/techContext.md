@@ -12,7 +12,11 @@ machine; the NPU is here.
   version-constants source) + CsWinRT 2.3.1 (direct) + `Microsoft.Windows.SDK.BuildTools` 10.0.26100.4948
   (makeappx/signtool; also used by `identity.ps1`). CsWinRT reads Windows metadata from the
   `Microsoft.Windows.SDK.NET.Ref` 10.0.26100.57 NuGet, so no Windows SDK install is needed.
-- Tests: xunit 2.9.3, `Microsoft.AspNetCore.TestHost` 10.0.11. 932 tests, about 1 s.
+- Tests: xunit 2.9.3, `Microsoft.AspNetCore.TestHost` 10.0.11. 952 tests, about 2 s. `dotnet test`
+  does not build the exe project (`src/NpuBridge`); a change there needs `dotnet build` as well.
+  `Directory.Build.props` sets `InvariantGlobalization=true` solution-wide, which also gates off the
+  globalization analyzers (CA1305 and siblings) in `src/`; the test project flips it to `false` for
+  the de-DE culture test and carries CA1305 in its NoWarn (#35).
 - `Microsoft.ML.Tokenizers` 2.0.0 is Core's one package reference (D80); it pulls `Google.Protobuf`.
   `LlamaTokenizer.Create(stream, addBeginOfSentence: false)` over the embedded Phi-3.5-mini
   `tokenizer.model` (499,723 bytes, sha256 `9e556afd…8347`, MIT, `src/NpuBridge.Core/Tokenizers/Phi3/`).
@@ -85,11 +89,16 @@ machine; the NPU is here.
   2026-09-11; a full non-streaming one-word reply in 415 ms to 453 ms (677 ms to 899 ms in earlier
   runs); an early cut (`max_tokens=4`) ended in 472 ms against 2,703 ms for a late cut of the same
   prompt (D53 holds); progress delivers multiple tokens per callback.
-- **Runtime RPC fault (seen twice on 2026-09-11):** the first generation after a start can fail
-  with `COMException: The remote procedure call failed`, after which every call in that process
-  fails with `The RPC server is unavailable (0x800706BA)`. Nothing in the Application log. A restart
-  clears it; the bridge does not recreate the model (`docs/FUTURE.md`). In a smoke run this shows as
-  ten failed steps starting at `/debug/generate`; re-run once before treating it as a branch defect.
+- **Runtime RPC wedge (three episodes by 2026-09-12):** twice the first generation after a start
+  failed with `COMException: The remote procedure call failed` and every later call with `The RPC
+  server is unavailable (0x800706BA)`; once (2026-09-12, 17:28 local) a freshly ready bridge answered
+  its first and every following call with the same 502 in 3 to 16 ms, with nothing in the Application
+  log and no oversized prompt anywhere near it, and recovered on its own about eight minutes later.
+  The throw is `CreateContext`, the first cross-process call on the channel, which is why the health
+  recorder (D98) is armed before context acquisition. The bridge does not recreate the model. In a
+  smoke run a first-generation fault shows as failed steps from `/debug/generate` on; re-run once.
+  The event-log signature of the *crash-induced* wedge (D94) is `WorkloadsSessionHost.exe` with
+  `0xc0000409`; the daily `0xc0000005` in `tokapi.dll` is unrelated.
 - `--system-prompt-placement auto|native|prompt` (new in chunk 3, default `auto`): native context when
   the backend advertises the capability. Measured on this NPU: both placements produce the instructed
   reply under the chunk 3 template; only bare `/debug/generate` ignores system text (D45).
@@ -151,6 +160,7 @@ and the `WindowsWorkload.LanguageModel.*` packages as *staged only* (registered 
 dotnet build ; dotnet test
 .\scripts\identity.ps1 -Install|-Status|-Uninstall
 .\scripts\smoke.ps1 -Backend phi-silica|fake [-Port 5298] [-ToolProbeRuns 20] 6>&1 | Tee-Object -FilePath smoke.log
+.\scripts\tool-probe.ps1 -Stream -Include ToolCountSweep,WindowOccupancy,MultiStep -Runs 3 -HeadlineRuns 3 -OccupancyCells '70%' -JsonOut probe.json   # against a RUNNING bridge; -SelfTest needs none
 NpuBridge.exe --backend fake --listen http://127.0.0.1:5299 --verbose [--queue-capacity 1]
 NpuBridge.exe task install|status|uninstall        # elevated for install/uninstall
 NpuBridge.exe service install|start|stop|uninstall # elevated; aion/fake only
@@ -174,6 +184,41 @@ two come back `rate_limit_error`/`queue_full` with `Retry-After`.
   `closes #N` on a line of its own.
 - Ports used by the smoke script: the main server on `-Port`, auxiliary servers on `-Port + 1`
   (placement runs) and `-Port + 2` (`--truncate-history`).
+
+## Session tooling around the repository (2026-09-12)
+- **Sidequest board** (`sidequest@eigenwise-toolshed` at project scope, profile `coding`): tickets
+  in `~/.claude/sidequest/sidequest.db`, executors in `~/.claude/sidequest/worktrees/<project>/agent-<id>`
+  on their own branches, delivery `merge` into the board's `integrationBranch` in this checkout, never a
+  push. Routes: coding tiers on GPT-5.6 Terra (normal, high) and Luna (easy, medium) through the model
+  gateway, `review-audit` on Opus high (cross-family from the coders), debugging and hard coding on
+  Opus. This harness's Agent tool lacks `name`/`mode`, so dispatch with `reducedAgentSchema: true`.
+  A review bound with `reviewTarget` needs a submitted, un-integrated candidate; a rejected candidate
+  is repaired by a fresh ticket that later supersedes it. Executors cannot run the hardware smoke (a
+  worktree build has no package identity), and `dotnet test` in this checkout fails while a bridge
+  holds the exe. Two executors died on API stream idle timeouts and were resumed by `SendMessage`.
+- **Serena and worktrees do not mix.** The serena MCP server is one process per session with one
+  active project; three executors editing through it wrote into whichever worktree had activated it
+  last (2026-09-12). Dispatch briefs forbid serena in executors until an upstream fix; the
+  orchestrating session may still read through it. Not yet reported on Eigenwise/eigenwise-toolshed.
+- **Wave branches and PRs.** Each wave integrates on `wave/<name>` (cut from `main`, set as the
+  board's `integrationBranch`), ships as a PR whose body carries `closes #N`, CI runs on it, and the
+  merge is on GitHub. PR #36 was the first. Never repoint `integrationBranch` while a submission is
+  pending against the old target. The rules are in `~/.claude/CLAUDE.md`, which also carries the
+  cross-family review rule, the standing authorization to close issues on their definition of done,
+  and the no-Claude-attribution rule.
+- **Observability plugin** (`observability@eigenwise-toolshed`, project scope, enabled 2026-09-12):
+  a loopback observer on 14319, a pinned OpenTelemetry Collector on 4318, the `workbench-otel-lgtm`
+  container (Grafana on 3000, OTLP on 14318) under Docker Desktop, SQLite under
+  `%LOCALAPPDATA%\Eigenwise\Workbench`, this repository opted in through `.claude/settings.local.json`
+  (gitignored, as is the plugin's `.claude/settings.local.workbench-telemetry.json`). The plugin
+  cannot install its Collector here: it asks for `otelcol-contrib_0.120.0_windows_arm64.tar.gz`, which
+  the release does not publish; the amd64 archive, verified against the release checksums, was
+  extracted by hand into `%LOCALAPPDATA%\Eigenwise\Workbench\collector\` and runs under emulation.
+  Redo that after any Collector version bump. Docker Desktop must be running for the dashboard; the
+  plugin prints "could not start the container" while the container is in fact starting. Verify with
+  `bin/verify-project-telemetry.js --project <repo>` from a session started after the opt-in.
+- Marketplace auto-update is on for `eigenwise-toolshed` (`~/.claude/plugins/known_marketplaces.json`,
+  `autoUpdate: true`); an update still needs `/reload-plugins` in open sessions.
 
 ## Aion model family (researched 2026-09-10)
 - **Aion 1.0 Instruct**: the Phi Silica successor, announced at Build 2026 on 2026-06-02. Preview SDK

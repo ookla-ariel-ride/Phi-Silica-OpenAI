@@ -38,7 +38,11 @@ not just what the type declares (400 on failure, no context created) → check t
 choose the system-prompt placement → read `tools` into a `ToolCatalog` and render the instruction
 block into the *system text* (null catalog when there are no usable tools, `tool_choice: "none"` or
 `--tool-emulation off`, which is the single switch phase two reads) → render the prompt
-(`PromptTemplate`) → compute the output limits (`max_tokens`/`stop`, D53). Then
+(`PromptTemplate`) → **the system-text guard** (D97): when the placement is native and the system
+text exceeds 32,000 characters, or its token count reaches `backend.ContextWindowTokens`, the request
+is refused 400 `context_length_exceeded` here, before a queue slot is taken and before anything is
+tokenized for the character case; the count it computes once is carried on `PreparedChatRequest` for
+`ConversationSession`'s usage estimate → compute the output limits (`max_tokens`/`stop`, D53). Then
 `ChatCompletionsEndpoint` (JSON) or `ChatCompletionsStreamEndpoint` (SSE) hands the rest to
 `GenerationScheduler.ScheduleAsync`, which is where chunk 8 put the boundary. One worker reads a
 bounded `Channel<GenerationJob>` (`--queue-capacity`), a full queue is 429 with `Retry-After` and
@@ -64,7 +68,11 @@ when it is legible differs by shape (D57, D81) → `ToolCallReply.From` over the
 catalog is present, which both shapes call and neither decides for itself → settles the lease exactly
 once on every path: `Keep` after a `Complete`, uncut generation puts the context back under the new
 key, anything else disposes it in the `finally` (the stream cancels → drains → settles, D51; D72)
-→ shapes the OpenAI response → logs the outcome with `cache=`, `tail_turns=` and `truncated_turns=`. Two
+→ shapes the OpenAI response → logs the outcome with `cache=`, `tail_turns=` and `truncated_turns=`.
+The classifiers also feed `GenerationHealth` (D98): `Classify` records success or fault, the catch's
+`FromException` records a fault, and a flag armed before `session.Acquire()` and cleared once the
+outcome is classified makes the recording happen once per attempt and cover a `CreateContext` or
+preflight throw, which is the wedge's actual symptom. Two
 concurrent requests for one conversation never share a context, and since D84 the second does not even
 attempt its lookup until the first's whole attempt has run its course; whether it then reuses the seed
 context or creates one that loses the key is a scheduling detail chunk 8 deliberately does not promise,
@@ -158,7 +166,14 @@ did not cover (#26), the same shape D56, D57 and D81 each answered in turn.
 ## Backend contract (`ILanguageModelBackend`)
 - `InitializeAsync` once, possibly minutes; `BackendLifecycle` runs it in the background, owns the
   backend, and disposes it only after initialization finishes (grace period for stubborn runtimes).
-- `CreateContext(systemPrompt?)` returns an `IModelContext` the caller owns and disposes.
+- `CreateContext(systemPrompt?)` returns an `IModelContext` the caller owns and disposes. On Phi
+  Silica it throws `ArgumentException` above the 32,000-character ceiling (D97), so no direct caller
+  can reach the host fail-fast; the wire-level refusal happens earlier, in the preparer.
+- `ContextWindowTokens` (D97): the backend's known usable window in its own tokens, or null. Phi
+  Silica returns the measured 3,581 as a constant that the D80 smoke step cross-checks on every
+  hardware run through `/healthz`'s `context_window_tokens`; Aion, the unavailable backend and the
+  fake's default return null (the fake takes `FakeBackendOptions.ContextWindowTokens`). Per-build
+  discovery is deferred (`docs/FUTURE.md`).
 - `GenerateAsync(ctx, prompt, sampling?, onDelta, ct)` streams deltas on an arbitrary thread; returns
   `GenerationResult(Text, Status, Detail)`. Cancellation is `GenerationStatus.Cancelled` with partial
   text, never an escaping exception.
@@ -337,7 +352,11 @@ service/task verbs bind through the same code.
   off the server); `queue_depth`/`queue_capacity`, real since chunk 8 — `queue_depth` is a live
   counter rather than `Reader.Count`, dropping at whichever comes first of the caller cancelling while
   queued or the worker dequeuing, so a client that enqueues and gives up cannot inflate it or
-  `Retry-After` for a whole generation (D87); backend diagnostics passed through verbatim.
+  `Retry-After` for a whole generation (D87); `last_generation` (`outcome`, `finished_at`,
+  `duration_ms`, `error`; null before any attempt) and `consecutive_backend_faults`, and 503
+  `status: degraded` with the last fault's first line once the count reaches two while the backend is
+  `Ready`, requests still admitted (D98); `context_window_tokens`, written as null when unknown
+  (D97); backend diagnostics passed through verbatim.
 - `/v1/completions`: the legacy `text_completion` shape over the same pipeline, both streaming and
   not (D91). `choices[].text` rather than `.message`; `finish_reason` is only `stop`, `length` or
   `content_filter`, since `tools` does not exist here; a multi-element `prompt` array is a 400 rather
@@ -355,7 +374,10 @@ service/task verbs bind through the same code.
   counter's count for a text and the counter's name, answered while the model is still loading (D80).
   Both are loopback-only and diagnostic; the smoke script leans on them. `/debug/generate` still
   carries the pre-D82 catch filter, so a foreign `OperationCanceledException` escapes it as a bare
-  500 (issue #25).
+  500 (issue #25). It runs the system-text guard before `CreateContext` and still generates an
+  over-window prompt on purpose (the D52 smoke step measures the runtime's own verdict that way),
+  but a generic `Error` on a prompt its preflight already said would not fit is not recorded as a
+  backend fault; a thrown exception on the same prompt is (D98, second addendum).
 
 ## Review loop
 Each chunk: build + tests green → adversarial review (in-session subagent, then Codex) → fix in-scope
@@ -381,6 +403,16 @@ self-review would have checked the code against the same wrong brief. Only a rev
 written the code, reading against the spec rather than the instruction, could find it (D84). This is
 why an implementer never dispatches its own reviewer, and why the session driving the work makes the
 ruling when a review and a brief disagree.
+
+**Since 2026-09-12 the loop runs on the Sidequest board, and three things it taught.** First, bind
+the review to the candidate before integrating: a `review-audit` ticket with `reviewTarget` only
+binds to a submitted, un-integrated candidate, and a rejected candidate cannot be reworked in place;
+the repair is a fresh ticket that supersedes it once integrated. Second, the reviewer on a different
+model family is what caught the wave's one design defect (the health flag armed too late for the
+wedge's real symptom) and what the same-family review of the guard did not: a vacuous test survived
+Terra reviewing Terra and fell to the cross-family pass. Third, shared tooling state is a
+correctness hazard under concurrent executors: one serena process with one active project turned
+three isolated worktrees into one, and the fix was a rule in every brief, not a code change.
 
 **The state-doc pass belongs to the merge, not to whatever comes after it.** The session that merged
 chunk 8 crashed in the gap between filing its issues and updating the documents, and the repository

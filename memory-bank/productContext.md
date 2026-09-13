@@ -18,7 +18,9 @@ so those tools can run fully local, offline, and free.
   it did not follow), the response says so in OpenAI's error format rather than silently degrading.
 - **Observable.** `/healthz` answers "is the model loaded, why not, how long has it been loading",
   whether the process has package identity, the context cache's count and hit/miss counters, how many
-  requests are waiting on the generation queue and how many it will hold, the
+  requests are waiting on the generation queue and how many it will hold, the outcome of the last
+  generation attempt and how many backend faults in a row (503 `degraded` at two, D98), the backend's
+  known context window in tokens (D97), the
   streaming keep-alive timings, and the backend's own diagnostics (bootstrap outcome, ready state,
   the text-contract counters `text_mismatches` and `late_deltas`); every request logs backend,
   prompt size, cache hit or miss, time to first token, tokens/s and outcome; `--verbose` shows the
@@ -67,7 +69,10 @@ so those tools can run fully local, offline, and free.
   and the many-tool agent case measured 2026-09-12 (issue #21, D93 to D96) at 40/40 over 1 to 25 tools
   and 32/32 at up to 85 % window occupancy. The limit is the window, not the model's protocol
   discipline: a real agent's tool schemas alone are nearly three times it, and the tool block goes into
-  the system text, where over ~40,000 characters it crashes the Windows model host (issue #29). A
+  the system text, where over ~44,000 characters it would crash the Windows model host (issue #29);
+  since D97 the bridge refuses native system text at the window's token count or over 32,000
+  characters with a 400 before any backend call, so a full-toolset agent gets an instant refusal
+  rather than a crashed runtime. A
   zero-argument call written without the `tool_calls` wrapper reads as content (issue #22).
 - A continuing conversation hits the context cache (`--context-cache-size`, default 4) and sends only
   its newest turns. The reply is the one a replay would give, sooner. Context overflow returns
@@ -94,10 +99,13 @@ so those tools can run fully local, offline, and free.
   adopted after the measurement the owner asked for agreed with the runtime's preflight. `max_tokens`
   is a budget in those tokens. Aion and the fake report `ceil(chars/4)`, documented as an estimate.
   `POST /debug/tokenize` shows the count and which counter answered.
-- The Phi Silica runtime can fail its first generation after a start with an RPC fault (seen twice
-  on 2026-09-11); the request is a 502 `backend_error`, every later request in that process fails
-  the same way, and a restart clears it. The bridge does not recreate the model on its own yet
-  (`docs/FUTURE.md`). The README tells users this.
+- The Phi Silica runtime can wedge (three episodes by 2026-09-12: twice after a first generation, once
+  from the first call of a freshly ready bridge with no crash and no oversized prompt); every
+  generation then answers 502 `backend_error` in milliseconds. Two episodes self-healed in minutes, one
+  needed a restart. Since D98 `/healthz` says so: after two consecutive backend faults it answers 503
+  `status: degraded` with the last outcome and the count, while still admitting requests so a runtime
+  that recovers can clear it. The bridge does not recreate the model on its own (deferred with reasons
+  in D98). The README tells users this.
 - A failure during a generation always reaches the client in the OpenAI error body: as an HTTP
   status while the response has not begun, as a `data: {"error":...}` event once it has. Since D82
   that covers a cancellation the client did not cause, which the non-streaming shape used to let

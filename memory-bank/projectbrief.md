@@ -17,7 +17,8 @@ the two, so agents call the cloud while the NPU sits idle.
    (`--backend phi-silica|aion|fake`), so the November 2026 model swap is a flag change.
 3. Conversations are efficient on a 4K-token model: a context cache keyed on the message prefix
    means a continuing chat sends only its newest turn to the NPU.
-4. Context pressure is surfaced loudly (HTTP 400 `context_length_exceeded`), never hidden.
+4. Context pressure is surfaced loudly (HTTP 400 `context_length_exceeded`), never hidden, and since
+   D97 a system text that cannot fit is refused before it can reach the model host at all.
 5. Emulated tool calling so agent loops can run at all on models with no native function calling,
    with honest reporting of how well a ~3B model follows the protocol.
 6. Runs as a plain exe, a logon task (Phi Silica) or a Windows service (Aion/fake), localhost-only by
@@ -81,7 +82,7 @@ from the 2026-09-10 review (D82; issue #10 closed), taken in the same window bec
 in the files D81 had just rewritten. Chunk 7 then landed the same day, and chunk 8 the next, which
 completes the plan. **All eight chunks are built and merged as of 2026-09-12.** Remaining work is
 tracked as GitHub issues rather than chunks: #24 to #28 from chunk 8's own review, #33 to #35 left by the
-2026-09-13 wave that shipped #29 to #31 (D97 to D99), #14 to #16 from the coverage audit, #17,
+2026-09-12 wave that shipped #29 to #31 (D97 to D99, the first Sidequest wave, merged through PR #36), #14 to #16 from the coverage audit, #17,
 #19, #22, and #2 and #11 for Aion.
 
 ## Repository
@@ -95,4 +96,9 @@ merge, decisions and deferrals written down, commit per chunk. GitHub issues are
 each remaining chunk, defect and cleanup is an issue, and progress a later session needs goes into
 a comment on it. Decisions that are the owner's to make are put to them one at a time with a
 recommendation, and recorded in `docs/SESSION-HANDOFF.md` and the relevant issue. After a merge,
-`CLAUDE.md`, the handoff and this folder are updated in the same session.
+`CLAUDE.md`, the handoff and this folder are updated in the same session. Since 2026-09-12 the work
+runs on the Sidequest board: one ticket per issue, executors in isolated worktrees on routed models,
+an adversarial review on a different model family bound to every candidate before it integrates,
+each wave on a `wave/<name>` branch shipped as a pull request that closes its issues, and a standing
+authorization for the orchestrating session to close an issue with its evidence once its definition
+of done is met (the rules live in `~/.claude/CLAUDE.md`).

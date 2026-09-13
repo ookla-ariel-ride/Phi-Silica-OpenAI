@@ -10,10 +10,10 @@ Elite an empty context accepts 3,581 tokens of prompt, roughly 13,400 characters
 decodes at about 27 tokens per second. Those counts are the model's own: the bridge tokenizes with
 Phi-3.5-mini's vocabulary, having measured that the runtime's prompt-length limit agrees with it.
 Short conversations work well, and a continuing one is cheap because the bridge keeps the model's
-context between turns. Long agent loops with a dozen tools will not fit — a real terminal agent's
-toolset alone measured nearly three times the whole window, and its whole fixed prompt three to
-seven times — and the bridge answers with OpenAI's
-`context_length_exceeded` error instead of dropping turns on its own.
+context between turns. Long agent loops with a dozen tools will not fit: a real terminal agent's toolset alone measured
+nearly three times the whole window, and its whole fixed prompt three to seven times. The bridge
+answers with OpenAI's `context_length_exceeded` error instead of dropping turns on its own, and it
+answers before the request can reach the model.
 
 ## Backends
 
@@ -98,14 +98,15 @@ and it streams over server-sent events like any other OpenAI provider. `docs/CLI
 OpenCode and Hermes the same way, plus the wire-level traps a client author should know about before
 relying on this bridge.
 
-`scripts/smoke.ps1 -Backend phi-silica` checks the whole surface against the hardware in three to
-five minutes: health with identity, both response shapes, the cut, the context cache, the overflow
-refusal and `--truncate-history` on a second server, the tokenizer against the model's own prompt
-limit, a tool-call probe over N runs (`-ToolProbeRuns`, five by default), two concurrent requests
+`scripts/smoke.ps1 -Backend phi-silica` checks the whole surface against the hardware in five to
+ten minutes: health with identity, both response shapes, the cut, the context cache, the overflow
+refusal and `--truncate-history` on a second server, the system-text guard with a 32,000-character
+text whose token count is proved offline first, the tokenizer against the model's own prompt limit
+and against the window the bridge reports, a tool-call probe over N runs (`-ToolProbeRuns`, five by default), two concurrent requests
 queueing behind one another, a full queue answering 429 on a server started with capacity 1,
 `/v1/completions` on both shapes, and at the end that the relaunched child process exited and the
-port is free. It starts and tears down four helper servers along the way, each with its own pass or
-fail row. Re-run `identity.ps1 -Install` whenever the build output folder or the manifest changes,
+port is free, then a last line with the health of the run's final generation. It starts and tears
+down four helper servers along the way, each with its own pass or fail row. Re-run `identity.ps1 -Install` whenever the build output folder or the manifest changes,
 which includes moving or renaming the clone.
 
 ## How a request travels
@@ -119,7 +120,9 @@ flowchart TD
     C -->|"yes"| C1["Append the tool instructions to the system text"]
     C -->|"no"| D
     C1 --> D["Render the transcript (PromptTemplate)"]
-    D --> S{"Is there room in the queue?"}
+    D --> G{"Does the system text alone fit?"}
+    G -->|"no"| E400s["400 context_length_exceeded, before the queue"]
+    G -->|"yes"| S{"Is there room in the queue?"}
     S -->|"no"| E429["429 queue_full, with Retry-After"]
     S -->|"yes"| W["Wait for the one worker"]
     W --> F{"A cached context holds a prefix of it?"}
@@ -141,7 +144,10 @@ flowchart TD
     R -->|"no"| M["Dispose the context"]
 ```
 
-Everything below the queue runs on one worker. There is one model handle and no way to use it from
+The system-text check comes first because it protects the machine: system text at or over the
+model's window, or over 32,000 characters, is refused before any backend call and before a queue
+slot is taken. Everything below the queue runs on one
+worker. There is one model handle and no way to use it from
 two requests at once, so a second request waits, and so do its cache lookup and its prompt-length
 preflight, which are calls on that same handle. A request that arrives to a full queue is refused
 with 429, code `queue_full`, and a `Retry-After` estimated from how long generations have averaged
@@ -163,7 +169,7 @@ Keep-alive comments hold the connection open while that happens.
 |---|---|
 | `POST /v1/chat/completions` | chat completions, streaming and non-streaming |
 | `POST /v1/completions` | the legacy text-completion shape, streaming and non-streaming |
-| `GET /healthz` | backend state, load time, package identity, context-cache and queue counters, streaming keep-alive timings, diagnostics, `last_generation`, and `consecutive_backend_faults`. Returns 200 while ready with fewer than two consecutive backend faults; returns 503 when loading, unavailable, or degraded |
+| `GET /healthz` | backend state, load time, package identity, context-cache and queue counters, streaming keep-alive timings, diagnostics, the backend's known context window in tokens (`context_window_tokens`, null when unknown), `last_generation`, and `consecutive_backend_faults`. Returns 200 while ready with fewer than two consecutive backend faults; returns 503 when loading, unavailable, or degraded |
 | `GET /v1/models`, `GET /v1/models/{id}` | the active model id |
 | `POST /debug/generate` | one literal prompt into the backend with timing. Diagnostic, loopback only |
 | `POST /debug/tokenize` | the backend's token count of a literal text, and which counter answered. Diagnostic, loopback only, works while the model loads |
@@ -278,8 +284,8 @@ meanwhile and the calls then arrive in a single chunk. Offering different tools 
 conversation as far as the cache is concerned, since the instruction block is part of the system text.
 
 How well the model follows the protocol is its own business, and it is now measured rather than
-guessed. Across 114 generations on Phi Silica — tool counts from 1 to 25, flat and nested schemas,
-agent system prompts up to 1,501 tokens, and tool blocks filling half to 85 % of the context window —
+guessed. Across 114 generations on Phi Silica (tool counts from 1 to 25, flat and nested schemas,
+agent system prompts up to 1,501 tokens, and tool blocks filling half to 85 % of the context window)
 arguments parsed as valid JSON in every call that checked them, the values were right wherever the
 model picked the right tool, no prose-wrapped protocol reached a client, and the bridge produced no
 malformed reply. One exception worth stating plainly: in a run using stochastic sampling, three
@@ -290,20 +296,21 @@ suggested accuracy sagged as the window filled; it did not reproduce once the sw
 deterministic decoding and the position control the other dimensions use (`docs/DECISIONS.md` D96).
 
 The limit is not the model's protocol discipline. It is the window. A real agent's tool schemas are
-larger than everything Phi Silica can hold: one terminal agent measured here presents about 40 KB of
+larger than everything Phi Silica can hold: one terminal agent measured here sends about 37 KB of
 tool JSON for its 25 tools, against a 3,581-token window, so it cannot run until its toolset is cut
-down — restricted to a single toolset, the same agent works. Offer a handful of tools and this is
+down. Restricted to a single toolset, the same agent works. Offer a handful of tools and this is
 reliable; offer an agent framework's whole toolbox and the conversation will not fit at all.
 `docs/CLIENTS.md` has the measured table, and `--tool-emulation off` turns the feature off for the
 process, `tool_choice: "none"` for one request.
 
 One safety note for anyone probing these limits. A system prompt much over 40,000 characters does not
 merely overflow: it crashes the Windows model host and leaves the NPU unusable for the whole machine
-for several minutes (`docs/DECISIONS.md` D94, issue #29). After two consecutive backend faults,
-`/healthz` returns 503 with `status: degraded`, the latest outcome, and the fault count. The bridge
-still admits requests so a runtime that recovers can clear the degraded state. A client that keeps
-retrying 502 responses can still spend 30 to 40 seconds of NPU time on an impossible request. Treat
-40,000 as the ceiling rather than the 44,000 where it was first seen to break, and find the boundary with
+for several minutes (`docs/DECISIONS.md` D94, issue #29). The bridge refuses before that can happen.
+System text delivered to the model natively is answered 400 `context_length_exceeded` when its token
+count reaches the window or its length exceeds 32,000 characters, before any backend call and before
+a queue slot is taken, and the Phi Silica adapter refuses the same ceiling for anything that calls it
+directly. The message says when the rendered tool definitions are what filled it. If you write a
+script that builds system text, keep it under 32,000 characters and find the boundary with
 `POST /debug/tokenize` rather than by sending the request.
 
 ## Configuration
@@ -386,10 +393,15 @@ on the NPU: two requests sent at once queued and both answered, and a server sta
 through `/debug/generate` and obeyed when it arrives inside the rendered transcript. Use the
 diagnostic endpoint to learn about the raw model, and the chat endpoint to learn about this API.
 
-**The model runtime can fail its first generation after a start.** Twice in one day the first
-request after start answered 502 with `The remote procedure call failed`, and every later request in
-that process answered `The RPC server is unavailable`. Nothing is logged by Windows. Restarting the
-bridge clears it; the bridge does not yet recreate the model on its own.
+**The model runtime can wedge.** Three times so far a Phi Silica process has reached a state where
+every generation fails within milliseconds with `The RPC server is unavailable`: twice after a first
+generation, once from the very first call of a freshly started bridge with no crash and no oversized
+prompt anywhere near it. Windows logs nothing for that kind. Two of the three cleared on their own
+within about eight minutes; one needed a restart. The bridge does not recreate the model on its own,
+but `/healthz` now says what is happening: after two consecutive backend faults it answers 503 with
+`status: degraded`, the last outcome and the fault count, while still admitting requests so a
+runtime that recovers can show it. A client that polls `/healthz` should back off on 503 rather than
+retry hot.
 
 ## Repository layout
 
@@ -408,7 +420,8 @@ src/NpuBridge/             the ARM64 exe: Program.cs, PackageActivation, Supervi
   Backends/                PhiSilicaBackend, AionBackend, PackageDependency
 tests/NpuBridge.Tests/     xunit against the fake backend through TestServer
 packaging/                 AppxManifest.xml for the sparse package; BuildTools.proj
-scripts/                   identity.ps1 (package identity), smoke.ps1 (the hardware run)
+scripts/                   identity.ps1 (package identity), smoke.ps1 (the hardware run), tool-probe.ps1 (the
+                           tool-call measurement, with -Stream and an offline -SelfTest)
 docs/                      PLAN.md, DECISIONS.md, FUTURE.md, SESSION-HANDOFF.md, CLIENTS.md, and the
                            Windows ARM64 workaround notes for OpenCode and the Grok CLI
 memory-bank/               project notes kept for the next session

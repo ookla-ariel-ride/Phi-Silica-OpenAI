@@ -3,7 +3,10 @@
 ## Works today (verified)
 | Area | Status | Evidence |
 |---|---|---|
-| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; **950** xunit tests green, 0 skipped (the #29/#30/#31 wave, D97 to D99, merged 2026-09-12; chunk 5, the D77 conformance pass, D78, the D79 test hardening, D80 real token counts, the D81 shared pipeline, the D82 review notes and chunk 7 tool-call emulation merged 2026-09-11; chunk 8, D84 to D92, merged 2026-09-12). **All eight chunks of `docs/PLAN.md` are built and merged; the plan is complete.** |
+| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; **952** xunit tests green, 0 skipped (the #29/#30/#31 wave, D97 to D99, merged 2026-09-12 through PR #36; chunk 5, the D77 conformance pass, D78, the D79 test hardening, D80 real token counts, the D81 shared pipeline, the D82 review notes and chunk 7 tool-call emulation merged 2026-09-11; chunk 8, D84 to D92, merged 2026-09-12). **All eight chunks of `docs/PLAN.md` are built and merged; the plan is complete.** |
+| System-text guard (#29, D97) | ✅ | `Api/SystemTextGuard.cs`, called from `ChatRequestPreparer` before the queue and from `/debug/generate` before `CreateContext`: native system text at or over `ILanguageModelBackend.ContextWindowTokens` (3,581 on Phi Silica) or over 32,000 characters is 400 `context_length_exceeded` with no backend call, no queue slot, no context; the character ceiling is checked before tokenizing; `PhiSilicaBackend.CreateContext` throws above the same ceiling. `SystemTextGuardTests` (twelve tests: token check, character ceiling, tools named in the message, no truncate retry, plain 400 on a busy queue with the rolling mean untouched, folded placement left to the preflight, de-DE culture, no `Count` call on a ceiling refusal). Smoke on the NPU (2026-09-12): a 32,000-character system text counted offline at 13,421 tokens refused before any context; `/healthz` `context_window_tokens` 3581 equal to the measured D80 boundary |
+| Outcome-based `/healthz` (#30, D98) | ✅ | `Backends/GenerationHealth.cs`, recorded from `GenerationOutcome.Classify`, `GenerationFailure.FromException` and `SchedulerAdmission.FailureFor` on all five shapes, armed before `session.Acquire()` so a `CreateContext` or preflight throw counts. `last_generation` and `consecutive_backend_faults` on the body; two consecutive faults are 503 `degraded` while requests stay admitted. `GenerationHealthTests` (eleven tests, including `CreateContext` and preflight throws, a cut counted as success, a refusal not moving the counter, a post-generation bridge exception not overwriting a success, a preflight-known overflow on `/debug/generate` recording nothing). Smoke on the NPU: the D52 cross-check's runtime `Error` recorded as one fault, not degraded |
+| Streamed tool-call measurement (#31, D99) | ✅ | `tool-probe.ps1 -Stream` and `-SelfTest`: six streamed/JSON pairs identical after ignoring per-response ids and key order, `index` only on the streamed shape, the finish-reason biconditional both ways on 34 replies, `context_cache_hits` 0 to 1 across the second turn of the tool round trip, streamed latency equal to JSON. The script reads streamed error events, treats a non-200 pair as not comparable, and survives a 503 degraded `/healthz` |
 | Generation scheduler (`--queue-capacity`) | ✅ | Chunk 8, D84 to D88, D92: `Api/GenerationScheduler.cs`, one worker on a bounded `Channel<GenerationJob>`. `ConversationSession.Acquire` runs inside the scheduled closure, not just `GenerateAsync`, because `CreateContext` and `GetUsablePromptLength` are calls on the same shared handle (D84 — the review's catch, against the task brief's own instruction). Queue-full → 429 + `Retry-After` + `rate_limit_error`/`queue_full`; a job cancelled while queued is dropped without touching the model (503 `queue_shutting_down`); a job that ran and threw its own OCE is a 502 (D88). Measured on the NPU: two concurrent requests really queued (`queue_depth` peaked at 1), `--queue-capacity 1` admitted one and rejected two |
 | `POST /v1/completions` | ✅ | Chunk 8, D91: both shapes, `object: "text_completion"`, `choices[].text`, finish reasons `stop`/`length`/`content_filter` only (no `tools` on this endpoint). `prompt` wrapped into one user message and run through the identical pipeline from the model-id check onward; a multi-element `prompt` array is a 400; the `chatcmpl-` id prefix is kept deliberately; `echo`/`best_of`/`suffix`/`logprobs`/`logit_bias` accepted and warned, never implemented. Smoke answered on both shapes on the NPU |
 | `/debug/generate` through the scheduler | ✅ | Chunk 8, D90, superseding D40's deferral: unqueued it raced the shared handle exactly as the OpenAI endpoints did. Two imprecisions left as issues, not fixed in-chunk (#25) |
@@ -73,10 +76,26 @@
   runtime that never completes now parks the single worker and everything queued behind it, with
   `queue_depth` never draining. A bounded timeout-then-dispose is the wrong fix — it reinstates the
   use-after-dispose race D51 removed. Unobserved in practice so far (#28).
-- The Phi Silica runtime can fail its first generation after a start with an RPC fault, after which
-  every generation in that process fails (`The RPC server is unavailable`). Seen twice on
-  2026-09-11; a restart clears it; the bridge does not recreate the model (`docs/FUTURE.md`, README
-  "Things that will surprise you"). A smoke run that fails this way is re-run once.
+- The Phi Silica runtime can wedge: every generation in the process then fails within milliseconds
+  with `The RPC server is unavailable`. Three episodes: twice after a first generation on
+  2026-09-11 (a restart cleared one), and once on 2026-09-12 from the first call of a freshly ready
+  bridge, with no crash in the Application log and no oversized prompt, self-healed in about eight
+  minutes. Since D98 `/healthz` answers 503 `degraded` after two consecutive backend faults, so a
+  client or the smoke readiness step can tell. The bridge does not recreate the model (deferred,
+  D98). A smoke run that fails on a first generation is re-run once.
+- `/healthz` fault attribution leftovers (#34): the armed window still covers in-process work before
+  classification (a tokenizer or cut throw after a good generation would be labelled a backend
+  fault), an SSE write failing ahead of `RequestAborted` can record a fault, the cut-counts-as-success
+  test reaches its branch only probabilistically, `duration_ms` is 0 on one fault path and includes
+  the queue wait on the JSON shapes, ten smoke `/healthz` reads expect only 200.
+- System-text guard leftovers (#35): the globalization analyzers are gated off in `src/` by
+  `InvariantGlobalization=true`; `dotnet test` never compiles the exe project; the smoke's one-token
+  window cross-check is tighter than the step's own 2 % spread; the null-window branch of
+  `context_window_tokens` is untested; `PhiSilicaBackend` references `Api` for the ceiling constant;
+  the smoke probe sits at exactly 32,000 characters; a dead optional parameter on `RefusalFor`.
+- The model once answered a tool round trip's second turn with a fenced `{"tool_calls": []}`, which
+  the parser correctly treated as content (#33). Whether the bridge should swallow an empty fence is
+  open.
 - Two keep-alive tests pin less than they claim to a reader of their names until the keep-alive
   waits go through the injected `TimeProvider` (`docs/FUTURE.md`); their summaries say so.
 - Issues #14 and #15 are part-done: `honours a system prompt` and the chat steps in the smoke
@@ -222,3 +241,17 @@
   keep-alive landing mid-loop, plus a sibling window its own write-up had wrongly called safe; both
   fixed in `2114c36`. 932 tests; the NPU run passed 28 PASS / 0 FAIL / 0 SKIP / 5 INFO first time.
   Fast-forward merged; #24 to #28 filed for what it knowingly left.
+- The #29/#30/#31 wave (2026-09-12, the first Sidequest wave, D97 to D99, PR #36): sixteen tickets.
+  Every code change was reviewed by a different model family than wrote it (GPT-5.6 Terra and Luna
+  wrote, Opus reviewed), and the whole PR branch had a `/code-review` pass on top. The catches that
+  earned it: the first healthz candidate armed its fault flag only before `GenerateAsync` and so
+  would have missed the very wedge #30 was filed for (the reviewer read D94 and saw the throw is
+  `CreateContext`; a third wedge episode that evening confirmed it on hardware); a Terra review of
+  the guard found the folded-placement test vacuous; the PR review found `/debug/generate` counting a
+  preflight-known overflow's generic `Error` as a fault (the smoke had shown exactly one), the guard
+  tokenizing 37 KB before its cheap character check, four probe-script gaps, and the docs calling
+  UTC times local. One tooling failure shaped the wave: three executors in separate worktrees all
+  edited through the one serena process and every edit landed in whichever worktree had activated it
+  last; briefs since forbid serena in executors. 952 tests; the NPU run on `7a3207c` passed with the
+  window cross-check exact. Merged on GitHub as `4b252c4`; #29, #30 and #31 closed with their
+  evidence; #33, #34 and #35 filed for what the reviews left.
