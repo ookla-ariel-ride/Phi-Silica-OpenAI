@@ -816,6 +816,41 @@ try {
         $lines -join [Environment]::NewLine
     }
 
+    Step 'native system text token-window guard is refused before CreateContext' {
+        # D97: this hardware probe targets the token-window branch below the character ceiling.
+        $health = Get-Json '/healthz'
+        if ($null -eq $health.context_window_tokens) {
+            Skip 'backend does not report context_window_tokens: no token-window guard to probe'
+        }
+
+        $systemText = [string]::new('x', 20000)
+        $tokenized = Get-Json '/debug/tokenize' 'POST' (@{ text = $systemText } | ConvertTo-Json -Compress)
+        $reportedWindow = [int]$health.context_window_tokens
+        $systemTokens = [int]$tokenized.tokens
+        if ($systemText.Length -ge 32000) { throw "token-window guard probe must stay below the 32,000-character ceiling; got $($systemText.Length)" }
+        if ($systemTokens -le $reportedWindow) { throw "token-window guard probe is too short: /debug/tokenize reports $systemTokens tokens, not above the $reportedWindow-token usable window" }
+
+        $body = @{ model = $servedModel; temperature = 0; messages = @(
+            @{ role = 'system'; content = $systemText }
+            @{ role = 'user'; content = 'Reply with exactly the word PONG.' }
+        ) } | ConvertTo-Json -Depth 5
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add("token-window probe: $($systemText.Length) system characters, /debug/tokenize=$systemTokens tokens > context_window_tokens=$reportedWindow")
+
+        $response = Invoke-WebRequest -Uri "$base/v1/chat/completions" -Method POST -Body $body -ContentType 'application/json' -SkipHttpErrorCheck -TimeoutSec 30
+        $tokenError = $response.Content | ConvertFrom-Json -Depth 20
+        if ([int]$response.StatusCode -ne 400 -or $tokenError.error.code -ne 'context_length_exceeded') { throw "token-window guard: expected HTTP 400 context_length_exceeded; got HTTP $($response.StatusCode): $($response.Content)" }
+        if ($tokenError.error.message -notmatch 'Native system text alone exceeds the context window:.*tokens fills the .*token usable window') { throw "token-window guard: expected the token-window detail, got: $($tokenError.error.message)" }
+        $lines.Add('token-window guard: HTTP 400 context_length_exceeded naming the token window before CreateContext')
+
+        $stream = Invoke-Sse '/v1/chat/completions' $body 30
+        if ($stream.StatusCode -ne 400 -or $stream.Frames.Count -ne 0) { throw "streamed token-window guard: expected plain HTTP 400 before any frame; got HTTP $($stream.StatusCode), frames=$($stream.Frames.Count): $($stream.Body)" }
+        $streamError = $stream.Body | ConvertFrom-Json -Depth 20
+        if ($streamError.error.code -ne 'context_length_exceeded' -or $streamError.error.message -notmatch 'Native system text alone exceeds the context window:.*tokens fills the .*token usable window') { throw "streamed token-window guard returned the wrong error: $($stream.Body)" }
+        $lines.Add('streamed token-window guard: plain HTTP 400 context_length_exceeded before any SSE frame')
+        $lines -join [Environment]::NewLine
+    }
+
     # The D80 measurement, repeated per build: the preflight is the runtime's own tokenizer answering
     # "this many characters fit", so if the bridge's counter is the runtime's, every text's fitting
     # prefix counts the same number of tokens. Three texts with very different characters per token;

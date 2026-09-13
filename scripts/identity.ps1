@@ -274,7 +274,11 @@ switch ($PSCmdlet.ParameterSetName) {
                     Where-Object { $_.PackageFullName -eq $existing.PackageFullName }
                 if ($stillRegistered) {
                     Write-Step "Removing superseded $($existing.PackageFullName)"
-                    Remove-AppxPackage -Package $existing.PackageFullName -ErrorAction SilentlyContinue
+                    $removeErrors = $null
+                    Remove-AppxPackage -Package $existing.PackageFullName -ErrorAction SilentlyContinue -ErrorVariable removeErrors
+                    if ($removeErrors) {
+                        Write-Warning "Could not remove superseded package '$($existing.PackageFullName)'. Remove it by hand before starting the bridge: $($removeErrors[0].Exception.Message)"
+                    }
                 }
             }
         }
