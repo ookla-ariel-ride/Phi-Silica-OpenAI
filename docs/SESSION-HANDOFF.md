@@ -1,4 +1,4 @@
-# Session handoff, 2026-09-13 (early morning), issues #29, #30 and #31 shipped as one wave
+# Session handoff, 2026-09-12 (late evening, local), issues #29, #30 and #31 shipped as one wave
 
 Supersedes the 2026-09-12 evening handoff (in git history). This session was the first run of the
 Sidequest board on this repository: thirteen tickets, three issues, two adversarial reviews per code
@@ -13,11 +13,13 @@ on a PR or pushed directly is the last section.
 - **950 tests pass**, last run by the board's integration gate on `7a3207c` (`Passed! - Failed: 0,
   Passed: 950, Skipped: 0, Total: 950`). 932 at the start of the session; the 18 new ones are the
   guard, the health recorder and the folded-placement preflight.
-- `smoke.ps1 -Backend phi-silica` on the merged `main`: passed on 2026-09-13 at 18:47 local (all steps, 0 skipped, 6 informational). The guard step refused a 32,000-character system text counted offline at 13,421 tokens before any context; `/healthz` reported `context_window_tokens` 3581 and the D80 step measured 3581; the final health line showed the D55 cross-check's runtime `Error` recorded as one backend fault, not degraded.
+- `smoke.ps1 -Backend phi-silica` on the merged `main`: passed on 2026-09-12 at 18:47 local (all steps, 0 skipped, 6 informational). The guard step refused a 32,000-character system text counted offline at 13,421 tokens before any context; `/healthz` reported `context_window_tokens` 3581 and the D80 step measured 3581; the final health line showed the D55 cross-check's runtime `Error` recorded as one backend fault, not degraded.
+- Clock: this machine, its commits and the Windows Application log are on Pacific time (UTC-7); the
+  Sidequest board and GitHub stamp UTC, which is why the wave straddles 2026-09-12 and 2026-09-13.
 - Decisions D97 (system-text guard, with a hardening addendum), D98 (outcome-based health, with the
   F1 addendum) and D99 (the streamed tool-call measurement) are appended. `docs/FUTURE.md` has a
   dated section for the wave's leftovers.
-- GitHub: #29, #30 and #31 closed with their evidence on 2026-09-13. New: #33 (empty
+- GitHub: #29, #30 and #31 closed with their evidence on 2026-09-12 (evening, local). New: #33 (empty
   `tool_calls` fence delivered as content), #34 (healthz attribution leftovers), #35 (guard
   leftovers). The older queue (#24 to #28, #2, #11, #14 to #17, #19, #22) is unchanged.
 
@@ -44,7 +46,7 @@ on a PR or pushed directly is the last section.
 
 ## Two things the wave taught, beyond the code
 
-- **A third issue #30 wedge episode, with no crash and no oversized prompt.** At 00:28 a fresh
+- **A third issue #30 wedge episode, with no crash and no oversized prompt.** At 17:28 local (00:28 UTC) a fresh
   bridge was ready and every generation returned 502 `The RPC server is unavailable` in 3 to 16 ms;
   the event log had no `WorkloadsSessionHost` crash; it self-healed within about eight minutes. That
   episode is what made the healthz review's blocking finding decisive: the throw is `CreateContext`,
@@ -74,10 +76,11 @@ on a PR or pushed directly is the last section.
 
 ## Do this next
 
-1. If the wave is not yet on a PR: cut `wave/issues-29-30-31` from local `main`, reset local `main`
-   to `origin/main`, push the branch, open the PR with `closes #29`, `closes #30` (and #31 already
-   closed), let CI run, merge on GitHub. The board's `integrationBranch` gets set to the next wave's
-   branch when it is cut.
+1. PR #36 (`wave/issues-29-30-31` into `main`) is open with CI green. A whole-branch `/code-review`
+   found one real defect (`/debug/generate` recording a preflight-known overflow as a backend fault)
+   and four probe-script gaps; both are fixed on the branch by two board tickets before the merge.
+   Merge on GitHub, delete the branch and the delivered `refs/sidequest/*` refs. The board's
+   `integrationBranch` gets set to the next wave's branch when it is cut.
 2. `.claude/settings.json` enabling `observability@eigenwise-toolshed` was stashed during the wave so
    the board could merge onto a clean target; pop it, then `/reload-plugins` and run the plugin's
    `enable-project-telemetry` skill.

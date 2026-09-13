@@ -3,7 +3,7 @@
 ## Works today (verified)
 | Area | Status | Evidence |
 |---|---|---|
-| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; **950** xunit tests green, 0 skipped (the #29/#30/#31 wave, D97 to D99, merged 2026-09-13; chunk 5, the D77 conformance pass, D78, the D79 test hardening, D80 real token counts, the D81 shared pipeline, the D82 review notes and chunk 7 tool-call emulation merged 2026-09-11; chunk 8, D84 to D92, merged 2026-09-12). **All eight chunks of `docs/PLAN.md` are built and merged; the plan is complete.** |
+| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; **950** xunit tests green, 0 skipped (the #29/#30/#31 wave, D97 to D99, merged 2026-09-12; chunk 5, the D77 conformance pass, D78, the D79 test hardening, D80 real token counts, the D81 shared pipeline, the D82 review notes and chunk 7 tool-call emulation merged 2026-09-11; chunk 8, D84 to D92, merged 2026-09-12). **All eight chunks of `docs/PLAN.md` are built and merged; the plan is complete.** |
 | Generation scheduler (`--queue-capacity`) | ✅ | Chunk 8, D84 to D88, D92: `Api/GenerationScheduler.cs`, one worker on a bounded `Channel<GenerationJob>`. `ConversationSession.Acquire` runs inside the scheduled closure, not just `GenerateAsync`, because `CreateContext` and `GetUsablePromptLength` are calls on the same shared handle (D84 — the review's catch, against the task brief's own instruction). Queue-full → 429 + `Retry-After` + `rate_limit_error`/`queue_full`; a job cancelled while queued is dropped without touching the model (503 `queue_shutting_down`); a job that ran and threw its own OCE is a 502 (D88). Measured on the NPU: two concurrent requests really queued (`queue_depth` peaked at 1), `--queue-capacity 1` admitted one and rejected two |
 | `POST /v1/completions` | ✅ | Chunk 8, D91: both shapes, `object: "text_completion"`, `choices[].text`, finish reasons `stop`/`length`/`content_filter` only (no `tools` on this endpoint). `prompt` wrapped into one user message and run through the identical pipeline from the model-id check onward; a multi-element `prompt` array is a 400; the `chatcmpl-` id prefix is kept deliberately; `echo`/`best_of`/`suffix`/`logprobs`/`logit_bias` accepted and warned, never implemented. Smoke answered on both shapes on the NPU |
 | `/debug/generate` through the scheduler | ✅ | Chunk 8, D90, superseding D40's deferral: unqueued it raced the shared handle exactly as the OpenAI endpoints did. Two imprecisions left as issues, not fixed in-chunk (#25) |
@@ -36,7 +36,7 @@
 
 ## Not built yet
 - **No chunk is outstanding.** `docs/PLAN.md`'s eight chunks are all merged as of 2026-09-12. Remaining
-  work is GitHub issues: #24 to #28 from chunk 8, #33 to #35 left by the 2026-09-13 wave that shipped
+  work is GitHub issues: #24 to #28 from chunk 8, #33 to #35 left by the 2026-09-12 wave that shipped
   #29 to #31, #14/#15/#16
   from the coverage audit, #17, #19, #22, plus #2 and #11 for Aion.
 - Aion Instruct adapter hardware verification: the adapter merged 2026-09-11 (chunk 6, D66 to D70) but
@@ -88,7 +88,7 @@
 - Tool-call compliance is measured across the range (#21, D93 to D96, 2026-09-12): 40/40 over 1 to 25
   tools, 3/3 flat and 3/3 deep schemas, 9/9 under system-prompt pressure, 32/32 at up to 85 % window
   occupancy under `temperature: 0`, and a multi-step round trip that answered without repeating the
-  call. PLAN predicted 60–80 %. The streamed shape and the cache round trip were measured on 2026-09-13 (#31, D99): six
+  call. PLAN predicted 60–80 %. The streamed shape and the cache round trip were measured on 2026-09-12 (#31, D99): six
   streamed/JSON pairs identical after ignoring per-response ids and key order, `index` only on the
   streamed shape, and the second turn of a tool round trip hit the context cache. One
   compliance failure did occur, under stochastic sampling only — three calls to a tool name never

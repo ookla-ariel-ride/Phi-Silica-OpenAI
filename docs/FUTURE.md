@@ -55,7 +55,7 @@ land here instead of widening the chunk. Each entry says where it came from and 
   `Task.WaitAsync` uses today, which is a production change and so out of scope for a coverage-only
   task. A genuine client-disconnect mid-stream is covered on both endpoints as of task 3b (fix round 1).
 
-## 2026-09-13 wave leftovers (issues #29, #30, #31)
+## 2026-09-12 wave leftovers (issues #29, #30, #31)
 
 - **An empty `tool_calls` fence reaches the client as content** (issue #33, D99). On the second turn
   of a tool round trip the model answered with a fenced `{"tool_calls": []}` and nothing else;

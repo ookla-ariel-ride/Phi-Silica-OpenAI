@@ -20,8 +20,8 @@ section used to duplicate actually lives; `docs/SESSION-HANDOFF.md` carries the 
 what to do next; `docs/FUTURE.md` holds deferred work. Read the handoff first; update DECISIONS and
 FUTURE whenever work changes a choice or defers something.
 
-Current state: 950 tests pass (last run by the Sidequest integration gate on `7a3207c`, 2026-09-13), `smoke.ps1 -Backend phi-silica`
-passes clean on hardware (2026-09-13: all steps, 0 skipped, 6 informational; `/healthz` `context_window_tokens` 3581 matched the
+Current state: 950 tests pass (last run by the Sidequest integration gate on `7a3207c`, 2026-09-12), `smoke.ps1 -Backend phi-silica`
+passes clean on hardware (2026-09-12, evening: all steps, 0 skipped, 6 informational; `/healthz` `context_window_tokens` 3581 matched the
 measured D80 boundary exactly), and the repository is `ookla-ariel-ride/npu-bridge`.
 
 Standing facts that will cost you a session if you do not know them:
@@ -45,7 +45,7 @@ Standing facts that will cost you a session if you do not know them:
   constraint, not the model's protocol discipline.
 
 Open issues carry the rest: #24 to #28 are chunk 8's known leftovers; #29 to #31 (the issue #21
-findings) shipped on 2026-09-13 as D97 to D99 and left #33 (an empty `tool_calls` fence delivered as
+findings) shipped on 2026-09-12 as D97 to D99 and left #33 (an empty `tool_calls` fence delivered as
 content), #34 (healthz fault-attribution leftovers) and #35 (system-text guard leftovers); #2, #11,
 #14 to #17, #19 and #22 are longer-running.
 
