@@ -165,6 +165,22 @@ public class ToolCallEndpointTests
         Assert.Equal("tool_calls", Sse.Chunks(streamText)[^1].GetProperty("choices")[0].GetProperty("finish_reason").GetString());
     }
 
+    [Theory]
+    [InlineData("```json\n{\"name\":\"get_time\",\"description\":\"Get the current time\"}\n```")]
+    [InlineData("The available tool is {\"name\":\"get_time\",\"description\":\"Get the current time\"}.")]
+    public async Task An_echoed_zero_argument_tool_definition_stays_content(string reply)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => FakeBackend.Tokenize(reply) });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var body = await PostAsync(host, Body(stream: false, tools: Time));
+
+        var choice = body.GetProperty("choices")[0];
+        Assert.Equal("stop", choice.GetProperty("finish_reason").GetString());
+        Assert.Equal(reply, choice.GetProperty("message").GetProperty("content").GetString());
+        Assert.False(choice.GetProperty("message").TryGetProperty("tool_calls", out _));
+    }
+
     [Fact]
     public async Task A_reply_that_is_not_a_call_stays_ordinary_content()
     {

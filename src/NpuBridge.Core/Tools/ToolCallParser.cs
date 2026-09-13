@@ -519,7 +519,8 @@ internal static class ToolCallParser
         var hasParameters = TryGet(body, "parameters", out var parameters);
         var supplied = hasArguments || (declared && hasParameters);
 
-        if (!supplied && !declared && (hasParameters || !IsOffered(offeredToolNames, tool)))
+        if (!supplied && !declared
+            && (!HasOnlyShortFormKeys(call) || !IsOffered(offeredToolNames, tool)))
         {
             return null;
         }
@@ -534,6 +535,20 @@ internal static class ToolCallParser
         }
 
         return new ParsedToolCall(tool, text);
+    }
+
+    private static bool HasOnlyShortFormKeys(JsonElement call)
+    {
+        foreach (var property in call.EnumerateObject())
+        {
+            if (!string.Equals(property.Name, "name", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(property.Name, "arguments", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool IsOffered(IReadOnlyCollection<string>? offeredToolNames, string tool)

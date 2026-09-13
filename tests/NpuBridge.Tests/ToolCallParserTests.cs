@@ -311,6 +311,15 @@ public class ToolCallParserTests
             ["get_time"]));
     }
 
+    [Theory]
+    [InlineData("```json\n{\"name\":\"get_time\",\"description\":\"Get the current time\"}\n```")]
+    [InlineData("The available tool is {\"name\":\"get_time\",\"description\":\"Get the current time\"}.")]
+    [InlineData("""{"name":"get_time","type":"function"}""")]
+    public void An_offered_short_form_with_extra_keys_is_content(string reply)
+    {
+        Assert.Null(ToolCallParser.Parse(reply, ["get_time"]));
+    }
+
     /// <summary>
     /// Inside a wrapper the model has said these are calls, so <c>parameters</c> is still accepted as
     /// the name of the arguments field — some models write it there having read the schema. This is
