@@ -253,6 +253,34 @@ public class GenerationHealthTests
         host.AssertNoLeak();
     }
 
+    [Theory]
+    [InlineData("/v1/chat/completions")]
+    [InlineData("/v1/completions")]
+    public async Task Cutter_tokenizer_failures_do_not_count_as_backend_faults_on_JSON_shapes(string path)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            TokenCounter = new ThrowingIndexAtTokenCountCounter(),
+            Responder = _ => ["done"],
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+        object body = path == "/v1/chat/completions"
+            ? new { model = "fake", messages = new[] { new { role = "user", content = "chat json" } }, max_tokens = 1 }
+            : new { model = "fake", prompt = "completions json", max_tokens = 1 };
+
+        using var response = await host.Client.PostAsJsonAsync(path, body);
+        var health = await ReadHealthAsync(host);
+        using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var error = document.RootElement.GetProperty("error");
+
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Equal("server_error", error.GetProperty("type").GetString());
+        Assert.Equal("backend_error", error.GetProperty("code").GetString());
+        Assert.Equal(JsonValueKind.Null, error.GetProperty("param").ValueKind);
+        Assert.Equal(0, health.Body.GetProperty("consecutive_backend_faults").GetInt32());
+        host.AssertNoLeak();
+    }
+
     [Fact]
     public async Task Create_context_failures_count_as_backend_faults_on_every_generation_shape()
     {
@@ -311,7 +339,9 @@ public class GenerationHealthTests
     [InlineData("/v1/completions")]
     public async Task Stream_write_failure_does_not_count_as_a_backend_fault(string path)
     {
+        var fake = new FakeBackend();
         await using var host = await BridgeTestHost.StartAsync(
+            fake,
             responseBodyFactory: context => context.Request.Path == path ? new ThrowAfterFirstWriteStream() : null);
         object body = path == "/v1/chat/completions"
             ? new { model = "fake", messages = new[] { new { role = "user", content = "hello" } }, stream = true }
@@ -329,6 +359,7 @@ public class GenerationHealthTests
         await TestWait.UntilAsync(() => host.Requests.Completed > 0);
         var health = await ReadHealthAsync(host);
 
+        Assert.NotEmpty(fake.Calls);
         Assert.Equal(0, health.Body.GetProperty("consecutive_backend_faults").GetInt32());
         host.AssertNoLeak();
     }
@@ -379,6 +410,21 @@ public class GenerationHealthTests
         var response = await host.Client.GetAsync("/healthz");
         using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         return (response.StatusCode, document.RootElement.Clone());
+    }
+
+    private sealed class ThrowingIndexAtTokenCountCounter : ITokenCounter
+    {
+        public string Name => CharEstimateTokenCounter.Instance.Name;
+
+        public bool PrefixStable => CharEstimateTokenCounter.Instance.PrefixStable;
+
+        public int Count(string text) => CharEstimateTokenCounter.Instance.Count(text);
+
+        public int IndexAtTokenCount(string text, int tokens, out int totalTokens) =>
+            throw new InvalidOperationException("cut watcher tokenizer failure");
+
+        public int TokensCovering(string text, int prefixChars) =>
+            CharEstimateTokenCounter.Instance.TokensCovering(text, prefixChars);
     }
 
     private sealed class ThrowingTokensCoveringCounter : ITokenCounter

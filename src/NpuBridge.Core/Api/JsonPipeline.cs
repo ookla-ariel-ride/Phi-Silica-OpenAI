@@ -192,6 +192,10 @@ internal static class JsonPipeline
                         }
 
                         var result = await backendCalls.AwaitAsync(generation).ConfigureAwait(false);
+                        if (sink.BridgeFault is { } bridgeFault)
+                        {
+                            throw bridgeFault;
+                        }
 
                         // 7a. A backend without a preflight can only say "too long" by failing the
                         // generation. With --truncate-history that is not the end: drop the oldest
