@@ -23,6 +23,8 @@ public sealed class UnavailableBackend : ILanguageModelBackend
 
     public Tokenizers.ITokenCounter TokenCounter => Tokenizers.CharEstimateTokenCounter.Instance;
 
+    public int? ContextWindowTokens => null;
+
     public IReadOnlyDictionary<string, object?> Diagnostics { get; } = new Dictionary<string, object?>();
 
     public Task InitializeAsync(CancellationToken cancellationToken) =>

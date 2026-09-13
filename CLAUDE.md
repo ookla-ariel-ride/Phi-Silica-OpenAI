@@ -101,7 +101,7 @@ unavailable` in 3 to 17 ms, `/healthz` still says `ready` (issue #30), a bridge 
 it, and the host processes are protected so they cannot be killed. It self-heals after minutes. This is
 easy to trigger by accident, because tool emulation renders the tool block into the system text — a
 real agent's toolset is ~37 KB on the wire. Find limits with `POST /debug/tokenize`, not by sending the request.
-"RPC server is unavailable" persisting past one retry means this happened; wait it out.
+"RPC server is unavailable" persisting past one retry means this happened; wait it out. The bridge now refuses native system text above 32,000 characters or the backend's known window token count before `CreateContext` (D97); the warning still applies to bare backend calls and to `/debug/generate` on builds before this change.
 
 Aion's SDK NuGet is not on nuget.org. It comes from the sample repo's GitHub release
 (`AionInstructPreview.Text.Framework.1.0.0.nupkg`) and lives in `nuget-local/`, wired by `nuget.config`.
@@ -336,6 +336,7 @@ Live today:
   `x-npu-bridge-truncated-turns: N` (turns dropped) to the response once a generation is attempted on
   the truncated transcript; the 400 refusal carries no header. On a stream that had already sent
   a keep-alive when a status-driven truncation happened, the header cannot be sent and the log says so.
+- **Native system-text guard (D97).** On a cache miss with native placement, the bridge refuses a system text before `CreateContext` when it exceeds 32,000 characters or a backend's known usable context window in tokens. It uses the same 400 `context_length_exceeded` envelope, does not create a context, and does not retry with `--truncate-history`; folded placement remains governed by the normal preflight.
 - **The context cache** (D71, D72): a request whose transcript extends a cached prefix (ending in an
   assistant turn, longest match wins) generates on that context with only the tail rendered, in the
   marker format; a context goes back in only after a `Complete`, uncut generation, under the key of

@@ -254,10 +254,16 @@ internal sealed class ConversationSession
     {
         while (true)
         {
-            var lease = Lookup();
+            var acquisition = Lookup();
+            if (acquisition.Failure is not null)
+            {
+                return acquisition;
+            }
+
+            var lease = acquisition.Lease!;
             if (!_preflight)
             {
-                return ContextAcquisition.Acquired(lease);
+                return acquisition;
             }
 
             // Guarded: the lease is owned here until it is handed back, and the caller's finally
@@ -401,7 +407,7 @@ internal sealed class ConversationSession
         }
     }
 
-    private ContextLease Lookup()
+    private ContextAcquisition Lookup()
     {
         var systemText = _prepared.Rendered.SystemText;
         var backend = _prepared.Backend;
@@ -433,13 +439,19 @@ internal sealed class ConversationSession
                     _prepared.RequestId, checkout.Context.Id, checkout.Prefix.TurnCount, tail.Count, prompt);
             }
 
-            return new ContextLease(_cache, checkout.Context, prompt, cacheHit: true, checkout.Prefix.Key,
-                tailTurns: tail.Count, promptChars: prompt.Length, transcriptChars, transcriptTokens, systemText, _turns);
+            return ContextAcquisition.Acquired(new ContextLease(_cache, checkout.Context, prompt, cacheHit: true, checkout.Prefix.Key,
+                tailTurns: tail.Count, promptChars: prompt.Length, transcriptChars, transcriptTokens, systemText, _turns));
+        }
+
+        var systemTextFailure = SystemTextGuard.RefusalFor(backend, nativeSystem, _prepared.ToolInstructions is not null);
+        if (systemTextFailure is not null)
+        {
+            return ContextAcquisition.Refused(systemTextFailure);
         }
 
         var context = backend.CreateContext(nativeSystem);
-        return new ContextLease(_cache, context, full.Prompt, cacheHit: false, cacheKey: null,
-            tailTurns: _turns.Count, promptChars: transcriptChars, transcriptChars, transcriptTokens, systemText, _turns);
+        return ContextAcquisition.Acquired(new ContextLease(_cache, context, full.Prompt, cacheHit: false, cacheKey: null,
+            tailTurns: _turns.Count, promptChars: transcriptChars, transcriptChars, transcriptTokens, systemText, _turns));
     }
 
     private List<ChatMessage> Transcript()

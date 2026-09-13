@@ -17,6 +17,7 @@ land here instead of widening the chunk. Each entry says where it came from and 
 - **Embeddings endpoint.** Phi Silica exposes `GenerateEmbeddingVectors`; `/v1/embeddings` is a small
   wrapper. Aion has no equivalent.
 - **Context TTL / idle expiry** in the context cache, in addition to LRU.
+- **Per-build context-window discovery.** Phi Silica currently exposes the D80-measured 3,581-token usable window as a backend constant for D97's native-system guard. A future initialization probe could create an empty context, call the preflight on long ASCII input, and convert the result with the backend counter. It needs hardware validation and must never use an unsafe system prompt.
 - **Listener auth** (bearer token) for anyone who binds beyond localhost.
 - **Content-filter option pass-through** (`ContentFilterOptions` on Phi Silica).
 - **LoRA adapters** (`LanguageModelOptions.LowRankAdapter`).

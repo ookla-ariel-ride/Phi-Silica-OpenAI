@@ -19,6 +19,8 @@ namespace NpuBridge.PhiSilica;
 internal sealed class PhiSilicaBackend : ILanguageModelBackend
 {
     public const string FeatureId = "com.microsoft.windows.ai.languagemodel";
+    // Measured by the D80 smoke boundary check; see issue #29 and D97 for the native-system guard.
+    private const int UsableContextWindowTokens = 3581;
     private const uint AccessDenied = 0x80070005;
 
     private readonly BridgeOptions _options;
@@ -63,6 +65,8 @@ internal sealed class PhiSilicaBackend : ILanguageModelBackend
     /// swap behind this API, re-run the D80 measurement before trusting it for that model.
     /// </summary>
     public NpuBridge.Tokenizers.ITokenCounter TokenCounter => NpuBridge.Tokenizers.Phi3TokenCounter.Instance;
+
+    public int? ContextWindowTokens => UsableContextWindowTokens;
 
     public IReadOnlyDictionary<string, object?> Diagnostics => _diagnostics;
 
