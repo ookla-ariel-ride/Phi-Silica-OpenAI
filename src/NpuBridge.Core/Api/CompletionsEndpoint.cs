@@ -52,6 +52,7 @@ internal sealed class CompletionsEndpoint
         IgnoredParameterLog ignoredLog,
         ContextCache cache,
         GenerationScheduler scheduler,
+        GenerationHealth generationHealth,
         TimeProvider time,
         ILogger<CompletionsEndpoint> logger,
         ILogger<CompletionsStreamEndpoint> streamLogger)
@@ -70,7 +71,7 @@ internal sealed class CompletionsEndpoint
         if (prepared.Request.Stream == true)
         {
             return await CompletionsStreamEndpoint
-                .StreamAsync(http, prepared, options, streaming, cache, scheduler, time, streamLogger)
+                .StreamAsync(http, prepared, options, streaming, cache, scheduler, generationHealth, time, streamLogger)
                 .ConfigureAwait(false) ?? Results.Empty;
         }
 
@@ -85,6 +86,7 @@ internal sealed class CompletionsEndpoint
         // ChatCompletionsEndpoint's fuller account of why (D43 + D51, chunk 8 fix round 1).
         ContextLease? lease = null;
         var queueWaitMs = 0.0;
+        var generationAttempted = false;
 
         try
         {
@@ -112,6 +114,7 @@ internal sealed class CompletionsEndpoint
                         var watcher = limits.IsEmpty ? null : new CutWatcher(limits);
                         var sink = DeltaSink.ToWatcher(stopwatch, watcher);
 
+                        generationAttempted = true;
                         var generation = backend.GenerateAsync(
                             attemptLease.Context,
                             attemptLease.Prompt,
@@ -162,7 +165,7 @@ internal sealed class CompletionsEndpoint
 
             if (admission != SchedulerOutcome.Completed)
             {
-                var schedulerFailure = SchedulerAdmission.FailureFor(admission, scheduled.RetryAfterSeconds);
+                var schedulerFailure = SchedulerAdmission.FailureFor(admission, scheduled.RetryAfterSeconds, generationHealth);
                 SchedulerAdmission.ApplyRetryAfter(http.Response, admission, scheduled.RetryAfterSeconds);
 
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, prepared.PromptChars, ttftMs: 0, tokens: 0,
@@ -203,7 +206,7 @@ internal sealed class CompletionsEndpoint
             // them: same OutputCutter, same GenerationOutcome, so the same generated text yields the
             // same reply and finish reason regardless of which endpoint asked for it.
             var cut = limits.Cut(result.Text);
-            var outcome = GenerationOutcome.Classify(result, cancelledByCut);
+            var outcome = GenerationOutcome.Classify(result, cancelledByCut, generationHealth, totalMs);
 
             if (outcome.Failure is { } failure)
             {
@@ -253,7 +256,7 @@ internal sealed class CompletionsEndpoint
         }
         catch (Exception ex)
         {
-            var failure = GenerationFailure.FromException(ex);
+            var failure = GenerationFailure.FromException(ex, generationAttempted ? generationHealth : null);
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
                 status: ex.GetType().Name, finish: "-", httpStatus: failure.StatusCode,
                 cache: CacheLabel(lease), tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns,

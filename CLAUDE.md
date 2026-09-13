@@ -343,7 +343,9 @@ Live today:
   the transcript plus the reply. `usage.prompt_tokens` estimates the whole transcript on a hit and a
   miss alike; the log line's `prompt_chars` is what was sent, and it also carries `cache=hit|miss`,
   `tail_turns=N` and `truncated_turns=N`. `/healthz` reports `contexts_cached`,
-  `context_cache_capacity`, `context_cache_hits` and `context_cache_misses`.
+  `context_cache_capacity`, `context_cache_hits`, `context_cache_misses`, `last_generation` and
+  `consecutive_backend_faults`. It returns `503 degraded` after two consecutive backend faults while
+  still admitting requests, so a later successful generation can clear the state.
 - Token counts in `usage` are the backend's counter's (D80): Phi-3 tokens on Phi Silica, `ceil(chars/4)`
   on Aion and the fake (D44). `prompt_tokens` counts the whole rendered transcript plus the native
   system text, the same on a hit and a miss; on a stream, `completion_tokens` counts the text the
