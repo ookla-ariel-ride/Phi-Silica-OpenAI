@@ -1,9 +1,12 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using NpuBridge.Api;
 using NpuBridge.Backends;
 using NpuBridge.Backends.Fake;
 using NpuBridge.Configuration;
+using NpuBridge.Tokenizers;
 
 namespace NpuBridge.Tests;
 
@@ -28,6 +31,23 @@ public class SystemTextGuardTests
             },
         },
     ];
+
+    private sealed class FixedTokenCountCounter : ITokenCounter
+    {
+        public string Name => "fixed";
+
+        public bool PrefixStable => true;
+
+        public int Count(string text) => 32_001;
+
+        public int IndexAtTokenCount(string text, int tokens, out int totalTokens)
+        {
+            totalTokens = Count(text);
+            return text.Length;
+        }
+
+        public int TokensCovering(string text, int prefixChars) => Count(text);
+    }
 
     [Fact]
     public async Task Token_window_refuses_native_system_text_before_context_creation_and_allows_smaller_text()
@@ -67,6 +87,34 @@ public class SystemTextGuardTests
         var accepted = await PostChatAsync(host, new string('s', 32_000));
         Assert.Equal(HttpStatusCode.OK, accepted.StatusCode);
         host.AssertNoLeak();
+    }
+
+    [Fact]
+    public void Refusal_messages_use_invariant_grouping_under_a_non_invariant_current_culture()
+    {
+        var original = CultureInfo.CurrentCulture;
+        try
+        {
+            CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("de-DE");
+            var backend = new FakeBackend(new FakeBackendOptions { ContextWindowTokens = 32_000 });
+
+            var characterFailure = SystemTextGuard.RefusalFor(backend, new string('s', 32_001), includesToolDefinitions: false);
+            var tokenBackend = new FakeBackend(new FakeBackendOptions
+            {
+                ContextWindowTokens = 32_000,
+                TokenCounter = new FixedTokenCountCounter(),
+            });
+            var tokenFailure = SystemTextGuard.RefusalFor(tokenBackend, "s", includesToolDefinitions: false);
+
+            Assert.Contains("32,000-character safety ceiling: 32,001 characters.", characterFailure!.Body.Error.Message,
+                StringComparison.Ordinal);
+            Assert.Contains("32,001 tokens fills the 32,000-token usable window.", tokenFailure!.Body.Error.Message,
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = original;
+        }
     }
 
     [Fact]
@@ -124,6 +172,62 @@ public class SystemTextGuardTests
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         Assert.DoesNotContain("data:", await response.Content.ReadAsStringAsync(), StringComparison.Ordinal);
         Assert.Equal(0, fake.ContextsCreated);
+        host.AssertNoLeak();
+    }
+
+    [Fact]
+    public async Task Native_system_text_refusal_bypasses_a_busy_queue_and_preserves_the_rolling_mean()
+    {
+        var clock = new ManualTimeProvider(new DateTimeOffset(2026, 9, 12, 12, 0, 0, TimeSpan.Zero));
+        var generationGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            ContextWindowTokens = 100,
+            StartGate = generationGate,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake,
+            options: new BridgeOptions { Backend = BackendKind.Fake, QueueCapacity = 1 }, time: clock);
+
+        // The running generation owns the worker but is not queued itself.
+        var running = PostChatAsync(host, "safe");
+        await TestWait.UntilAsync(() => fake.Calls.Count == 1);
+
+        // Preparation runs before ScheduleAsync, so this streamed request returns a normal JSON 400
+        // without spending the worker's slot or committing an SSE keep-alive.
+        var refusedTask = PostChatAsync(host, new string('s', 500), stream: true);
+        await TestWait.UntilAsync(() => refusedTask.IsCompleted);
+        var refused = await refusedTask;
+        Assert.Equal(HttpStatusCode.BadRequest, refused.StatusCode);
+        Assert.Equal("application/json", refused.Content.Headers.ContentType?.MediaType);
+        Assert.DoesNotContain(": keep-alive", await refused.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+        Assert.Equal(0, host.Scheduler.QueueDepth);
+        Assert.Single(fake.Calls);
+
+        // Make the only admitted generation take two scheduler seconds. Its duration is the mean that
+        // a later full-queue response must use; a guarded refusal must not add a zero-duration job.
+        clock.Advance(TimeSpan.FromSeconds(2));
+        generationGate.SetResult();
+        Assert.Equal(HttpStatusCode.OK, (await running).StatusCode);
+
+        var schedulerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var schedulerGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var held = host.Scheduler.ScheduleAsync(async _ =>
+        {
+            schedulerEntered.SetResult();
+            await schedulerGate.Task;
+            return 0;
+        }, CancellationToken.None);
+        await schedulerEntered.Task;
+
+        var queued = host.Scheduler.ScheduleAsync(_ => Task.FromResult(0), CancellationToken.None);
+        await TestWait.UntilAsync(() => host.Scheduler.QueueDepth == 1);
+        var rejected = await host.Scheduler.ScheduleAsync(_ => Task.FromResult(0), CancellationToken.None);
+
+        Assert.Equal(ScheduleResultKind.Rejected, rejected.Kind);
+        Assert.Equal(2, rejected.RetryAfterSeconds);
+
+        schedulerGate.SetResult();
+        await Task.WhenAll(held, queued);
         host.AssertNoLeak();
     }
 
