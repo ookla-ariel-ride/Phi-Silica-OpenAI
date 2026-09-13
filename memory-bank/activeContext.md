@@ -1,122 +1,103 @@
 # Active Context: npu-bridge
 
-_Last updated: 2026-09-12 (late evening, local), after the first Sidequest wave shipped issues #29,
-#30 and #31 (D97 to D99) and merged through PR #36. **All eight chunks of `docs/PLAN.md` are built
-and merged; the plan is complete.** Work from here is GitHub issues, run as Sidequest waves on
-`wave/<name>` branches that ship as pull requests; `docs/SESSION-HANDOFF.md` has the running
-conventions and what the wave taught._
+_Last updated: 2026-09-13 (morning, local), after the second Sidequest wave, `leftovers`, took issues
+#19, #22, #25, #26, #34 and #35 (D100 to D102) onto `wave/leftovers`. **All eight chunks of
+`docs/PLAN.md` are built and merged; the plan is complete.** Work is GitHub issues, run as board waves
+on `wave/<name>` branches that ship as pull requests; `docs/SESSION-HANDOFF.md` has the wave's state
+and what it taught._
 
 ## Where we are
-`main` is `0f3dd65` on top of `4b252c4`, the merge of PR #36 (34 commits: the wave, its two
-review-fix ticket sets, the D99 docs, the clock-time docs fix, the observability chore commits), in
-sync with origin. 952 tests pass (the board's integration gate on `10240ad`; CI green on the PR head
-`229cd24`), the solution builds with no warnings.
+`main` is `0733868`, equal to `origin/main`, unchanged since the last handoff. `wave/leftovers` holds
+the wave: ten board candidates and their ten merge commits, then the docs commit `930f0de` (D100 to
+D102, FUTURE, CLAUDE.md, the handoff), then the memory-bank and README commits of this pass. 980 tests
+pass (the board's integration gate on `f1d3b8b`); the solution builds with no warnings. The branch is
+pushed and its pull request carries the six `closes` lines; the merge is on GitHub.
 
-**The last hardware smoke was on `7a3207c`** (2026-09-12, 18:47 local; all steps, 0 skipped, 6
-informational): the guard step refused a 32,000-character system text counted offline at 13,421
-tokens before any context, `/healthz` reported `context_window_tokens` 3581 and the D80 step measured
-3581, and the final health line showed the D55 cross-check's runtime `Error` recorded as one backend
-fault, not degraded. The two review-fix sets after it (`d7676e7` C#, `bab0594` probe script) are
-unit-tested and CI-built only. The next session runs the smoke first. Earlier the same day the smoke
-passed at the PR #32 merge and again after the folder rename (`identity=True`, `queue_depth` peaking
-at 1, `--queue-capacity 1` admitting one of three, D80's boundaries 3581 / 3543 / 3581).
+**The last clean hardware smoke was on `3c97d48`** (2026-09-13, 05:47 local; all steps, 0 skipped, 6
+informational, final health `ok`). Three earlier runs the same wave: the baseline on `0733868`
+(21:02 the evening before), `3631444` with `-ToolProbeRuns 20` (20/20 called the tool, the issue #22
+definition of done), and `25dda87` (06:17), which passed every step including the restored
+token-window guard probe (20,000 characters measured at 5,001 tokens, refused before
+`CreateContext`) except `queue-full`, which failed on a 5-second `/healthz` client timeout inside the
+aux-server readiness loop. That loop catches only `HttpRequestException`; a slow health answer during
+model load escapes it. Pre-existing (no wave commit touches those lines), filed as board ticket SQ-30,
+not dispatched because the board MCP disconnected mid-session. The last two code merges (`008ce6f`,
+`f1d3b8b`) have not been smoke-run; the next session runs the smoke after SQ-30 lands.
 
 Chunk 6, the Aion Instruct Preview adapter, is merged but code-verified only: build 29648 never appends
 `WIN://SYSAPPID` for a main-package dynamic dependency, so the Qualcomm QNN provider cannot be
-image-mapped and no Aion generation has ever run here (D70; issue #2 open). Do not re-investigate that
-blocker.
-
-**The local folder was renamed to `npu-bridge` on 2026-09-12**, and identity was re-registered for it.
-`identity.ps1` registers with `Add-AppxPackage -ExternalLocation $BinDir`, so a rename leaves the
-registration pointing nowhere, and `-Status` cannot reveal it (it prints the WindowsApps
-`InstallLocation`, not the external location). The re-register showed that `Add-AppxPackage`
-**refuses** an in-place update when the external location changed (`HRESULT 0x80073D0B`) and D82's
-remove-then-add fallback is what carries it.
+image-mapped and no Aion generation has ever run here (D70; issue #2 open). Do not re-investigate.
 
 Aion Instruct ships as a model swap behind the Phi Silica API (Microsoft's Phi Silica page,
 2026-07-24): standalone package early October 2026, Insider rollout in October under a Controlled
 Feature Rollout with a registry key, retail in November with Phi Silica removed, no LAF token.
 `PhiSilicaBackend` is therefore the production Aion path. Details in `techContext.md`.
 
-## What the 2026-09-12 late session built: the #29/#30/#31 wave (D97 to D99)
-Three issues from the issue #21 measurement, run as sixteen Sidequest tickets: three implementations,
-one rejected candidate repaired as a fresh ticket, two test and probe fixes, two PR-review fixes, and
-five Opus reviews. Every code change was reviewed by a different model family than wrote it.
+## What the 2026-09-12/13 session built: the `leftovers` wave (D100 to D102)
+Six issues as ten board tickets (seven implementers, three bound cross-family reviews), one
+whole-branch `/code-review` that found nine findings and fed a three-ticket fix round, four smoke runs.
+Every code candidate was reviewed by a different model family than wrote it.
 
-- **D97, the system-text guard (#29).** `SystemTextGuard` refuses native system text before any
-  backend call when it reaches `ILanguageModelBackend.ContextWindowTokens` (3,581 on Phi Silica, a
-  constant the D80 smoke step now cross-checks through `/healthz`'s `context_window_tokens`) or
-  exceeds a 32,000-character ceiling (a Core constant, well under the 44,000 where `CreateContext`
-  fail-fasts the Windows model host, D94). It runs in `ChatRequestPreparer`, so a refusal takes no
-  queue slot and is a plain 400 on a busy queue, and the character ceiling is checked before anything
-  is tokenized. `PhiSilicaBackend.CreateContext` throws above the same ceiling for direct callers.
-  `--truncate-history` never retries it (dropping turns cannot shrink the system text); folded
-  placement is untouched (the prompt preflight already refuses it correctly). The refusal message
-  names the tool block when emulation rendered one. Messages use invariant formatting; the shipped
-  exe was always invariant (`Directory.Build.props` sets `InvariantGlobalization`), which is also why
-  the globalization analyzers never flagged the `:N0` (#35).
-- **D98, outcome-based health (#30).** `GenerationHealth`, one locked recorder, fed from the shared
-  classifiers (`GenerationOutcome.Classify`, `GenerationFailure.FromException`,
-  `SchedulerAdmission.FailureFor`) on all five shapes. `/healthz` gains `last_generation`
-  (`outcome`, `finished_at`, `duration_ms`, `error`) and `consecutive_backend_faults`; at two it is
-  503 `status: degraded` while requests are still admitted. The first candidate armed its fault flag
-  only before `GenerateAsync` and was rejected in review: the wedge's symptom is `CreateContext`
-  throwing (a third episode that evening: 27 consecutive 3-to-16 ms 502s from a freshly ready bridge,
-  no crash in the event log, self-healed in about eight minutes). The repair arms before
-  `session.Acquire()`. `/debug/generate`'s generic `Error` on a prompt its preflight said would not
-  fit is not a fault (second addendum); a thrown exception on the same prompt still is, deliberately.
-  Recreate-the-model stays deferred. Leftovers on #34: the armed window still covers in-process work
-  before classification, an SSE-write-before-abort race, a probabilistic cut test, `duration_ms`
-  semantics, ten smoke reads that expect only 200, two unpinned "not a fault" cases.
-- **D99, the streamed tool-call measurement (#31).** `tool-probe.ps1 -Stream` re-runs two cells with
-  `stream: true`; six pairs identical after removing `index` and `id` and ordering keys canonically;
-  `index` only on the streamed shape; the biconditional both ways on 34 replies;
-  `context_cache_hits` 0 to 1 across the second turn of the tool round trip; streamed latency
-  indistinguishable from JSON. The first comparison called every pair a mismatch because it compared
-  ids and key order; fixed twice more (non-200 pairs are "not comparable"; streamed error events are
-  now read; a 503 degraded `/healthz` no longer aborts the run). One model behaviour filed as #33: the
-  second turn once answered with a fenced `{"tool_calls": []}`, delivered as content.
-
-## What the earlier 2026-09-12 session built: chunk 8 (issue #4, D84 to D92)
-Settled; the decision entries and `systemPatterns.md` carry it. The scheduler serializes the model
-handle, not just the generation (D84, the review's catch against the brief); the lease is published
-from inside the closure (D85); a truncation retry keeps its slot (D86); `queue_depth` is a live
-counter (D87); dropped-while-queued is 503 and ran-and-threw is 502 (D88); D52's first-frame boundary
-now has the queue wait inside it (D89); `/debug/generate` goes through the scheduler (D90);
-`/v1/completions` with its four rulings (D91); publish-before-arm is the bug shape to remember, with
-`Interlocked` on both sides because ARM64 reorders (D92).
-
-## What the 2026-09-11 session built
-Settled; detail lives in `docs/DECISIONS.md`, `systemPatterns.md` and `progress.md`. Chunk 5 (D71 to
-D76), D77 (OpenAI wire conformance), D78, D79 (test and smoke hardening), D80 (real token counts), D81
-(one post-generation pipeline), D82 (the review notes), chunk 7 / D83 (tool-call emulation).
+- **D100, one JSON pipeline (#26).** `JsonPipeline.RunAsync<TResponse>` holds the scheduled closure
+  both JSON endpoints used to copy (the `Acquire` loop, the lease publication, the cut race, the
+  guarded cancel, the truncation retry, the admission block, the catch pair); each endpoint keeps its
+  DTO, its model-id check and a `respond` factory. The two closures were diffed before folding: five
+  differences, all the tool-call branch (provably inert on `/v1/completions`) or the DTO.
+  `CacheLabel` lives once on `GenerationPipeline`. With it: `WaitAsync` replaces the never-completing
+  `Task.Delay` shapes in the scheduler and the lifecycle (the worker's own fault is caught and logged
+  so shutdown still does not throw); `Retry-After` averages the last 16 attempts under the existing
+  stats lock; `ContextLease._settled` is `Interlocked`. The review established that a status-driven
+  `--truncate-history` retry is unreachable on `/v1/completions` (one user turn, nothing to drop).
+- **D101, offered zero-argument calls (#22).** `ToolCallParser.Parse` takes the request's offered tool
+  names; an unwrapped object whose only key is `name`, naming an offered tool, is a call with `{}`.
+  The whole-branch review found the first cut one key too wide (an echoed zero-argument definition,
+  `{"name":"get_time","description":…}`, became a call); the exact-keys narrowing landed the same day.
+  Bare arrays, unknown declared names and `parameters` echoes are unchanged. The probe's multi-step
+  cell now offers a zero-argument tool. Addendum: #25 (`/debug/generate` maps a foreign
+  `OperationCanceledException` to the 502 envelope and has a `ClientGone` branch), #35 (`.editorconfig`
+  raises CA1305 for `src/`; `BackendLimits` holds the 32,000 ceiling and `SystemTextGuard` is internal
+  again; `/healthz` writes `context_window_tokens: null`; the smoke's D80 bracket is 2 % and its guard
+  probes cover both branches), #19 (`identity.ps1` sorts by parsed version, re-checks before removing
+  a superseded registration, and warns when the removal fails).
+- **D102, the backend-call fault tracker (#34).** `BackendCallTracker` wraps the eight backend call
+  sites across the five shapes; the unfiltered catch records a fault only for the exception a tracked
+  call threw. A bridge-side throw is a 502 that leaves health alone; no new outcome value, because
+  `Classify` runs before the usage tokenizer so a good generation has already recorded `ok`. Duration
+  is the attempt's own. `FakeBackend.DeltaGate` (holds after delta N, before the next token's
+  cancellation check) made the cut and cancellation tests deterministic. Follow-ups from its review:
+  the cutter's tokenizer runs in the delta callback, so its throw is stashed by `DeltaSink`, the
+  watcher's signal is completed so the model is cancelled at once, and the fault is rethrown outside
+  the tracked region; the smoke's final-health read tolerates 503 again.
 
 ## Open threads
-No chunk is outstanding. Sixteen issues are open.
+No chunk is outstanding. Ten issues stay open once the PR merges.
 
-- **Left by the wave (#33, #34, #35):** see above. #34's first item (the recorder learning "a backend
-  call was made" from `ConversationSession`) is the one that changes design; the rest are small.
-- **From chunk 8 (#24 to #28):** #24, the publish-before-arm regression test is probabilistic (~60 %
-  catch rate). #25, a foreign `OperationCanceledException` still escapes `/debug/generate` as a bare
-  500, the one client-visible item. #26, the ~60-line JSON endpoint duplicate that `StreamingPipeline`
-  did not cover, plus four smaller cleanups. #27, three knowingly-untested paths. #28, the drain wait
-  is unbounded and silent. A natural next wave is #25, #26 and #34 together, since the health recorder
-  is threaded through the same endpoint pair #26 wants to fold.
-- **Coverage (#14, #15, #16)**, **#17** (`Cancellation` capability read by nobody), **#19**
-  (`identity.ps1` version sorting, both defects unreachable at 0.1.0.0), **#22** (accepted parser
-  behaviour), **#11** (Aion Plan, no SDK), **#2** (Aion hardware half, blocked on the OS).
-- Aion's overflow status is unmeasured; the status-driven truncation path (D73) is exercised by the
-  fake only and must be re-checked when any Aion generation runs.
-- Two Toolshed defects observed this session and not yet reported upstream: serena's single active
-  project under concurrent worktree executors, and the observability plugin's missing `windows_arm64`
-  Collector archive (`techContext.md`).
+- **SQ-30** (smoke readiness loops) is filed on the board and waits for a dispatch; then one more
+  smoke on the branch tip.
+- **Next wave candidates:** #24 and #17 (scheduler and `/healthz`, both reshaped by this wave), #27
+  and #28 (the streaming drain), #33 (a ruling first: tell the model to answer in prose when no tool
+  applies, measure with the probe, then decide whether to strip an empty fence).
+- **Deferred from this wave's reviews** (`docs/FUTURE.md`, 2026-09-13 section): a bridge throw before
+  classification leaves `/healthz` stale; `duration_ms >= 0` is unfalsifiable and the cancellation
+  duration path is unreachable; attempt duration is plumbed four times where the scheduler measures
+  it once; `Caught` is last-exception equality; `DeltaGate` ignores cancellation and its counters are
+  backend-wide; two twins of the disconnect test are still on `TokenDelay`; the debug endpoint's
+  mid-generation abort writes a body into a dead connection.
+- **Coverage (#14, #15, #16)**, **#11** (Aion Plan, no SDK), **#2** (Aion hardware half, blocked on
+  the OS). Aion's overflow status is unmeasured; the status-driven truncation path (D73) is exercised
+  by the fake only and must be re-checked when any Aion generation runs.
+- Two Toolshed defects still unreported upstream: serena's single active project under concurrent
+  worktree executors (serena was not used at all this session, by anyone), and the observability
+  plugin's missing `windows_arm64` Collector archive (`techContext.md`).
 
 ## How to resume
-1. Read `CLAUDE.md`, then `docs/SESSION-HANDOFF.md`, then `docs/DECISIONS.md` D97 to D99 with their
-   addenda.
-2. `dotnet build; dotnet test` (expect 952). Do not build while a smoke server is running.
-3. `scripts/smoke.ps1 -Backend phi-silica` before anything else: `main` has two commit sets no
-   hardware run has seen. Re-run `identity.ps1 -Install` first if the folder moved.
-4. Pick issues, cut `wave/<name>` from `main`, set the board's `integrationBranch` to it, file one
-   ticket per issue with the contract in the description, dispatch, bind an Opus review to each
-   submitted candidate before integrating, ship the wave as a PR.
+1. Read `CLAUDE.md`, then `docs/SESSION-HANDOFF.md`, then `docs/DECISIONS.md` D100 to D102.
+2. If the PR is merged: `git switch main && git pull`, repoint the board's `integrationBranch` to
+   `main`, then update this file's "Where we are" and the status paragraph in `CLAUDE.md`.
+3. `dotnet build; dotnet test` (expect 980). Do not build while a smoke server is running.
+4. `/reload-plugins` if the board MCP is down, dispatch SQ-30, integrate it, run
+   `scripts/smoke.ps1 -Backend phi-silica`; the queue-full step is the one to watch.
+5. Cut the next wave from `main`: one ticket per logical change (not per issue when an issue mixes a
+   refactor with a behaviour change), `worktreeBase: local-main`, verify fields as one command or an
+   `&&` chain, a cross-family review bound to every code candidate before it integrates, and the
+   whole-branch `/code-review` before the PR.

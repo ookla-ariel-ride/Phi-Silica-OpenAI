@@ -185,7 +185,7 @@ two come back `rate_limit_error`/`queue_full` with `Retry-After`.
 - Ports used by the smoke script: the main server on `-Port`, auxiliary servers on `-Port + 1`
   (placement runs) and `-Port + 2` (`--truncate-history`).
 
-## Session tooling around the repository (2026-09-12)
+## Session tooling around the repository (2026-09-12, updated 2026-09-13)
 - **Sidequest board** (`sidequest@eigenwise-toolshed` at project scope, profile `coding`): tickets
   in `~/.claude/sidequest/sidequest.db`, executors in `~/.claude/sidequest/worktrees/<project>/agent-<id>`
   on their own branches, delivery `merge` into the board's `integrationBranch` in this checkout, never a
@@ -195,7 +195,16 @@ two come back `rate_limit_error`/`queue_full` with `Retry-After`.
   A review bound with `reviewTarget` needs a submitted, un-integrated candidate; a rejected candidate
   is repaired by a fresh ticket that later supersedes it. Executors cannot run the hardware smoke (a
   worktree build has no package identity), and `dotnet test` in this checkout fails while a bridge
-  holds the exe. Two executors died on API stream idle timeouts and were resumed by `SendMessage`.
+  holds the exe. Three executors so far died on API stream idle timeouts at their first step (all
+  Opus) and were resumed by `SendMessage` with the briefing command restated. The board refuses a
+  ticket `verify` that chains with `;` or contains `$name` tokens: one command or an `&&` chain,
+  multi-step checks in the description, and a PowerShell parse check written for an executor needs
+  `$errs = $null` before `[ref]$errs`. With `worktreeBase: auto` the first dispatch of a wave wants
+  `origin/<integration branch>`; set `local-main` when the wave branch is cut. A plugin update
+  mid-session refuses dispatch until `/reload-plugins`, and if the board MCP later disconnects the
+  CLI (`node <plugin>/bin/sidequest.js <verb> --project <path>`, forward slashes) still files,
+  lists and integrates but refuses to dispatch. Integrating runs `dotnet test` in this checkout and
+  rolls the merge back on red, so integrate only while no smoke server holds the exe.
 - **Serena and worktrees do not mix.** The serena MCP server is one process per session with one
   active project; three executors editing through it wrote into whichever worktree had activated it
   last (2026-09-12). Dispatch briefs forbid serena in executors until an upstream fix; the

@@ -30,7 +30,7 @@ serializes is an endpoint concern: it wraps the endpoints' own closures, and `Sc
 to turn its outcomes into the wire shapes that live next to it. `AionBackend`
 compiles only when `nuget-local/` holds the Aion nupkg (`AionSdkAvailable`, D66); CI builds without it.
 
-## Request flow (as built through chunk 8, D84 to D92, 2026-09-12)
+## Request flow (as built through the `leftovers` wave, D84 to D92 and D100 to D102, 2026-09-13)
 `ChatRequestPreparer` does the shared part for both shapes, in order: parse the JSON body (malformed
 body → 400, no context created) → validate the DTO against what the deserializer can actually produce,
 not just what the type declares (400 on failure, no context created) → check the backend is `Ready`
@@ -44,7 +44,10 @@ is refused 400 `context_length_exceeded` here, before a queue slot is taken and 
 tokenized for the character case; the count it computes once is carried on `PreparedChatRequest` for
 `ConversationSession`'s usage estimate → compute the output limits (`max_tokens`/`stop`, D53). Then
 `ChatCompletionsEndpoint` (JSON) or `ChatCompletionsStreamEndpoint` (SSE) hands the rest to
-`GenerationScheduler.ScheduleAsync`, which is where chunk 8 put the boundary. One worker reads a
+`GenerationScheduler.ScheduleAsync`, which is where chunk 8 put the boundary. Since D100 the JSON
+half of what follows lives once in `JsonPipeline.RunAsync<TResponse>`, called by both JSON endpoints
+with a `respond` factory (the streamed half has been `StreamingPipeline` since D91), so the closure
+below exists in two shared places, never per endpoint. One worker reads a
 bounded `Channel<GenerationJob>` (`--queue-capacity`), a full queue is 429 with `Retry-After` and
 `rate_limit_error`/`queue_full`, and a job cancelled while still queued is dropped without touching
 the model. **Everything from here to the lease's settlement runs inside that scheduled closure**,
@@ -67,7 +70,15 @@ the one place failure, filtered and content are told apart, with the cut's verdi
 when it is legible differs by shape (D57, D81) → `ToolCallReply.From` over the finished text when a
 catalog is present, which both shapes call and neither decides for itself → settles the lease exactly
 once on every path: `Keep` after a `Complete`, uncut generation puts the context back under the new
-key, anything else disposes it in the `finally` (the stream cancels → drains → settles, D51; D72)
+key, anything else disposes it in the `finally` (the stream cancels → drains → settles, D51; D72).
+Around the whole closure sits `GenerationPipeline.BackendCallTracker` (D102): every call on the
+shared model handle (`CreateContext`, `GetUsablePromptLength`, `GenerateAsync`; eight sites over the
+five shapes) runs through it, and the unfiltered catch records a `/healthz` backend fault only for the
+exception a tracked call threw. A throw from the bridge's own code (the cutter's tokenizer, the
+raw-output log, the usage estimate, an SSE write) is still a 502 and leaves health alone; the cutter
+runs inside the delta callback, so `DeltaSink` stashes its exception, completes the watcher's signal so
+the model is cancelled at once, and the pipeline rethrows the bridge fault outside the tracked region
+after the drain, a genuine backend exception winning if both happened
 → shapes the OpenAI response → logs the outcome with `cache=`, `tail_turns=` and `truncated_turns=`.
 The classifiers also feed `GenerationHealth` (D98): `Classify` records success or fault, the catch's
 `FromException` records a fault, and a flag armed before `session.Acquire()` and cleared once the
@@ -153,6 +164,18 @@ did not cover (#26), the same shape D56, D57 and D81 each answered in turn.
   object that never declared itself a call needs both `name` and `arguments`, `parameters` counts
   only inside a `tool_calls` wrapper (outside one it is the tool definition echoed back), and
   arguments that were supplied and cannot be read drop the call instead of defaulting to `{}` (D83).
+  One exception since D101, narrowed twice: an unwrapped object whose only key is `name`, naming a
+  tool the request offered (ordinal), is a zero-argument call. Any other key (`description`,
+  `type`, `parameters`) makes it content, because a zero-argument tool's own definition has no
+  `parameters` and the model echoing it back met the first cut's conditions. The offered-name set
+  decides nothing else: a declared call's unknown name is still surfaced, a bare array still declares
+  nothing.
+- **The scheduler's shutdown waits use `WaitAsync`, and a worker fault is caught there on purpose.**
+  `Task.WhenAny(work, Task.Delay(...))` leaves a never-completing delay registered on the token when
+  the work wins; `work.WaitAsync(token)` disposes its own registration. But `WhenAny` never observes a
+  faulted task and `await` rethrows it, so `StopAsync` catches the worker's fault and logs it at
+  Warning, keeping "shutdown does not throw" (D100). `Retry-After` is queue depth times the mean of
+  the last 16 attempts, summed on demand under the stats lock on the rejection path only.
 - **Check what a framework method throws, not what its name suggests.**
   `JsonDocument.Parse(string)` transcodes to UTF-8 first and answers invalid UTF-16 with
   `ArgumentException`, so a `catch (JsonException)` around it looks exhaustive and is not. Every
@@ -215,11 +238,16 @@ did not cover (#26), the same shape D56, D57 and D81 each answered in turn.
 (`MaxPromptChars`), and full call recording (`Calls`, per-context `History`). Tests that pass against
 it should not pass vacuously on the NPU.
 
-## Test conventions (D43, D54, D79, D81, D82, D83, D92)
+## Test conventions (D43, D54, D79, D81, D82, D83, D92, D102)
 - Never assert on wall-clock timing. Order events with the fake's gates and assert on what had or had
   not happened when the gate opened. Which gate depends on where the hold must be: `StartGate` before
   the generation decides anything at all, the prompt-length verdict included; `FirstTokenGate` after
-  that verdict and before the first token; `InitGate` during model load. They are not
+  that verdict and before the first token; `InitGate` during model load; `DeltaGate` (D102) after
+  delta N and before the next token's cancellation check, for "the cut or the disconnect has landed
+  before the fake looks at the next token". A `TokenDelay` racing a cancel is the shape `DeltaGate`
+  replaces: the 5 ms cut-cancellation test failed once in a loaded full-suite gate and 14/14 alone.
+  `DeltaGate` waits on no token and its counters are backend-wide, so release it in a `finally` and
+  keep one generation in flight per test. They are not
   interchangeable — the three tests that need "the verdict lands after a keep-alive has already
   committed the headers" cannot use `FirstTokenGate`, which is held too late, and they raced a
   millisecond delay against a millisecond keep-alive interval until `StartGate` replaced
@@ -380,11 +408,20 @@ service/task verbs bind through the same code.
   backend fault; a thrown exception on the same prompt is (D98, second addendum).
 
 ## Review loop
-Each chunk: build + tests green → adversarial review (in-session subagent, then Codex) → fix in-scope
-findings test-first → defer the rest to `docs/FUTURE.md` → append to `docs/DECISIONS.md` →
-whole-branch review → fast-forward merge to `main` → update `CLAUDE.md`, `docs/PLAN.md`,
-`docs/SESSION-HANDOFF.md` and this folder in the same session → close the issue from the merge
-commit. Chunk 6 was built by a forked subagent and reviewed by the parent session; hardware
+Since 2026-09-12 a wave runs on the Sidequest board: cut `wave/<name>` from `main` and point the
+board's `integrationBranch` at it (`worktreeBase: local-main`, or the first dispatch wants an
+`origin/` ref that does not exist yet) → one ticket per logical change with the contract, anchors,
+bounds and a one-command verify in the description → dispatch the ready set in one message → for a
+ticket with a hang, leak, cancel or fault path, bind a `review-audit` on the other model family to
+the submitted candidate before integrating; the rest ride the deterministic gate → integrate on
+accept (the board runs `dotnet test` post-merge and rolls back a red one) → the whole-branch
+`/code-review` on the integrated tip, whose findings become a fix round of tickets → the hardware
+smoke on the final tip → the D-entries, FUTURE, `CLAUDE.md`, the handoff and this folder in one docs
+commit → push, PR with `closes #N`, CI, merge on GitHub, repoint the board to `main`. The pre-board
+loop for a chunk was: build + tests green → adversarial review (in-session subagent, then Codex) →
+fix in-scope findings test-first → defer the rest to `docs/FUTURE.md` → append to
+`docs/DECISIONS.md` → whole-branch review → fast-forward merge to `main` → update the state docs in
+the same session → close the issue from the merge commit. Chunk 6 was built by a forked subagent and reviewed by the parent session; hardware
 verification is part of an adapter chunk's definition of done and, when the machine cannot provide it,
 the chunk merges labelled code-verified only with the issue left open (chunk 6, D70). Work between
 chunks (D77 to D82) follows the same loop on its own branch; a partial pass over an issue (D79 over
@@ -413,6 +450,16 @@ wedge's real symptom) and what the same-family review of the guard did not: a va
 Terra reviewing Terra and fell to the cross-family pass. Third, shared tooling state is a
 correctness hazard under concurrent executors: one serena process with one active project turned
 three isolated worktrees into one, and the fix was a rule in every brief, not a code change.
+
+**The `leftovers` wave (2026-09-13) taught four more.** The bound reviews and the whole-branch
+`/code-review` find different things: three of the nine whole-branch findings were real defects (a
+parser false positive, a missing `ClientGone` branch, a cutter fault holding the worker) that three
+accepting bound reviews had not seen, so both stay. A ticket that takes an issue whole can bundle a
+refactor, a wire change and two fixes into one candidate that a merge delivery can never split; cut
+tickets per logical change. The board's post-merge gate is the place a wall-clock test finally
+fails; gate the fake instead of retrying blind, and record the isolation runs that justify the one
+retry. And the `/code-review` skill's finder subagents are refused by the board's hook as review
+work outside the board; the reviewing agent then runs every angle itself, which worked.
 
 **The state-doc pass belongs to the merge, not to whatever comes after it.** The session that merged
 chunk 8 crashed in the gap between filing its issues and updating the documents, and the repository
