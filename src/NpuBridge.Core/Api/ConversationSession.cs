@@ -243,12 +243,13 @@ internal sealed class ConversationSession
     /// with a preflight — refuses or truncates before anything is generated. The returned lease is
     /// the caller's to settle.
     /// </summary>
-    public ContextAcquisition Acquire()
+    public ContextAcquisition Acquire(BackendCallTracker backendCalls)
     {
+        ArgumentNullException.ThrowIfNull(backendCalls);
         Volatile.Write(ref _truncationSettled, false);
         try
         {
-            return AcquireCore();
+            return AcquireCore(backendCalls);
         }
         finally
         {
@@ -256,11 +257,11 @@ internal sealed class ConversationSession
         }
     }
 
-    private ContextAcquisition AcquireCore()
+    private ContextAcquisition AcquireCore(BackendCallTracker backendCalls)
     {
         while (true)
         {
-            var lease = Lookup();
+            var lease = Lookup(backendCalls);
             if (!_preflight)
             {
                 return ContextAcquisition.Acquired(lease);
@@ -272,7 +273,7 @@ internal sealed class ConversationSession
             int? usable;
             try
             {
-                usable = _prepared.Backend.GetUsablePromptLength(lease.Context, lease.Prompt);
+                usable = backendCalls.Invoke(() => _prepared.Backend.GetUsablePromptLength(lease.Context, lease.Prompt));
             }
             catch
             {
@@ -407,7 +408,7 @@ internal sealed class ConversationSession
         }
     }
 
-    private ContextLease Lookup()
+    private ContextLease Lookup(BackendCallTracker backendCalls)
     {
         var systemText = _prepared.Rendered.SystemText;
         var backend = _prepared.Backend;
@@ -444,7 +445,7 @@ internal sealed class ConversationSession
                 tailTurns: tail.Count, promptChars: prompt.Length, transcriptChars, transcriptTokens, systemText, _turns);
         }
 
-        var context = backend.CreateContext(nativeSystem);
+        var context = backendCalls.Invoke(() => backend.CreateContext(nativeSystem));
         return new ContextLease(_cache, context, full.Prompt, cacheHit: false, cacheKey: null,
             tailTurns: _turns.Count, promptChars: transcriptChars, transcriptChars, transcriptTokens, systemText, _turns);
     }

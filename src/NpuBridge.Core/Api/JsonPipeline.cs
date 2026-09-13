@@ -83,8 +83,8 @@ internal static class JsonPipeline
         // clauses, which run for a throw at any point including before scheduling, can still log the
         // best value they have.
         var queueWaitMs = 0.0;
-        var elapsed = Stopwatch.StartNew();
-        var generationAttempted = false;
+        var backendCalls = new BackendCallTracker();
+        var attemptDurationMs = 0.0;
         var outcomeClassified = false;
 
         try
@@ -103,13 +103,14 @@ internal static class JsonPipeline
             var scheduled = await scheduler.ScheduleAsync(async ct =>
             {
                 var stopwatch = Stopwatch.StartNew();
-                while (true)
+                try
+                {
+                    while (true)
                 {
                     // 7. The context: checked out of the cache when the transcript extends a cached
                     // prefix, created fresh otherwise, and refused here -- before a token is generated --
                     // when a backend with a preflight says the prompt does not fit (D55).
-                    generationAttempted = true;
-                    var acquisition = session.Acquire();
+                    var acquisition = session.Acquire(backendCalls);
                     if (acquisition.Failure is { } refused)
                     {
                         return ChatAttemptResult.Refused(refused);
@@ -159,12 +160,12 @@ internal static class JsonPipeline
                         var watcher = limits.IsEmpty ? null : new CutWatcher(limits);
                         var sink = DeltaSink.ToWatcher(stopwatch, watcher);
 
-                        var generation = backend.GenerateAsync(
+                        var generation = backendCalls.Invoke(() => backend.GenerateAsync(
                             attemptLease.Context,
                             attemptLease.Prompt,
                             prepared.Sampling,
                             sink.OnDelta,
-                            generationCts.Token);
+                            generationCts.Token));
 
                         // Whichever comes first. When the cut has fired, cancel here -- on this thread,
                         // guarded -- and then wait for the generation to end as it would have anyway. The
@@ -190,7 +191,7 @@ internal static class JsonPipeline
                             }
                         }
 
-                        var result = await generation.ConfigureAwait(false);
+                        var result = await backendCalls.AwaitAsync(generation).ConfigureAwait(false);
 
                         // 7a. A backend without a preflight can only say "too long" by failing the
                         // generation. With --truncate-history that is not the end: drop the oldest
@@ -216,6 +217,11 @@ internal static class JsonPipeline
                         throw;
                     }
                 }
+                }
+                finally
+                {
+                    attemptDurationMs = stopwatch.Elapsed.TotalMilliseconds;
+                }
             }, http.RequestAborted).ConfigureAwait(false);
 
             queueWaitMs = scheduled.QueueWait.TotalMilliseconds;
@@ -238,7 +244,11 @@ internal static class JsonPipeline
                 // BackendThrewCancellation (502, fix round 1 Finding 1) -- none of which ever reached the
                 // closure above in the first two cases, so no context exists to dispose beyond what the
                 // finally already handles (null).
-                var schedulerFailure = SchedulerAdmission.FailureFor(admission, scheduled.RetryAfterSeconds, generationHealth);
+                var schedulerFailure = SchedulerAdmission.FailureFor(
+                    admission,
+                    scheduled.RetryAfterSeconds,
+                    backendCalls.Faulted ? generationHealth : null,
+                    attemptDurationMs);
                 SchedulerAdmission.ApplyRetryAfter(http.Response, admission, scheduled.RetryAfterSeconds);
 
                 ChatRequestMetrics.LogRequest(logger, requestId, backendName, prepared.PromptChars, ttftMs: 0, tokens: 0,
@@ -385,7 +395,7 @@ internal static class JsonPipeline
         // answered the identical event with a 502 and the ordinary error body.
         catch (Exception ex)
         {
-            var failure = GenerationFailure.FromException(ex, generationAttempted && !outcomeClassified ? generationHealth : null, elapsed.Elapsed.TotalMilliseconds);
+            var failure = GenerationFailure.FromException(ex, backendCalls.Caught(ex) && !outcomeClassified ? generationHealth : null, attemptDurationMs);
             ChatRequestMetrics.LogRequest(logger, requestId, backendName, lease?.PromptChars ?? prepared.PromptChars, ttftMs: 0, tokens: 0,
                 status: ex.GetType().Name, finish: "-", httpStatus: failure.StatusCode,
                 cache: GenerationPipeline.CacheLabel(lease), tailTurns: lease?.TailTurns ?? 0, truncatedTurns: session.DroppedTurns,

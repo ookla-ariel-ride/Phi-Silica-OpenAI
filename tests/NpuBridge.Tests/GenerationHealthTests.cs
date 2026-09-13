@@ -42,7 +42,7 @@ public class GenerationHealthTests
             FailAfterTokens = 0,
             FailureException = new InvalidOperationException("RPC unavailable"),
             Responder = _ => ["abcdefgh", " still generating"],
-            TokenDelay = TimeSpan.FromMilliseconds(20),
+            DeltaGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously),
         };
         var fake = new FakeBackend(options);
         await using var host = await BridgeTestHost.StartAsync(fake);
@@ -65,15 +65,21 @@ public class GenerationHealthTests
 
         options.FailAfterTokens = null;
         options.FailureException = null;
-        var recovered = await host.Client.PostAsJsonAsync("/v1/chat/completions", new
+        var deltasBeforeCut = fake.DeltasEmitted;
+        var recoveredTask = host.Client.PostAsJsonAsync("/v1/chat/completions", new
         {
             model = "fake",
             messages = new[] { new { role = "user", content = "say hi" } },
             max_tokens = 1,
         });
+        await TestWait.UntilAsync(() => fake.DeltasEmitted == deltasBeforeCut + 1);
+        await TestWait.UntilAsync(() => fake.CancellationsObserved == 1);
+        options.DeltaGate!.SetResult();
+        var recovered = await recoveredTask;
         var afterSuccess = await ReadHealthAsync(host);
 
         Assert.Equal(HttpStatusCode.OK, recovered.StatusCode);
+        Assert.Equal(deltasBeforeCut + 1, fake.DeltasEmitted);
         using var recoveredDocument = JsonDocument.Parse(await recovered.Content.ReadAsStringAsync());
         Assert.Equal("length", recoveredDocument.RootElement.GetProperty("choices")[0].GetProperty("finish_reason").GetString());
         Assert.Equal(HttpStatusCode.OK, afterSuccess.StatusCode);
@@ -218,6 +224,116 @@ public class GenerationHealthTests
     }
 
     [Fact]
+    public async Task Post_generation_tokenizer_failures_do_not_count_as_backend_faults_on_any_response_shape()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            TokenCounter = new ThrowingTokensCoveringCounter(),
+            Responder = _ => ["done"],
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        using var chatJson = await PostChatAsync(host, ChatBody.User("chat json"));
+        using var chatStream = await host.Client.PostAsJsonAsync("/v1/chat/completions", new
+        {
+            model = "fake",
+            messages = new[] { new { role = "user", content = "chat stream" } },
+            stream = true,
+        });
+        using var completionsJson = await host.Client.PostAsJsonAsync("/v1/completions", new { model = "fake", prompt = "completions json" });
+        using var completionsStream = await host.Client.PostAsJsonAsync("/v1/completions", new { model = "fake", prompt = "completions stream", stream = true });
+        var health = await ReadHealthAsync(host);
+
+        Assert.Equal(HttpStatusCode.BadGateway, chatJson.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, chatStream.StatusCode);
+        Assert.Equal(HttpStatusCode.BadGateway, completionsJson.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, completionsStream.StatusCode);
+        Assert.Equal(0, health.Body.GetProperty("consecutive_backend_faults").GetInt32());
+        Assert.Equal("ok", health.Body.GetProperty("last_generation").GetProperty("outcome").GetString());
+        host.AssertNoLeak();
+    }
+
+    [Fact]
+    public async Task Create_context_failures_count_as_backend_faults_on_every_generation_shape()
+    {
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            CreateContextFailure = new InvalidOperationException("CreateContext RPC unavailable"),
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        using var chatJson = await PostChatAsync(host, ChatBody.User());
+        using var chatStream = await host.Client.PostAsJsonAsync("/v1/chat/completions", new
+        {
+            model = "fake",
+            messages = new[] { new { role = "user", content = "stream" } },
+            stream = true,
+        });
+        using var completionsJson = await host.Client.PostAsJsonAsync("/v1/completions", new { model = "fake", prompt = "completion" });
+        using var completionsStream = await host.Client.PostAsJsonAsync("/v1/completions", new { model = "fake", prompt = "stream completion", stream = true });
+        using var debug = await host.Client.PostAsJsonAsync("/debug/generate", new { prompt = "debug" });
+        var health = await ReadHealthAsync(host);
+
+        Assert.Equal(HttpStatusCode.BadGateway, chatJson.StatusCode);
+        Assert.Equal(HttpStatusCode.BadGateway, chatStream.StatusCode);
+        Assert.Equal(HttpStatusCode.BadGateway, completionsJson.StatusCode);
+        Assert.Equal(HttpStatusCode.BadGateway, completionsStream.StatusCode);
+        Assert.Equal(HttpStatusCode.BadGateway, debug.StatusCode);
+        Assert.Equal(5, health.Body.GetProperty("consecutive_backend_faults").GetInt32());
+        Assert.Equal("backend_fault", health.Body.GetProperty("last_generation").GetProperty("outcome").GetString());
+        host.AssertNoLeak();
+    }
+
+    [Fact]
+    public async Task Native_system_text_guard_does_not_record_a_backend_fault()
+    {
+        await using var host = await BridgeTestHost.StartAsync();
+
+        using var response = await host.Client.PostAsJsonAsync("/v1/chat/completions", new
+        {
+            model = "fake",
+            messages = new[]
+            {
+                new { role = "system", content = new string('x', 32_001) },
+                new { role = "user", content = "hello" },
+            },
+        });
+        var health = await ReadHealthAsync(host);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(0, health.Body.GetProperty("consecutive_backend_faults").GetInt32());
+        Assert.Equal(JsonValueKind.Null, health.Body.GetProperty("last_generation").ValueKind);
+        host.AssertNoLeak();
+    }
+
+    [Theory]
+    [InlineData("/v1/chat/completions")]
+    [InlineData("/v1/completions")]
+    public async Task Stream_write_failure_does_not_count_as_a_backend_fault(string path)
+    {
+        await using var host = await BridgeTestHost.StartAsync(
+            responseBodyFactory: context => context.Request.Path == path ? new ThrowAfterFirstWriteStream() : null);
+        object body = path == "/v1/chat/completions"
+            ? new { model = "fake", messages = new[] { new { role = "user", content = "hello" } }, stream = true }
+            : new { model = "fake", prompt = "hello", stream = true };
+
+        try
+        {
+            using var response = await host.Client.PostAsJsonAsync(path, body);
+        }
+        catch (IOException)
+        {
+            // TestServer surfaces the second failed write while serializing the ordinary error result.
+        }
+
+        await TestWait.UntilAsync(() => host.Requests.Completed > 0);
+        var health = await ReadHealthAsync(host);
+
+        Assert.Equal(0, health.Body.GetProperty("consecutive_backend_faults").GetInt32());
+        host.AssertNoLeak();
+    }
+
+    [Fact]
     public async Task Backend_calls_before_generation_record_faults_and_a_success_clears_them()
     {
         var options = new FakeBackendOptions
@@ -277,5 +393,47 @@ public class GenerationHealthTests
             CharEstimateTokenCounter.Instance.IndexAtTokenCount(text, tokens, out totalTokens);
 
         public int TokensCovering(string text, int prefixChars) => throw new InvalidOperationException("post-generation usage failure");
+    }
+
+    private sealed class ThrowAfterFirstWriteStream : Stream
+    {
+        private readonly MemoryStream _inner = new();
+        private int _writes;
+
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => _inner.Length;
+        public override long Position { get => _inner.Position; set => throw new NotSupportedException(); }
+        public override void Flush() => _inner.Flush();
+        public override Task FlushAsync(CancellationToken cancellationToken) => _inner.FlushAsync(cancellationToken);
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => _inner.SetLength(value);
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            ThrowAfterFirstWrite();
+            _inner.Write(buffer, offset, count);
+        }
+
+        public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            ThrowAfterFirstWrite();
+            await _inner.WriteAsync(buffer.AsMemory(offset, count), cancellationToken);
+        }
+
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            ThrowAfterFirstWrite();
+            return _inner.WriteAsync(buffer, cancellationToken);
+        }
+
+        private void ThrowAfterFirstWrite()
+        {
+            if (Interlocked.Increment(ref _writes) > 1)
+            {
+                throw new IOException("test response body write failure");
+            }
+        }
     }
 }

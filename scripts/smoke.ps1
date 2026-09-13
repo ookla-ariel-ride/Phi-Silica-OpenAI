@@ -113,6 +113,10 @@ function Get-Json([string] $path, [string] $method = 'GET', [string] $body = $nu
     $request = @{ Uri = "$base$path"; Method = $method; SkipHttpErrorCheck = $true; TimeoutSec = $timeoutSec }
     if ($body) { $request.Body = $body; $request.ContentType = 'application/json' }
     $r = Invoke-WebRequest @request
+    if ($path -eq '/healthz' -and [int]$r.StatusCode -eq 503) {
+        $health = $r.Content | ConvertFrom-Json -Depth 20
+        if ($health.status -eq 'degraded') { throw "backend is degraded: $($health.last_generation.error)" }
+    }
     if ($expect -notcontains [int]$r.StatusCode) { throw "HTTP $($r.StatusCode) for $method $path : $($r.Content)" }
     return ($r.Content | ConvertFrom-Json -Depth 20)
 }

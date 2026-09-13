@@ -290,15 +290,21 @@ public class GenerationSchedulerEndpointTests
     [InlineData(true, CompletionsPath)]
     public async Task A_backend_that_throws_the_cuts_cancellation_is_a_502_not_a_queue_error(bool stream, string path)
     {
+        var deltaGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var fake = new FakeBackend(new FakeBackendOptions
         {
             Responder = _ => ["0123", "4567", "89ab", "cdef"],
-            TokenDelay = TimeSpan.FromMilliseconds(5),
+            DeltaGate = deltaGate,
+            DeltaGateAfterTokens = 2,
             ThrowOnCancellation = true,
         });
         await using var host = await BridgeTestHost.StartAsync(fake);
 
-        var response = await host.Client.PostAsJsonAsync(path, RequestBody(path, "hi", stream, maxTokens: 2));
+        var responseTask = host.Client.PostAsJsonAsync(path, RequestBody(path, "hi", stream, maxTokens: 1));
+        await TestWait.UntilAsync(() => fake.DeltasEmitted == 2);
+        await TestWait.UntilAsync(() => fake.CancellationsObserved == 1);
+        deltaGate.SetResult();
+        var response = await responseTask;
 
         // The streamed shape has deltas on the wire by the time the throw happens, so its status line is
         // spent and the same envelope arrives as an SSE error event (D52) -- the JSON shape answers with
@@ -310,6 +316,13 @@ public class GenerationSchedulerEndpointTests
         Assert.Equal(stream ? HttpStatusCode.OK : HttpStatusCode.BadGateway, response.StatusCode);
         Assert.Equal("backend_error", error.GetProperty("code").GetString());
         Assert.Contains("OperationCanceledException", error.GetProperty("message").GetString(), StringComparison.Ordinal);
+
+        // Scheduler cancellation still represents a backend attempt and records a health duration.
+        var health = await ReadJson(await host.Client.GetAsync("/healthz"));
+        Assert.Equal(1, health.GetProperty("consecutive_backend_faults").GetInt32());
+        var lastGeneration = health.GetProperty("last_generation");
+        Assert.Equal("backend_fault", lastGeneration.GetProperty("outcome").GetString());
+        Assert.True(lastGeneration.GetProperty("duration_ms").GetInt32() >= 0);
 
         // And the context the failed attempt held is released, not left to the cache (D43).
         await TestWait.UntilAsync(() => fake.ActiveContexts == 0);
