@@ -179,7 +179,14 @@ public static class DebugEndpoints
 
                 return (IResult)Results.Json(body, JsonDefaults.Options);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (Exception) when (http.RequestAborted.IsCancellationRequested)
+            {
+                // The client is gone, so there is nobody to hand a body to and this is not an error.
+                // The scheduler still classifies a queued cancellation below, while this covers an
+                // exception raised after the job has started without attributing it to backend health.
+                return Results.Empty;
+            }
+            catch (Exception ex)
             {
                 return GenerationFailure.FromException(
                     ex,
@@ -195,10 +202,9 @@ public static class DebugEndpoints
         // The same classification both /v1/chat/completions shapes use (fix round 1, Finding 4): the
         // three callers spelled a full queue and a scheduler shutdown out separately and had already
         // drifted apart on day one, which is the drift D81 exists to prevent one level up.
-        // clientAlreadyGone is false explicitly rather than by default: this diagnostic endpoint has no
-        // streamed shape and no client worth sparing a status line for, so unlike the two OpenAI
-        // endpoints it does not answer an aborted caller with silence.
-        var admission = SchedulerAdmission.Classify(scheduled, clientAlreadyGone: false);
+        // A queued client cancellation is client-gone just as it is for the OpenAI endpoints; the
+        // scheduler's shutdown outcome remains distinguishable when RequestAborted was not set.
+        var admission = SchedulerAdmission.Classify(scheduled, http.RequestAborted.IsCancellationRequested);
         if (admission == SchedulerOutcome.Completed)
         {
             return scheduled.Result!;
