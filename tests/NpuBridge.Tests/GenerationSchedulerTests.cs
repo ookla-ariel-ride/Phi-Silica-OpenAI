@@ -233,6 +233,79 @@ public class GenerationSchedulerTests
         await task;
     }
 
+    /// <summary>
+    /// Issue #26 item 4: the estimate averages the last sixteen attempts, not every attempt since the
+    /// process started. A cumulative mean never forgets — one 160-second cold-start generation stayed
+    /// in every <c>Retry-After</c> this process would ever compute, and a model that had since warmed
+    /// up could not talk it back down. Here sixteen one-second generations follow it, which is exactly
+    /// the window, so the outlier has been overwritten and the estimate is the warm one.
+    ///
+    /// Deterministic, with no wall clock anywhere (D54): every duration is the manual clock's, and the
+    /// rejection is read while X, Y and Z are still parked on their gates, so none of them has recorded
+    /// a duration of its own yet.
+    /// </summary>
+    [Fact]
+    public async Task Retry_after_averages_only_the_last_sixteen_generations()
+    {
+        var time = new ManualTimeProvider(T0);
+        var scheduler = NewScheduler(queueCapacity: 2, time: time);
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            await RunOneJobAsync(scheduler, time, TimeSpan.FromSeconds(160));
+            for (var i = 0; i < GenerationWindow; i++)
+            {
+                await RunOneJobAsync(scheduler, time, TimeSpan.FromSeconds(1));
+            }
+
+            // Fill the queue to its capacity of 2: X is running, Y and Z sit in the channel.
+            var gateX = new TaskCompletionSource();
+            var startedX = new TaskCompletionSource();
+            var taskX = scheduler.ScheduleAsync<string>(async ct =>
+            {
+                startedX.TrySetResult();
+                await gateX.Task.WaitAsync(ct).ConfigureAwait(false);
+                return "x";
+            }, CancellationToken.None);
+            await startedX.Task;
+
+            var gateY = new TaskCompletionSource();
+            var taskY = scheduler.ScheduleAsync<string>(async ct =>
+            {
+                await gateY.Task.WaitAsync(ct).ConfigureAwait(false);
+                return "y";
+            }, CancellationToken.None);
+            var gateZ = new TaskCompletionSource();
+            var taskZ = scheduler.ScheduleAsync<string>(async ct =>
+            {
+                await gateZ.Task.WaitAsync(ct).ConfigureAwait(false);
+                return "z";
+            }, CancellationToken.None);
+            await TestWait.UntilAsync(() => scheduler.QueueDepth == 2);
+
+            var rejected = await scheduler.ScheduleAsync<string>(_ => Task.FromResult("w"), CancellationToken.None);
+
+            Assert.Equal(ScheduleResultKind.Rejected, rejected.Kind);
+            // ceil(2 x 1.0). A cumulative mean would still be carrying the 160s outlier:
+            // (160 + 16 x 1) / 17 = 10.35s, so ceil(2 x 10.35) = 21.
+            Assert.Equal(2, rejected.RetryAfterSeconds);
+
+            gateX.SetResult();
+            gateY.SetResult();
+            gateZ.SetResult();
+            await taskX;
+            await taskY;
+            await taskZ;
+        }
+        finally
+        {
+            await scheduler.DisposeAsync();
+        }
+    }
+
+    /// <summary>The scheduler's own window size, mirrored here so the test says why sixteen short generations is the number that clears one outlier.</summary>
+    private const int GenerationWindow = 16;
+
     [Fact]
     public async Task A_job_cancelled_while_queued_never_runs_its_body()
     {

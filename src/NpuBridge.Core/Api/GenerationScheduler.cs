@@ -35,9 +35,9 @@ namespace NpuBridge.Api;
 ///   <see cref="ScheduleResultKind.Cancelled"/>, not <see cref="ScheduleResultKind.Rejected"/>: a
 ///   stopped scheduler is never coming back to honour a <c>Retry-After</c>.</item>
 ///   <item>A queue-full rejection carries a <c>Retry-After</c>, already computed as whole seconds:
-///   queue depth times the rolling average generation duration, floored at 1. With no generation yet
-///   completed the average is 0, so a cold-start rejection floors to 1 second — PLAN §2.7 does not
-///   define this case; that floor is the decision (task-1-brief.md).</item>
+///   queue depth times the mean duration of the last <see cref="GenerationWindow"/> generations,
+///   floored at 1. With no generation yet completed the mean is 0, so a cold-start rejection floors to
+///   1 second — PLAN §2.7 does not define this case; that floor is the decision (task-1-brief.md).</item>
 ///   <item>Shutdown stops accepting new work and drains whatever is left in the queue as cancelled
 ///   rather than running it, but still awaits a job already running to its natural end (same D51
 ///   invariant, not suspended for shutdown).</item>
@@ -53,14 +53,27 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
     /// </summary>
     public static readonly TimeSpan DisposeGracePeriod = TimeSpan.FromSeconds(15);
 
+    /// <summary>
+    /// How many recent generations the <c>Retry-After</c> estimate averages over. A cumulative mean
+    /// since process start was the first shape, and it never forgets: one cold-start generation that
+    /// took two minutes still drags every estimate this process ever makes, and a model that has since
+    /// warmed up cannot talk it down. Sixteen is long enough that one outlier cannot own the estimate
+    /// and short enough that a queue-capacity's worth of recent work (four by default) dominates it
+    /// within a minute of load.
+    /// </summary>
+    private const int GenerationWindow = 16;
+
     private readonly Channel<IQueuedJob> _queue;
     private readonly TimeProvider _time;
     private readonly ILogger<GenerationScheduler> _logger;
     private readonly CancellationTokenSource _shutdown = new();
     private readonly object _statsGate = new();
 
-    private double _averageGenerationSeconds;
-    private long _completedGenerations;
+    /// <summary>The last <see cref="GenerationWindow"/> generation durations, oldest overwritten. Guarded by <see cref="_statsGate"/>.</summary>
+    private readonly double[] _recentGenerationSeconds = new double[GenerationWindow];
+
+    /// <summary>Generations recorded since start; only its low bits (the ring slot) and its cap at the window size are ever read. Guarded by <see cref="_statsGate"/>.</summary>
+    private long _recordedGenerations;
     private Task _worker = Task.CompletedTask;
     private bool _disposed;
 
@@ -124,11 +137,26 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
         await _shutdown.CancelAsync().ConfigureAwait(false);
         _queue.Writer.TryComplete();
 
-        var finished = await Task.WhenAny(_worker, Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken))
-            .ConfigureAwait(false);
-        if (finished != _worker)
+        try
+        {
+            // WaitAsync rather than WhenAny against a never-completing Task.Delay: the delay's
+            // registration on the host's token outlived every shutdown the worker won, which is every
+            // ordinary one, and stayed there for as long as the caller's token source did. WaitAsync
+            // disposes its own registration on both outcomes.
+            await _worker.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
         {
             _logger.LogWarning("Generation scheduler did not drain before the host's own shutdown deadline; a job may still be running.");
+        }
+        catch (Exception ex)
+        {
+            // Defensive: RunAsync funnels every exception a job body throws into that job's own
+            // completion source, so the worker loop itself cannot fault today. If it ever does, the
+            // WhenAny this replaced said nothing at all and the fault reached no log on any path.
+            // Logged rather than rethrown: shutdown reporting a worker's fault as its own failure is a
+            // behaviour change nothing asked for, and DisposeAsync still swallows it exactly as before.
+            _logger.LogWarning(ex, "The generation scheduler's worker ended with an exception rather than draining.");
         }
     }
 
@@ -145,12 +173,23 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
 
         // Same escape hatch as StopAsync, on its own bounded clock rather than the host's: the two
         // must not disagree about whether disposal can be made to wait forever behind a generation
-        // that never observes cancellation (fix-round-1 finding 1).
-        var finished = await Task.WhenAny(_worker, Task.Delay(DisposeGracePeriod)).ConfigureAwait(false);
-        if (finished != _worker)
+        // that never observes cancellation (fix-round-1 finding 1). WaitAsync for the same reason
+        // StopAsync uses it: the Task.Delay this replaced kept a timer alive for the whole grace
+        // period every time the worker drained first.
+        try
+        {
+            await _worker.WaitAsync(DisposeGracePeriod).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
         {
             _logger.LogWarning("Generation scheduler did not drain within {Grace}s of disposal; a job may still be running.",
                 DisposeGracePeriod.TotalSeconds);
+        }
+        catch (Exception ex)
+        {
+            // A faulted worker (see StopAsync, which logs it as a Warning): disposal must not throw for
+            // it, which is what the WhenAny this replaced achieved by never observing it at all.
+            _logger.LogDebug(ex, "The generation scheduler's worker had already faulted when it was disposed.");
         }
 
         _shutdown.Dispose();
@@ -230,14 +269,23 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
         return Task.FromResult(ScheduleResult.Rejected<TResult>(retryAfter));
     }
 
-    /// <summary>queue depth × rolling average generation seconds, floored at 1, in whole seconds (task-1-brief.md).</summary>
+    /// <summary>queue depth × the mean of the last <see cref="GenerationWindow"/> generations' seconds, floored at 1, in whole seconds (task-1-brief.md).</summary>
     private int ComputeRetryAfterSeconds()
     {
         var depth = QueueDepth;
         double average;
         lock (_statsGate)
         {
-            average = _averageGenerationSeconds;
+            // Summed on demand rather than carried as a running total: sixteen additions on the
+            // rejection path only, and no accumulated floating-point drift over a long-lived process.
+            var count = (int)Math.Min(_recordedGenerations, GenerationWindow);
+            var total = 0.0;
+            for (var i = 0; i < count; i++)
+            {
+                total += _recentGenerationSeconds[i];
+            }
+
+            average = count == 0 ? 0 : total / count;
         }
 
         var seconds = (int)Math.Ceiling(depth * average);
@@ -273,13 +321,19 @@ public sealed class GenerationScheduler : IHostedService, IAsyncDisposable
         }
     }
 
-    /// <summary>Cumulative mean over every job whose body actually ran (completed or cancelled mid-run) — never one dropped while only queued, which touched the model for zero seconds and would only drag the average down.</summary>
+    /// <summary>
+    /// Records one job whose body actually ran (completed or cancelled mid-run) — never one dropped
+    /// while only queued, which touched the model for zero seconds and would only drag the estimate
+    /// down. Kept in a fixed <see cref="GenerationWindow"/>-slot ring, oldest overwritten, so
+    /// <see cref="ComputeRetryAfterSeconds"/> describes what this bridge is doing now rather than
+    /// everything it has ever done.
+    /// </summary>
     private void RecordGenerationDuration(double seconds)
     {
         lock (_statsGate)
         {
-            _completedGenerations++;
-            _averageGenerationSeconds += (seconds - _averageGenerationSeconds) / _completedGenerations;
+            _recentGenerationSeconds[(int)(_recordedGenerations % GenerationWindow)] = seconds;
+            _recordedGenerations++;
         }
     }
 

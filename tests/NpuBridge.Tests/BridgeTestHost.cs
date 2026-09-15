@@ -1,6 +1,7 @@
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
@@ -68,7 +69,8 @@ internal sealed class BridgeTestHost : IAsyncDisposable
         System.Net.IPAddress? remoteAddress = null,
         ILoggerProvider? loggerProvider = null,
         TimeSpan? keepAliveInterval = null,
-        TimeSpan? firstKeepAliveDelay = null)
+        TimeSpan? firstKeepAliveDelay = null,
+        Func<HttpContext, Stream?>? responseBodyFactory = null)
     {
         remoteAddress ??= System.Net.IPAddress.Loopback;
         backend ??= new FakeBackend();
@@ -130,6 +132,12 @@ internal sealed class BridgeTestHost : IAsyncDisposable
         app.Use((context, next) =>
         {
             context.Connection.RemoteIpAddress = remoteAddress;
+            var body = responseBodyFactory?.Invoke(context);
+            if (body is not null)
+            {
+                context.Response.Body = body;
+            }
+
             return next(context);
         });
         app.MapNpuBridge();

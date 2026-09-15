@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using NpuBridge.Backends;
 using NpuBridge.Backends.Fake;
 
@@ -132,6 +133,64 @@ public class DebugGenerateTests
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.Contains("cannot create", doc.RootElement.GetProperty("error").GetProperty("message").GetString(), StringComparison.Ordinal);
         await backend.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Foreign_cancellation_is_502_with_openai_error_envelope()
+    {
+        using var foreignCancellation = new CancellationTokenSource();
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => ["Hello", " world"],
+            FailAfterTokens = 1,
+            FailureException = new OperationCanceledException(
+                "adapter let a foreign cancellation escape", foreignCancellation.Token),
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var response = await host.Client.PostAsJsonAsync("/debug/generate", new { prompt = "x" });
+
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var error = doc.RootElement.GetProperty("error");
+        Assert.Equal("server_error", error.GetProperty("type").GetString());
+        Assert.Equal("backend_error", error.GetProperty("code").GetString());
+        Assert.True(error.TryGetProperty("message", out _));
+        Assert.True(error.TryGetProperty("param", out _));
+        Assert.Equal(0, fake.ActiveContexts);
+        host.AssertNoLeak();
+    }
+
+    [Fact]
+    public async Task A_queued_client_disconnect_returns_empty_without_an_error_log_or_context_leak()
+    {
+        var capture = new CapturingLoggerProvider();
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => ["ok"],
+            StartGate = startGate,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture);
+
+        var running = host.Client.PostAsJsonAsync("/debug/generate", new { prompt = "running" });
+        await TestWait.UntilAsync(() => fake.Calls.Count == 1);
+
+        using var cts = new CancellationTokenSource();
+        var queued = host.Client.PostAsJsonAsync("/debug/generate", new { prompt = "queued" }, cts.Token);
+        await TestWait.UntilAsync(() => host.Scheduler.QueueDepth == 1);
+        await cts.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => queued);
+        await TestWait.UntilAsync(() => host.Scheduler.QueueDepth == 0);
+
+        startGate.SetResult();
+        using var response = await running;
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        await TestWait.UntilAsync(() => fake.ActiveContexts == 0);
+        Assert.Single(fake.Calls);
+        Assert.DoesNotContain(capture.Records, r => r.Level >= LogLevel.Error);
+        host.AssertNoLeak();
     }
 
     [Fact]

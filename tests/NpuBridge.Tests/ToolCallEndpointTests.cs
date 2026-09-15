@@ -36,6 +36,19 @@ public class ToolCallEndpointTests
         },
     ];
 
+    private static readonly object[] Time =
+    [
+        new
+        {
+            type = "function",
+            function = new
+            {
+                name = "get_time",
+                description = "Get the current time",
+            },
+        },
+    ];
+
     private static object Body(bool stream, object? tools = null, object? toolChoice = null, string content = "weather in paris?") => new
     {
         model = "fake",
@@ -124,6 +137,48 @@ public class ToolCallEndpointTests
         var arguments = call.GetProperty("function").GetProperty("arguments");
         Assert.Equal(JsonValueKind.String, arguments.ValueKind);
         Assert.Equal("Paris", JsonDocument.Parse(arguments.GetString()!).RootElement.GetProperty("location").GetString());
+    }
+
+    [Fact]
+    public async Task A_short_form_zero_argument_call_is_emitted_on_both_shapes()
+    {
+        const string reply = """{"name":"get_time"}""";
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => FakeBackend.Tokenize(reply) });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var json = await PostAsync(host, Body(stream: false, tools: Time));
+        var jsonChoice = json.GetProperty("choices")[0];
+        var jsonMessage = jsonChoice.GetProperty("message");
+        Assert.Equal("tool_calls", jsonChoice.GetProperty("finish_reason").GetString());
+        Assert.Equal(JsonValueKind.Null, jsonMessage.GetProperty("content").ValueKind);
+        var jsonCall = Assert.Single(jsonMessage.GetProperty("tool_calls").EnumerateArray());
+        Assert.Equal("get_time", jsonCall.GetProperty("function").GetProperty("name").GetString());
+        Assert.Equal("{}", jsonCall.GetProperty("function").GetProperty("arguments").GetString());
+
+        var streamText = await (await host.Client.PostAsJsonAsync(Path, Body(stream: true, tools: Time))).Content.ReadAsStringAsync();
+        var streamCall = Sse.Chunks(streamText)
+            .First(c => c.GetProperty("choices").GetArrayLength() > 0
+                && c.GetProperty("choices")[0].GetProperty("delta").TryGetProperty("tool_calls", out _))
+            .GetProperty("choices")[0].GetProperty("delta").GetProperty("tool_calls")[0];
+        Assert.Equal("get_time", streamCall.GetProperty("function").GetProperty("name").GetString());
+        Assert.Equal("{}", streamCall.GetProperty("function").GetProperty("arguments").GetString());
+        Assert.Equal("tool_calls", Sse.Chunks(streamText)[^1].GetProperty("choices")[0].GetProperty("finish_reason").GetString());
+    }
+
+    [Theory]
+    [InlineData("```json\n{\"name\":\"get_time\",\"description\":\"Get the current time\"}\n```")]
+    [InlineData("The available tool is {\"name\":\"get_time\",\"description\":\"Get the current time\"}.")]
+    public async Task An_echoed_zero_argument_tool_definition_stays_content(string reply)
+    {
+        var fake = new FakeBackend(new FakeBackendOptions { Responder = _ => FakeBackend.Tokenize(reply) });
+        await using var host = await BridgeTestHost.StartAsync(fake);
+
+        var body = await PostAsync(host, Body(stream: false, tools: Time));
+
+        var choice = body.GetProperty("choices")[0];
+        Assert.Equal("stop", choice.GetProperty("finish_reason").GetString());
+        Assert.Equal(reply, choice.GetProperty("message").GetProperty("content").GetString());
+        Assert.False(choice.GetProperty("message").TryGetProperty("tool_calls", out _));
     }
 
     [Fact]

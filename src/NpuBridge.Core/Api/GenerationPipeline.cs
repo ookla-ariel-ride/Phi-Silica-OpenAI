@@ -38,6 +38,46 @@ internal sealed record ChatAttemptResult(
 }
 
 /// <summary>
+/// Identifies exceptions raised by an invocation of the model backend. Callers use it to distinguish a
+/// backend fault from bridge work that happens to run after a backend call, such as cutting output or
+/// tokenizing usage.
+/// </summary>
+internal sealed class BackendCallTracker
+{
+    private Exception? _exception;
+
+    public bool Faulted => Volatile.Read(ref _exception) is not null;
+
+    public T Invoke<T>(Func<T> call)
+    {
+        try
+        {
+            return call();
+        }
+        catch (Exception ex)
+        {
+            Volatile.Write(ref _exception, ex);
+            throw;
+        }
+    }
+
+    public async Task<T> AwaitAsync<T>(Task<T> task)
+    {
+        try
+        {
+            return await task.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Volatile.Write(ref _exception, ex);
+            throw;
+        }
+    }
+
+    public bool Caught(Exception exception) => ReferenceEquals(Volatile.Read(ref _exception), exception);
+}
+
+/// <summary>
 /// The parts of phase two that are the same whichever shape the reply takes. Both
 /// <see cref="ChatCompletionsEndpoint"/> and <see cref="ChatCompletionsStreamEndpoint"/> drive one
 /// generation, time its first delta, may cancel it early, and then report what came back; only the
@@ -76,6 +116,14 @@ internal static class GenerationPipeline
     }
 
     /// <summary>
+    /// The log line's <c>cache=</c> field: <c>hit</c>, <c>miss</c>, or <c>-</c> for a request that never
+    /// got as far as a context. Four copies of this one expression existed — one per endpoint — until
+    /// <see cref="StreamingPipeline"/> took two of them and <see cref="JsonPipeline"/> the other two;
+    /// it lives down here because both pipelines can reach it and neither owns it.
+    /// </summary>
+    public static string CacheLabel(ContextLease? lease) => lease is null ? "-" : lease.CacheHit ? "hit" : "miss";
+
+    /// <summary>
     /// The whole model output, verbatim, under <c>--verbose</c>. The one place the raw text is logged:
     /// what a client is shown has been through the cut and the status mapping, so this is how a
     /// question about the model rather than about the bridge gets answered.
@@ -109,6 +157,7 @@ internal sealed class DeltaSink
     private readonly Stopwatch _stopwatch;
     private readonly ChannelWriter<string>? _writer;
     private readonly CutWatcher? _watcher;
+    private Exception? _bridgeFault;
     private long _firstTokenTicks;
     private int _count;
 
@@ -151,6 +200,9 @@ internal sealed class DeltaSink
     /// </summary>
     public double TtftMs(double totalMs) => Count == 0 ? totalMs : FirstTokenTicks * 1000.0 / Stopwatch.Frequency;
 
+    /// <summary>The first bridge-side failure raised by the non-streaming cut watcher.</summary>
+    public Exception? BridgeFault => Volatile.Read(ref _bridgeFault);
+
     public void OnDelta(string delta)
     {
         if (Interlocked.Increment(ref _count) == 1)
@@ -165,7 +217,15 @@ internal sealed class DeltaSink
         // makes. Unbounded channel: TryWrite only fails once the writer is completed, which happens
         // after GenerateAsync has returned and so after the last callback.
         _writer?.TryWrite(delta);
-        _watcher?.Accept(delta);
+        try
+        {
+            _watcher?.Accept(delta);
+        }
+        catch (Exception ex)
+        {
+            Interlocked.CompareExchange(ref _bridgeFault, ex, null);
+            _watcher?.SignalFault();
+        }
     }
 }
 
@@ -194,8 +254,14 @@ internal sealed class CutWatcher
 
     public CutWatcher(OutputLimits limits) => _cutter = new OutputCutter(limits);
 
-    /// <summary>Completes once the model should be stopped, and never faults. Never completes if no limit fires.</summary>
+    /// <summary>
+    /// Completes once the model should be stopped or the watcher faults, and never faults itself.
+    /// Never completes if no limit fires and no watcher fault occurs.
+    /// </summary>
     public Task Signal => _signal.Task;
+
+    /// <summary>Signals that a watcher fault needs the model stopped before the request reports it.</summary>
+    public void SignalFault() => _signal.TrySetResult();
 
     /// <summary>
     /// One delta, from the backend's thread. Locked because the cutter is not thread-safe and a runtime

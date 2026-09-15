@@ -3,13 +3,19 @@
 ## Works today (verified)
 | Area | Status | Evidence |
 |---|---|---|
-| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; **952** xunit tests green, 0 skipped (the #29/#30/#31 wave, D97 to D99, merged 2026-09-12 through PR #36; chunk 5, the D77 conformance pass, D78, the D79 test hardening, D80 real token counts, the D81 shared pipeline, the D82 review notes and chunk 7 tool-call emulation merged 2026-09-11; chunk 8, D84 to D92, merged 2026-09-12). **All eight chunks of `docs/PLAN.md` are built and merged; the plan is complete.** |
+| Solution, build, tests | ✅ | `dotnet build` clean with and without the Aion SDK; **980** xunit tests green, 0 skipped on `wave/leftovers` (the `leftovers` wave, D100 to D102, integrated 2026-09-13 and shipped as a PR; the #29/#30/#31 wave, D97 to D99, merged 2026-09-12 through PR #36; chunk 5, the D77 conformance pass, D78, the D79 test hardening, D80 real token counts, the D81 shared pipeline, the D82 review notes and chunk 7 tool-call emulation merged 2026-09-11; chunk 8, D84 to D92, merged 2026-09-12). **All eight chunks of `docs/PLAN.md` are built and merged; the plan is complete.** |
 | System-text guard (#29, D97) | ✅ | `Api/SystemTextGuard.cs`, called from `ChatRequestPreparer` before the queue and from `/debug/generate` before `CreateContext`: native system text at or over `ILanguageModelBackend.ContextWindowTokens` (3,581 on Phi Silica) or over 32,000 characters is 400 `context_length_exceeded` with no backend call, no queue slot, no context; the character ceiling is checked before tokenizing; `PhiSilicaBackend.CreateContext` throws above the same ceiling. `SystemTextGuardTests` (twelve tests: token check, character ceiling, tools named in the message, no truncate retry, plain 400 on a busy queue with the rolling mean untouched, folded placement left to the preflight, de-DE culture, no `Count` call on a ceiling refusal). Smoke on the NPU (2026-09-12): a 32,000-character system text counted offline at 13,421 tokens refused before any context; `/healthz` `context_window_tokens` 3581 equal to the measured D80 boundary |
 | Outcome-based `/healthz` (#30, D98) | ✅ | `Backends/GenerationHealth.cs`, recorded from `GenerationOutcome.Classify`, `GenerationFailure.FromException` and `SchedulerAdmission.FailureFor` on all five shapes, armed before `session.Acquire()` so a `CreateContext` or preflight throw counts. `last_generation` and `consecutive_backend_faults` on the body; two consecutive faults are 503 `degraded` while requests stay admitted. `GenerationHealthTests` (eleven tests, including `CreateContext` and preflight throws, a cut counted as success, a refusal not moving the counter, a post-generation bridge exception not overwriting a success, a preflight-known overflow on `/debug/generate` recording nothing). Smoke on the NPU: the D52 cross-check's runtime `Error` recorded as one fault, not degraded |
 | Streamed tool-call measurement (#31, D99) | ✅ | `tool-probe.ps1 -Stream` and `-SelfTest`: six streamed/JSON pairs identical after ignoring per-response ids and key order, `index` only on the streamed shape, the finish-reason biconditional both ways on 34 replies, `context_cache_hits` 0 to 1 across the second turn of the tool round trip, streamed latency equal to JSON. The script reads streamed error events, treats a non-200 pair as not comparable, and survives a 503 degraded `/healthz` |
-| Generation scheduler (`--queue-capacity`) | ✅ | Chunk 8, D84 to D88, D92: `Api/GenerationScheduler.cs`, one worker on a bounded `Channel<GenerationJob>`. `ConversationSession.Acquire` runs inside the scheduled closure, not just `GenerateAsync`, because `CreateContext` and `GetUsablePromptLength` are calls on the same shared handle (D84 — the review's catch, against the task brief's own instruction). Queue-full → 429 + `Retry-After` + `rate_limit_error`/`queue_full`; a job cancelled while queued is dropped without touching the model (503 `queue_shutting_down`); a job that ran and threw its own OCE is a 502 (D88). Measured on the NPU: two concurrent requests really queued (`queue_depth` peaked at 1), `--queue-capacity 1` admitted one and rejected two |
+| One JSON pipeline (#26, D100) | ✅ | `Api/JsonPipeline.cs`: the scheduled closure both JSON endpoints used to copy, once (`ChatCompletionsEndpoint` 438 to 118 lines, `CompletionsEndpoint` 276 to 93); `CacheLabel` once on `GenerationPipeline`; `WaitAsync` for the scheduler's and the lifecycle's shutdown waits; `Retry-After` over the last 16 attempts (`Retry_after_averages_only_the_last_sixteen_generations`); `ContextLease._settled` via `Interlocked`. Cross-family review accepted; the whole suite (cut parity, leak counts, truncation slot) is the oracle. Smoke on the NPU at `3c97d48`: all steps |
+| Backend-call fault tracker (#34, D102) | ✅ | `GenerationPipeline.BackendCallTracker` around the eight backend call sites on five shapes; a bridge-side throw is a 502 that leaves `/healthz` alone; duration is the attempt's own; `FakeBackend.DeltaGate` for deterministic cut and cancel ordering. `GenerationHealthTests` grew to the tokenizer-throw, CreateContext-throw (five shapes), guard-refusal, SSE-write-failure and cutter-fault-cancels cases; `CompletionsTests` gained the disconnect disposal test. Two review follow-ups landed in-wave (the cutter's tokenizer outside the tracked region, cancelling the model at once; the smoke's degraded final-health read). Smoke on the NPU at `3c97d48`: final health `ok` |
+| Offered zero-argument tool calls (#22, D101) | ✅ | `ToolCallParser.Parse(text, offeredToolNames)`: an unwrapped object whose only key is `name`, naming an offered tool, is a call with `{}`; any other key or an unoffered name is content; bare arrays and `parameters` echoes unchanged. 141 ToolCall tests including the echoed-definition negative controls. Smoke on the NPU at `3631444` with `-ToolProbeRuns 20`: 20/20, no leaked protocol, no unoffered tool |
+| `/debug/generate` error mapping (#25) | ✅ | A foreign `OperationCanceledException` is the 502 envelope, not a bare 500; a client that vanishes while queued is `ClientGone` and gets the empty result. `DebugGenerateTests` has both, each shown to fail without its fix |
+| Guard leftovers (#35) | ✅ | `.editorconfig` raises CA1305 to a warning under `src/` (no hits); `Backends/BackendLimits.cs` owns the 32,000-character ceiling and `SystemTextGuard` is internal again; `RefusalFor` lost its optional token count; `/healthz` pins `context_window_tokens: null`; the smoke's D80 cross-check accepts a 2 % bracket and its guard probes cover both branches (33,000 characters; 20,000 characters measured at 5,001 tokens on the NPU) |
+| `identity.ps1` version handling (#19) | ✅ | Registered packages sorted by parsed `[version]` (fallback `0.0`); the superseded removal re-checks the old full name, is non-terminating, and warns with the full name when it fails. Verified by parse check and `-Status` only; the bump path cannot run at 0.1.0.0 |
+| Generation scheduler (`--queue-capacity`) | ✅ | Chunk 8, D84 to D88, D92: `Api/GenerationScheduler.cs`, one worker on a bounded `Channel<GenerationJob>`. `ConversationSession.Acquire` runs inside the scheduled closure, not just `GenerateAsync`, because `CreateContext` and `GetUsablePromptLength` are calls on the same shared handle (D84 — the review's catch, against the task brief's own instruction). Queue-full → 429 + `Retry-After` (queue depth times the mean of the last 16 attempts since D100) + `rate_limit_error`/`queue_full`; a job cancelled while queued is dropped without touching the model (503 `queue_shutting_down`); a job that ran and threw its own OCE is a 502 (D88). Measured on the NPU: two concurrent requests really queued (`queue_depth` peaked at 1), `--queue-capacity 1` admitted one and rejected two |
 | `POST /v1/completions` | ✅ | Chunk 8, D91: both shapes, `object: "text_completion"`, `choices[].text`, finish reasons `stop`/`length`/`content_filter` only (no `tools` on this endpoint). `prompt` wrapped into one user message and run through the identical pipeline from the model-id check onward; a multi-element `prompt` array is a 400; the `chatcmpl-` id prefix is kept deliberately; `echo`/`best_of`/`suffix`/`logprobs`/`logit_bias` accepted and warned, never implemented. Smoke answered on both shapes on the NPU |
-| `/debug/generate` through the scheduler | ✅ | Chunk 8, D90, superseding D40's deferral: unqueued it raced the shared handle exactly as the OpenAI endpoints did. Two imprecisions left as issues, not fixed in-chunk (#25) |
+| `/debug/generate` through the scheduler | ✅ | Chunk 8, D90, superseding D40's deferral: unqueued it raced the shared handle exactly as the OpenAI endpoints did. The two imprecisions it left (#25) were fixed in the `leftovers` wave |
 | Tool-call emulation (`tools`, `tool_choice`) | ✅ | Chunk 7, D83: `Tools/` (`ToolCatalog`, `ToolSchemaRenderer`, `ToolCallParser`) and `Api/ToolCallReply`, on both response shapes. The instruction block is appended to the system text so `ConversationKey` covers the tools offered; the parser never throws and anything it cannot read is content; the stream buffers the whole reply behind keep-alives, then one chunk carrying the array. Five test files, 1,880 lines, of which `ToolCallParserTests` holds the adversarial shapes; smoke on the NPU: 20/20 runs called the tool, no prose, no leaked protocol, no unoffered tool, every argument valid JSON |
 | One post-generation pipeline for both shapes | ✅ | D81: `Api/GenerationPipeline.cs` (`DeltaSink`, `CutWatcher`, `CancelGuardedAsync`, the raw-output log) and `GenerationOutcome` beside `GenerationFailure`; `GenerationOutcomeTests` pins every status crossed with the handler's own cancel, so the D56 and D57 drifts between the two hand-written copies cannot recur. No client-visible change: the smoke run on the NPU returned D80's numbers exactly |
 | A cancellation that is not the client's | ✅ | D82: the JSON path's catch is the streaming path's pair exactly — one clause filtered on `RequestAborted` that logs `http=0` and returns nothing, then an unfiltered one through `GenerationFailure` — so a backend that lets the runtime's own cancellation escape is answered with 502 and the ordinary error body instead of an unhandled 500. `ChatCompletionsTests` has one test per clause, each checked to fail against the old `when (ex is not OperationCanceledException)` filter |
@@ -39,9 +45,9 @@
 
 ## Not built yet
 - **No chunk is outstanding.** `docs/PLAN.md`'s eight chunks are all merged as of 2026-09-12. Remaining
-  work is GitHub issues: #24 to #28 from chunk 8, #33 to #35 left by the 2026-09-12 wave that shipped
-  #29 to #31, #14/#15/#16
-  from the coverage audit, #17, #19, #22, plus #2 and #11 for Aion.
+  work is GitHub issues: #24, #27 and #28 from chunk 8, #33 left by the #29 to #31 wave, #14/#15/#16
+  from the coverage audit, #17, plus #2 and #11 for Aion. (#19, #22, #25, #26, #34 and #35 close with
+  the `leftovers` PR.)
 - Aion Instruct adapter hardware verification: the adapter merged 2026-09-11 (chunk 6, D66 to D70) but
   build 29648 never grants a main-package dynamic dependency execute access, so no Aion generation has
   run; issue #2 stays open. Aion Instruct itself ships in October/November 2026 as a model swap behind
@@ -58,15 +64,11 @@
   time that branch has been seen to fire, and a live-path argument for issue #19's unguarded removal.
 - A queue-full rejection is 429 with `Retry-After`, but the channel *slot* of a job whose caller gave
   up is held until the worker drains it, so a burst of aborted clients can still 429 a live request
-  (D87 states this half as unchanged). `Retry-After`'s rolling average has no window or decay, so it
-  reacts progressively more slowly in a long-lived process (#26).
+  (D87 states this half as unchanged). Since D100 `Retry-After` averages only the last 16 attempts.
 - A preflight refusal or a queue-full rejection can surface as an SSE error event rather than a clean
   HTTP status once the queue wait reaches about a second, because D52's first-frame boundary now has
   the queue wait inside it (D89). Deliberate: holding the first keep-alive for admission would
   reintroduce the failure D52 exists to prevent.
-- A foreign `OperationCanceledException` escapes `/debug/generate` as a bare 500, unlike D82's 502 on
-  the OpenAI shapes; a client abort while queued there reports 503 `queue_shutting_down`, which is
-  untrue but harmless (#25).
 - The publish-before-arm regression test (D92) is probabilistic, roughly a 60 % catch rate over 500
   sequential jobs; a deterministic version needs only test-visibility of the two flags (#24).
 - Three chunk 8 paths ship without a deterministic test, each attempted and abandoned for a stated
@@ -83,19 +85,22 @@
   minutes. Since D98 `/healthz` answers 503 `degraded` after two consecutive backend faults, so a
   client or the smoke readiness step can tell. The bridge does not recreate the model (deferred,
   D98). A smoke run that fails on a first generation is re-run once.
-- `/healthz` fault attribution leftovers (#34): the armed window still covers in-process work before
-  classification (a tokenizer or cut throw after a good generation would be labelled a backend
-  fault), an SSE write failing ahead of `RequestAborted` can record a fault, the cut-counts-as-success
-  test reaches its branch only probabilistically, `duration_ms` is 0 on one fault path and includes
-  the queue wait on the JSON shapes, ten smoke `/healthz` reads expect only 200.
-- System-text guard leftovers (#35): the globalization analyzers are gated off in `src/` by
-  `InvariantGlobalization=true`; `dotnet test` never compiles the exe project; the smoke's one-token
-  window cross-check is tighter than the step's own 2 % spread; the null-window branch of
-  `context_window_tokens` is untested; `PhiSilicaBackend` references `Api` for the ceiling constant;
-  the smoke probe sits at exactly 32,000 characters; a dead optional parameter on `RefusalFor`.
 - The model once answered a tool round trip's second turn with a fenced `{"tool_calls": []}`, which
   the parser correctly treated as content (#33). Whether the bridge should swallow an empty fence is
   open.
+- Left by the `leftovers` wave's reviews (`docs/FUTURE.md`, 2026-09-13): a bridge throw in the window
+  before classification records nothing, so an already-degraded `/healthz` stays degraded although the
+  backend answered; `duration_ms >= 0` is an unfalsifiable assertion and `BackendThrewCancellation` is
+  unreachable through every endpoint; attempt duration is measured four times where the scheduler
+  measures it once; `BackendCallTracker.Caught` is last-exception equality; `DeltaGate` ignores
+  cancellation and its counters are backend-wide; the chat and debug twins of the disconnect test are
+  still on `TokenDelay`; a mid-generation abort on `/debug/generate` writes a body into a dead
+  connection; the bridge fault is rethrown without `ExceptionDispatchInfo`.
+- The smoke's two readiness loops catch only `HttpRequestException`, so a `/healthz` poll that takes
+  longer than 5 seconds during model load escapes the loop and fails the step (seen once in four runs
+  on 2026-09-13, on `queue-full`). Filed as board ticket SQ-30.
+- A streamed tool-call reply delivers no token until the model has stopped; that is the price of
+  telling a call from prose, and keep-alives cover it.
 - Two keep-alive tests pin less than they claim to a reader of their names until the keep-alive
   waits go through the injected `TimeProvider` (`docs/FUTURE.md`); their summaries say so.
 - Issues #14 and #15 are part-done: `honours a system prompt` and the chat steps in the smoke
@@ -112,15 +117,6 @@
   streamed shape, and the second turn of a tool round trip hit the context cache. One
   compliance failure did occur, under stochastic sampling only — three calls to a tool name never
   offered — and it did not reproduce deterministically.
-- An unwrapped zero-argument call (`{"name":"get_time"}`) is read as content, because outside a
-  `tool_calls` wrapper an object needs both `name` and `arguments` (#22, accepted in D83). A
-  streamed tool-call reply delivers no token until the model has stopped; that is the price of
-  telling a call from prose, and keep-alives cover it.
-- `identity.ps1` is not ready for a version bump (#19): `Get-RegisteredPackage` sorts `Version` as a
-  string, so `0.9.0.0` outranks `0.10.0.0` and a bump can leave two registrations, and the
-  superseded removal is unguarded under `$ErrorActionPreference = 'Stop'`, so a bump that replaces
-  the registration kills the script after the install has succeeded. Neither is reachable at
-  0.1.0.0; D82's add-before-remove is what made the first one decide anything.
 - Experimental Windows App SDK channel in use (no LAF token); APIs may change between releases.
 - Phi Silica returns multi-token progress chunks → callback-based token counts undercount by roughly
   2.3x to 3x; `usage` used `ceil(chars/4)` on both sides (D44) until D80 replaced it with the Phi-3
@@ -135,6 +131,15 @@
 - `task status` on a missing task exits non-zero with schtasks' own message.
 
 ## Review history
+- `leftovers` wave (2026-09-12/13, D100 to D102): six issues as ten board tickets; three bound
+  cross-family reviews (GPT-5.6 Terra on the Opus-authored #26; Opus on the GPT-authored #34 and on
+  the fix round), all accepted with should-fix findings that became in-wave tickets (SQ-25, SQ-27) or
+  FUTURE entries; the whole-branch `/code-review` at high effort returned nine findings (a parser
+  false positive on an echoed zero-argument definition, a missing `ClientGone` branch on the debug
+  endpoint, a cutter fault that held the worker for a whole generation, the smoke's lost token-window
+  probe, two wall-clock tests, dead flags, a silent removal in `identity.ps1`, the bundled #26
+  commit), seven fixed in three tickets and two deferred with reasons. The board's post-merge gate
+  failed once on a 5 ms-delay test that passed 14/14 in isolation; it was gated and the retry passed.
 - Chunk 1: in-session hostile review (20 findings, 15 fixed, blocker: env-var key mapping);
   Codex adversarial review (7 findings, all fixed). Commits `b6ae632`, `663fce5`.
 - Chunk 2: in-session hostile review (29 findings; blocker: environment lost across activation;

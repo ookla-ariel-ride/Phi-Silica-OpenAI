@@ -25,7 +25,17 @@ internal sealed class ContextLease : IDisposable
     private readonly string? _cacheKey;
     private readonly string? _systemText;
     private readonly IReadOnlyList<ChatMessage> _turns;
-    private bool _settled;
+
+    /// <summary>
+    /// 0 until one of <see cref="Keep"/>, <see cref="ReturnUntouched"/> and <see cref="Dispose"/> has
+    /// settled this lease; whichever claims it does the work and the other two become no-ops. An
+    /// <see cref="Interlocked"/> flag rather than a plain <c>bool</c> because the two writers are on
+    /// different threads — the scheduler's worker disposes a failed attempt's lease from inside the
+    /// scheduled closure, the request thread runs the <c>finally</c> — and every ordering that makes
+    /// that safe today is a task-completion barrier somewhere else in the pipeline. Exchange keeps it
+    /// safe without the next disposal path having to know which barrier it was relying on.
+    /// </summary>
+    private int _settled;
 
     internal ContextLease(
         ContextCache cache,
@@ -87,12 +97,10 @@ internal sealed class ContextLease : IDisposable
     public void Keep(string reply, IReadOnlyList<ChatToolCall>? toolCalls = null)
     {
         ArgumentNullException.ThrowIfNull(reply);
-        if (_settled)
+        if (Interlocked.Exchange(ref _settled, 1) != 0)
         {
             return;
         }
-
-        _settled = true;
 
         var turn = toolCalls is { Count: > 0 }
             ? new ChatMessage("assistant", null, null, null, toolCalls)
@@ -107,12 +115,11 @@ internal sealed class ContextLease : IDisposable
     /// </summary>
     public void ReturnUntouched()
     {
-        if (_settled)
+        if (Interlocked.Exchange(ref _settled, 1) != 0)
         {
             return;
         }
 
-        _settled = true;
         if (_cacheKey is not null)
         {
             _cache.Store(_cacheKey, Context);
@@ -125,12 +132,11 @@ internal sealed class ContextLease : IDisposable
 
     public void Dispose()
     {
-        if (_settled)
+        if (Interlocked.Exchange(ref _settled, 1) != 0)
         {
             return;
         }
 
-        _settled = true;
         Context.Dispose();
     }
 }
@@ -237,12 +243,13 @@ internal sealed class ConversationSession
     /// with a preflight — refuses or truncates before anything is generated. The returned lease is
     /// the caller's to settle.
     /// </summary>
-    public ContextAcquisition Acquire()
+    public ContextAcquisition Acquire(BackendCallTracker backendCalls)
     {
+        ArgumentNullException.ThrowIfNull(backendCalls);
         Volatile.Write(ref _truncationSettled, false);
         try
         {
-            return AcquireCore();
+            return AcquireCore(backendCalls);
         }
         finally
         {
@@ -250,11 +257,11 @@ internal sealed class ConversationSession
         }
     }
 
-    private ContextAcquisition AcquireCore()
+    private ContextAcquisition AcquireCore(BackendCallTracker backendCalls)
     {
         while (true)
         {
-            var lease = Lookup();
+            var lease = Lookup(backendCalls);
             if (!_preflight)
             {
                 return ContextAcquisition.Acquired(lease);
@@ -266,7 +273,7 @@ internal sealed class ConversationSession
             int? usable;
             try
             {
-                usable = _prepared.Backend.GetUsablePromptLength(lease.Context, lease.Prompt);
+                usable = backendCalls.Invoke(() => _prepared.Backend.GetUsablePromptLength(lease.Context, lease.Prompt));
             }
             catch
             {
@@ -401,7 +408,7 @@ internal sealed class ConversationSession
         }
     }
 
-    private ContextLease Lookup()
+    private ContextLease Lookup(BackendCallTracker backendCalls)
     {
         var systemText = _prepared.Rendered.SystemText;
         var backend = _prepared.Backend;
@@ -438,7 +445,7 @@ internal sealed class ConversationSession
                 tailTurns: tail.Count, promptChars: prompt.Length, transcriptChars, transcriptTokens, systemText, _turns);
         }
 
-        var context = backend.CreateContext(nativeSystem);
+        var context = backendCalls.Invoke(() => backend.CreateContext(nativeSystem));
         return new ContextLease(_cache, context, full.Prompt, cacheHit: false, cacheKey: null,
             tailTurns: _turns.Count, promptChars: transcriptChars, transcriptChars, transcriptTokens, systemText, _turns);
     }

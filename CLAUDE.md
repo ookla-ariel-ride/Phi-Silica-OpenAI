@@ -15,14 +15,16 @@ bypass the tool-call emulation rather than use it.
 
 **All eight chunks of `docs/PLAN.md` are built and merged; there is no next chunk.** Work from here
 is GitHub issues. `docs/PLAN.md` is the signed-off design; `docs/DECISIONS.md` records why things are
-the way they are, decision by decision (D1 to D99), and is where the chunk-by-chunk history this
+the way they are, decision by decision (D1 to D102), and is where the chunk-by-chunk history this
 section used to duplicate actually lives; `docs/SESSION-HANDOFF.md` carries the current state and
 what to do next; `docs/FUTURE.md` holds deferred work. Read the handoff first; update DECISIONS and
 FUTURE whenever work changes a choice or defers something.
 
-Current state: 950 tests pass (last run by the Sidequest integration gate on `7a3207c`, 2026-09-12), `smoke.ps1 -Backend phi-silica`
-passes clean on hardware (2026-09-12, evening: all steps, 0 skipped, 6 informational; `/healthz` `context_window_tokens` 3581 matched the
-measured D80 boundary exactly), and the repository is `ookla-ariel-ride/npu-bridge`.
+Current state: 980 tests pass on `wave/leftovers` (last run by the Sidequest integration gate on `f1d3b8b`, 2026-09-13),
+`smoke.ps1 -Backend phi-silica` passed clean on hardware at `3c97d48` (2026-09-13, morning: all steps, 0 skipped, 6
+informational; the 2026-09-12 run with `-ToolProbeRuns 20` called the tool 20/20) and the D80 cross-check matched
+`context_window_tokens` 3581 exactly on every run. The wave is not yet merged to `main`; the repository is
+`ookla-ariel-ride/npu-bridge`.
 
 Standing facts that will cost you a session if you do not know them:
 
@@ -44,10 +46,9 @@ Standing facts that will cost you a session if you do not know them:
   can use this bridge at all. Compliance below that boundary is near-perfect; the window is the
   constraint, not the model's protocol discipline.
 
-Open issues carry the rest: #24 to #28 are chunk 8's known leftovers; #29 to #31 (the issue #21
-findings) shipped on 2026-09-12 as D97 to D99 and left #33 (an empty `tool_calls` fence delivered as
-content), #34 (healthz fault-attribution leftovers) and #35 (system-text guard leftovers); #2, #11,
-#14 to #17, #19 and #22 are longer-running.
+Open issues carry the rest: the `leftovers` wave (D100 to D102, 2026-09-12/13) took #19, #22, #25,
+#26, #34 and #35 and ships as one PR; #24, #27 and #28 remain from chunk 8; #33 (an empty
+`tool_calls` fence delivered as content) still needs a ruling; #2, #11, #14 to #17 are longer-running.
 
 ## Machine reality
 
@@ -138,9 +139,13 @@ Three projects, deliberately:
   `Api/ToolCallReply`, D83), and chunk 8's concurrency and legacy endpoint (`Api/GenerationScheduler.cs`,
   the one-worker bounded queue and `IHostedService`; `Api/SchedulerAdmission.cs`, which maps a scheduler
   outcome to the wire — 429 with `Retry-After`, 503 `queue_shutting_down`; `Api/StreamingPipeline.cs`,
-  the SSE plumbing both streamed shapes now share; and `Api/CompletionsEndpoint.cs`,
+  the SSE plumbing both streamed shapes share; `Api/JsonPipeline.cs`, the scheduled closure both JSON
+  shapes share (D100); and `Api/CompletionsEndpoint.cs`,
   `CompletionsStreamEndpoint.cs`, `CompletionRequest.cs`, `CompletionResponse.cs`, `CompletionChunk.cs`
-  for `/v1/completions`, D84 to D92).
+  for `/v1/completions`, D84 to D92). `Backends/BackendLimits.cs` holds the 32,000-character native
+  system-text ceiling (D97, D101 addendum) and `Backends/GenerationHealth.cs` the outcome recorder that
+  `GenerationPipeline.BackendCallTracker` feeds (D98, D102); `FakeBackend.DeltaGate` is the
+  mid-generation gate the cut and cancellation tests use (D54, D102).
   Everything in `docs/PLAN.md` is now built; there is no "not built yet" list.
 - `src/NpuBridge` (net10.0-windows10.0.26100.0, ARM64 exe): `Program.cs`, config, service and task
   verbs, `PhiSilicaBackend`, `AionBackend` (behind a conditional SDK reference: when

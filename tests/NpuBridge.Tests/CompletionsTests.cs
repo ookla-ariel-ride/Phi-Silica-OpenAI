@@ -243,6 +243,36 @@ public class CompletionsTests
         host.AssertNoLeak();
     }
 
+    [Fact]
+    public async Task Client_disconnect_disposes_the_context_and_does_not_500()
+    {
+        var capture = new CapturingLoggerProvider();
+        var deltaGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeBackend(new FakeBackendOptions
+        {
+            Responder = _ => Enumerable.Repeat("tok ", 200),
+            DeltaGate = deltaGate,
+        });
+        await using var host = await BridgeTestHost.StartAsync(fake, loggerProvider: capture);
+
+        using var cts = new CancellationTokenSource();
+        var post = host.Client.PostAsJsonAsync(Path, new { model = "fake", prompt = "say hi" }, cts.Token);
+
+        await TestWait.UntilAsync(() => fake.DeltasEmitted == 1);
+        await cts.CancelAsync();
+        await TestWait.UntilAsync(() => fake.CancellationsObserved == 1);
+        deltaGate.SetResult();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => post);
+
+        await TestWait.UntilAsync(() => fake.ActiveContexts == 0);
+        Assert.Equal(fake.ContextsCreated, fake.ContextsDisposed);
+        Assert.Equal(0, fake.ActiveContexts);
+        Assert.Single(fake.Calls);
+        Assert.DoesNotContain(capture.Records, r => r.Level >= LogLevel.Error);
+        host.AssertNoLeak();
+    }
+
     /// <summary>
     /// Fix round 1, finding 3: the only overflow outcome this endpoint has, since
     /// <c>--truncate-history</c> cannot drop anything from a one-turn transcript

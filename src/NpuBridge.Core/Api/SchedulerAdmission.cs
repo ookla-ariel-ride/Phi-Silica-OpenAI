@@ -53,9 +53,8 @@ internal static class SchedulerAdmission
     /// Classifies a scheduled result that has already been awaited. <paramref name="clientAlreadyGone"/>
     /// is checked first and wins over every other reason, matching the convention every other failure
     /// path in these endpoints already follows (an aborted client is reported as silence, never as a
-    /// body nobody will read) — <c>/debug/generate</c> has no streamed shape and no client worth this
-    /// distinction, so it always passes <see langword="false"/>, explicit at its own call site rather
-    /// than a default this method would otherwise hide.
+    /// body nobody will read). Every endpoint, including <c>/debug/generate</c>, passes its current
+    /// request-abort state explicitly rather than relying on a hidden default.
     /// </summary>
     public static SchedulerOutcome Classify<TResult>(ScheduleResult<TResult> scheduled, bool clientAlreadyGone)
     {

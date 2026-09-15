@@ -10,8 +10,8 @@ namespace NpuBridge.Tools;
 /// never empty: a call the model gave no arguments for carries <c>"{}"</c>, because OpenAI's wire
 /// format types the field as a string holding a JSON object and clients parse it unconditionally.
 /// </summary>
-/// <param name="Name">The tool the model named, verbatim. The parser knows nothing about which tools
-/// were offered, so an unknown name reaches the client as it was written (PLAN §2.6 item 3).</param>
+/// <param name="Name">The tool the model named, verbatim. Bare zero-argument calls are matched to
+/// a tool the request offered; declared calls and calls with arguments are surfaced whatever their name.</param>
 /// <param name="Arguments">The arguments re-serialised as compact JSON object text.</param>
 internal sealed record ParsedToolCall(string Name, string Arguments);
 
@@ -30,7 +30,8 @@ internal sealed record ParsedToolCall(string Name, string Arguments);
 /// <list type="number">
 ///   <item>a fenced block, which is what the instruction asks for;</item>
 ///   <item>the first balanced <c>{…}</c> containing <c>"tool_calls"</c>;</item>
-///   <item>the first balanced <c>{…}</c> carrying both <c>"name"</c> and <c>"arguments"</c>;</item>
+///   <item>the first balanced <c>{…}</c> carrying both <c>"name"</c> and <c>"arguments"</c>, or a
+///   catalog-matched name with no arguments;</item>
 ///   <item>the first balanced <c>[{…}]</c> array;</item>
 ///   <item>all four again over a relaxed rewrite that also accepts single-quoted strings.</item>
 /// </list>
@@ -87,14 +88,16 @@ internal static class ToolCallParser
     /// is a reply, not a fault. The list is never empty — an object whose <c>tool_calls</c> array is
     /// empty, or whose every entry lacks a name, is content.
     /// </summary>
-    internal static IReadOnlyList<ParsedToolCall>? Parse(string text)
+    internal static IReadOnlyList<ParsedToolCall>? Parse(
+        string text,
+        IReadOnlyCollection<string>? offeredToolNames = null)
     {
         if (string.IsNullOrWhiteSpace(text))
         {
             return null;
         }
 
-        var strict = ParseStrict(text);
+        var strict = ParseStrict(text, offeredToolNames);
         if (strict is not null)
         {
             return strict;
@@ -104,24 +107,27 @@ internal static class ToolCallParser
         // an apostrophe opens a string that runs to the next apostrophe — so it runs after every
         // strategy that requires the model to have produced real JSON has already failed.
         var relaxed = RelaxSingleQuotes(text);
-        return relaxed is null ? null : ParseStrict(relaxed);
+        return relaxed is null ? null : ParseStrict(relaxed, offeredToolNames);
     }
 
     /// <summary>The four strategies over one piece of text, in PLAN order.</summary>
-    private static List<ParsedToolCall>? ParseStrict(string text)
+    private static List<ParsedToolCall>? ParseStrict(string text, IReadOnlyCollection<string>? offeredToolNames)
     {
         foreach (var fenced in FencedBlocks(text))
         {
-            var calls = Interpret(fenced);
+            var calls = Interpret(fenced, offeredToolNames);
             if (calls is not null)
             {
                 return calls;
             }
         }
 
-        return FirstCandidate(text, '{', preferEnclosingArray: false, "\"tool_calls\"")
-            ?? FirstCandidate(text, '{', preferEnclosingArray: true, "\"name\"", "\"arguments\"")
-            ?? FirstCandidate(text, '[', preferEnclosingArray: false, "\"name\"");
+        return FirstCandidate(text, '{', preferEnclosingArray: false, offeredToolNames, "\"tool_calls\"")
+            ?? FirstCandidate(text, '{', preferEnclosingArray: true, offeredToolNames, "\"name\"", "\"arguments\"")
+            ?? (offeredToolNames is null
+                ? null
+                : FirstCandidate(text, '{', preferEnclosingArray: true, offeredToolNames, "\"name\""))
+            ?? FirstCandidate(text, '[', preferEnclosingArray: false, offeredToolNames, "\"name\"");
     }
 
     /// <summary>
@@ -166,16 +172,17 @@ internal static class ToolCallParser
     /// <paramref name="marker"/>, carries one of <paramref name="anyOf"/> when any are named, and
     /// reads as calls.
     ///
-    /// The markers are not decoration. Requiring <c>"name"</c> and <c>"arguments"</c> together for
-    /// the unwrapped single call is what PLAN §2.6 item 3 asks for, and it is what stops
-    /// <c>{"name": "Ada"}</c> in a sentence about a person from becoming a call to a tool named Ada.
+    /// The markers are not decoration. An unwrapped single call needs <c>"name"</c> and
+    /// <c>"arguments"</c> together unless an offered-tool catalog names a zero-argument call; that
+    /// narrow exception is what lets <c>{"name":"get_time"}</c> be a call without turning
+    /// <c>{"name": "Ada"}</c> in a sentence about a person into one.
     ///
     /// Only a <c>tool_calls</c> wrapper declares its contents, and a bare array does not — deliberately.
     /// An array is punctuation the model did not have to mean: <c>The staff list is [{"name":"Ada"}]</c>
     /// is a sentence, and treating the brackets as a declaration puts that back to being a call. So a
-    /// bare array's elements face the same both-keys rule as a bare object, and only inside
-    /// <c>tool_calls</c> does <see cref="ReadCall"/> accept a call with no arguments and supply
-    /// <c>{}</c>.
+    /// bare array's elements face the both-keys rule regardless of the catalog, and only inside
+    /// <c>tool_calls</c> does <see cref="ReadCall"/> accept a call with no arguments without matching
+    /// an offered name.
     ///
     /// The comparison ignores case for the same reason the property lookup does: the markers stand in
     /// for property names, and the model capitalises them as it pleases.
@@ -189,7 +196,12 @@ internal static class ToolCallParser
     /// because the object being tested there is the call itself and nothing encloses it.
     /// </param>
     private static List<ParsedToolCall>? FirstCandidate(
-        string text, char opener, bool preferEnclosingArray, string marker, params string[] anyOf)
+        string text,
+        char opener,
+        bool preferEnclosingArray,
+        IReadOnlyCollection<string>? offeredToolNames,
+        string marker,
+        params string[] anyOf)
     {
         // Each candidate is scanned to its closing brace, so a reply that is nothing but openers costs
         // one scan to end-of-text per opener -- quadratic in a reply whose length the model controls,
@@ -235,7 +247,7 @@ internal static class ToolCallParser
                 continue;
             }
 
-            var calls = Interpret(span);
+            var calls = Interpret(span, offeredToolNames);
             if (calls is not null)
             {
                 return calls;
@@ -373,7 +385,7 @@ internal static class ToolCallParser
     /// Reads one JSON fragment as calls: a <c>{"tool_calls":[…]}</c> wrapper, a bare array of calls,
     /// or a single unwrapped call. Null when it does not parse or holds no call with a name.
     /// </summary>
-    private static List<ParsedToolCall>? Interpret(string json)
+    private static List<ParsedToolCall>? Interpret(string json, IReadOnlyCollection<string>? offeredToolNames)
     {
         if (string.IsNullOrWhiteSpace(json))
         {
@@ -403,7 +415,9 @@ internal static class ToolCallParser
 
             if (root.ValueKind == JsonValueKind.Array)
             {
-                ReadCalls(root, calls, declared: false);
+                // A bare array does not declare its elements. Catalog membership only disambiguates a
+                // bare object, so it deliberately cannot turn a staff list into executable calls.
+                ReadCalls(root, calls, declared: false, offeredToolNames: null);
             }
             else if (root.ValueKind == JsonValueKind.Object)
             {
@@ -412,14 +426,14 @@ internal static class ToolCallParser
                     // A model that emits one call sometimes drops the array and leaves the object.
                     if (wrapped.ValueKind == JsonValueKind.Array)
                     {
-                        ReadCalls(wrapped, calls, declared: true);
+                        ReadCalls(wrapped, calls, declared: true, offeredToolNames);
                     }
-                    else if (wrapped.ValueKind == JsonValueKind.Object && ReadCall(wrapped, declared: true) is { } single)
+                    else if (wrapped.ValueKind == JsonValueKind.Object && ReadCall(wrapped, declared: true, offeredToolNames) is { } single)
                     {
                         calls.Add(single);
                     }
                 }
-                else if (ReadCall(root, declared: false) is { } bare)
+                else if (ReadCall(root, declared: false, offeredToolNames) is { } bare)
                 {
                     calls.Add(bare);
                 }
@@ -429,11 +443,15 @@ internal static class ToolCallParser
         }
     }
 
-    private static void ReadCalls(JsonElement array, List<ParsedToolCall> into, bool declared)
+    private static void ReadCalls(
+        JsonElement array,
+        List<ParsedToolCall> into,
+        bool declared,
+        IReadOnlyCollection<string>? offeredToolNames)
     {
         foreach (var element in array.EnumerateArray())
         {
-            if (element.ValueKind == JsonValueKind.Object && ReadCall(element, declared) is { } call)
+            if (element.ValueKind == JsonValueKind.Object && ReadCall(element, declared, offeredToolNames) is { } call)
             {
                 into.Add(call);
             }
@@ -451,15 +469,19 @@ internal static class ToolCallParser
     /// model reads the word in the schema it was handed.
     /// </summary>
     /// <param name="declared">
-    /// True when a <c>tool_calls</c> wrapper has already said these objects are calls. Only then may
-    /// <c>arguments</c> be missing, and then it becomes <c>{}</c>.
+    /// True when a <c>tool_calls</c> wrapper has already said these objects are calls. A declared call
+    /// may omit <c>arguments</c> and then becomes <c>{}</c>; an unwrapped call may do the same only
+    /// when its name exactly matches the offered-tool catalog.
     ///
-    /// Without a wrapper the object has declared nothing, and requiring both keys is what stops an
+    /// Without either signal, an object has declared nothing, and requiring both keys is what stops an
     /// ordinary record becoming an executable call: a reply that explains a person and happens to put
     /// <c>{"name":"Ada"}</c> in a JSON fence produced a call to a tool named Ada. A false positive is
     /// far worse than a miss here, because the client's answer to a call is to run it.
     /// </param>
-    private static ParsedToolCall? ReadCall(JsonElement call, bool declared)
+    private static ParsedToolCall? ReadCall(
+        JsonElement call,
+        bool declared,
+        IReadOnlyCollection<string>? offeredToolNames)
     {
         var body = TryGet(call, "function", out var function) && function.ValueKind == JsonValueKind.Object
             ? function
@@ -493,15 +515,17 @@ internal static class ToolCallParser
         // `parameters` is the *tool definition*, echoed back, which a model asked "what can you do?"
         // produces readily. Accepting it turned that answer into a confident call whose arguments were
         // the JSON Schema, and the client runs what it is handed.
-        var supplied = TryGet(body, "arguments", out var arguments)
-            || (declared && TryGet(body, "parameters", out arguments));
+        var hasArguments = TryGet(body, "arguments", out var arguments);
+        var hasParameters = TryGet(body, "parameters", out var parameters);
+        var supplied = hasArguments || (declared && hasParameters);
 
-        if (!supplied && !declared)
+        if (!supplied && !declared
+            && (!HasOnlyShortFormKeys(call) || !IsOffered(offeredToolNames, tool)))
         {
             return null;
         }
 
-        var text = Arguments(supplied ? arguments : default);
+        var text = Arguments(supplied ? hasArguments ? arguments : parameters : default);
         if (text is null)
         {
             // Arguments were supplied and could not be read. Inventing {} for them would turn an
@@ -511,6 +535,38 @@ internal static class ToolCallParser
         }
 
         return new ParsedToolCall(tool, text);
+    }
+
+    private static bool HasOnlyShortFormKeys(JsonElement call)
+    {
+        foreach (var property in call.EnumerateObject())
+        {
+            if (!string.Equals(property.Name, "name", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(property.Name, "arguments", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsOffered(IReadOnlyCollection<string>? offeredToolNames, string tool)
+    {
+        if (offeredToolNames is null)
+        {
+            return false;
+        }
+
+        foreach (var offered in offeredToolNames)
+        {
+            if (string.Equals(offered, tool, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>

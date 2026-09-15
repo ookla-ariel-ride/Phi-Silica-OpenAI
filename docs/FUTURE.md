@@ -55,6 +55,51 @@ land here instead of widening the chunk. Each entry says where it came from and 
   `Task.WaitAsync` uses today, which is a production change and so out of scope for a coverage-only
   task. A genuine client-disconnect mid-stream is covered on both endpoints as of task 3b (fix round 1).
 
+## 2026-09-13 wave `leftovers` (issues #19, #22, #25, #26, #34, #35)
+
+Deferred from the two candidate reviews and the whole-branch review of that wave (D100 to D102). None
+blocked the merge.
+
+- **A bridge throw before classification leaves `/healthz` stale** (issue #34 review, note F7). The
+  fault tracker (D102) records only backend calls, and `GenerationOutcome.Classify` runs before the
+  usage tokenizer, so a good generation followed by a tokenizer throw still records `ok`. But a throw
+  in the window before classification, the raw-output log under `--verbose`, the cut, the cutter's
+  own accept, or an SSE frame write, records nothing, so a `/healthz` that was already `degraded`
+  stays so although the backend answered. Defensible: the request did fail. Undocumented on the wire
+  and untested; a `bridge_error` outcome value would make it visible.
+- **`duration_ms >= 0` proves nothing, and the cancellation-path duration has no test** (F3). The
+  assertion in `GenerationSchedulerEndpointTests` is unfalsifiable because `GenerationHealth` floors
+  the value at zero; the `BackendThrewCancellation` duration argument is reachable only on a scheduler
+  shutdown that lands mid-generation, which no test drives. Pin it with `ManualTimeProvider` when the
+  attempt duration moves onto the scheduler result (next item).
+- **Attempt duration is plumbed four times when the scheduler already measures it** (whole-branch
+  review, finding 5). Each endpoint keeps a stopwatch, a try/finally and a captured double that the
+  shared helper reads back through a delegate, while `GenerationScheduler.RunWorkerAsync` measures the
+  same interval with the injectable `TimeProvider`. Exposing the measured duration on `ScheduleResult`
+  beside `QueueWait` would delete all of it and make the health duration testable from one place.
+  Deferred because it is a refactor across four endpoints for a path that works and is tested; do it
+  when the next change touches those closures anyway.
+- **`BackendCallTracker.Caught` is last-exception reference equality** (F5). If the guarded
+  `attemptLease.Dispose()` in the inner catch throws, its exception replaces the backend's and a real
+  backend fault goes unrecorded. Needs a context whose `Dispose` throws; very narrow.
+- **`DeltaGate` ignores cancellation and its counters are backend-wide** (F8). A test that times out
+  before releasing the gate parks the fake with nothing able to release it, and `DeltasEmitted` and
+  `CancellationsObserved` are per backend, not per generation, so the gate's waits are deterministic
+  only while exactly one generation is in flight. Fine for the tests that use it today; a second
+  in-flight generation in one of them would need per-generation counters.
+- **The smoke's D80 window cross-check tolerates 2 %, not one token** (whole-branch review, finding 8,
+  second half). Issue #35 item 3 widened the D80 cross-check from an exact match to the three-text
+  [min, max] bracket widened by 2 %, because the step already tolerates that spread between its texts
+  and a healthy machine could otherwise fail on punctuation drift. The cost is that up to about 70
+  tokens of drift in `ContextWindowTokens` would pass. Kept on purpose; the token-window guard probe
+  restored by SQ-28 is the check that the reported window actually governs a refusal.
+- **One ticket per logical change** (finding 7). Commit 5d32b93 (issue #26) carries a refactor, a
+  wire-visible behaviour change (`Retry-After` smoothing), two runtime fixes and a docs pass, because
+  the issue listed five items and the ticket took the issue whole. A merge delivery cannot split it
+  afterwards. Next wave: an issue with a behaviour change and a refactor is two tickets.
+- **Two more wall-clock tests, the debug endpoint's mid-generation abort, and four notes from the last review** (SQ-27's review). `ChatCompletionsTests.Client_disconnect_disposes_the_context_and_does_not_500` and its `DebugGenerateTests` counterpart are still on `TokenDelay` and lack `AssertNoLeak`; the two `DeltaGate` tests do not release the gate in a `finally`, so a regression costs about 55 s per case instead of 10. A client that aborts mid-generation on `/debug/generate` still gets a fully built JSON body written into a dead connection where the other shapes return the empty result. `cancelledByCut = !watcherFaulted` in `JsonPipeline` is inert (a stored bridge fault always throws). `SchedulerOutcome.BackendThrewCancellation` is unreachable through every endpoint, because the scheduler's cancellation token is always the request's own, so the `health` argument passed to `FailureFor` at three call sites is dead. A non-conforming adapter that throws for the bridge's own cancel is recorded as a backend fault (D82/D88's choice). The bridge fault is rethrown without `ExceptionDispatchInfo`, so the log points at the pipeline. All small; the tests belong with issue #14.
+- **The smoke's readiness loops treat a slow `/healthz` as a failure** (observed 2026-09-13 on the queue-full step, one run in four). Both loops poll with a 5-second client timeout and catch only `HttpRequestException`, so a poll the bridge answers slowly during model load escapes the loop long before the 600-second deadline. Filed as a scripts ticket in the wave; if it is still open when you read this, it is the fix for a `HttpClient.Timeout of 5 seconds` failure on any step that starts an auxiliary server.
+
 ## 2026-09-12 wave leftovers (issues #29, #30, #31)
 
 - **An empty `tool_calls` fence reaches the client as content** (issue #33, D99). On the second turn
@@ -64,17 +109,8 @@ land here instead of widening the chunk. Each entry says where it came from and 
   model did), or document that clients treat it as "no answer" and re-ask. Either way the tool block's
   instructions could tell the model to answer in prose when no tool applies; one `tool-probe.ps1` cell
   would measure whether that removes it.
-- **`/healthz` fault attribution leftovers** (issue #34, from the second review of the #30 fix). The
-  armed window that makes a `CreateContext` throw count as a backend fault also covers in-process work
-  before classification (the cut, the raw-output log, the tokenizer calls in the session lookup and the
-  system-text guard), so a bridge-internal throw there after a good generation is labelled
-  `backend_fault`; closing it means the recorder learning "a backend call was made" from
-  `ConversationSession`. Also: an SSE write failure ahead of `RequestAborted` can record a fault (a
-  narrow pre-existing race); the cut-counts-as-success test reaches the cut-cancelled branch only
-  probabilistically and needs a mid-generation gate on `FakeBackend` (D54); `duration_ms` is 0 for the
-  scheduler-routed cancellation fault and the JSON shapes' fault duration includes the queue wait;
-  ten other `/healthz` reads in `smoke.ps1` still expect only 200; no test pins that the #29 guard's
-  refusal records nothing, and the `CreateContext`-throw case is pinned on the chat JSON shape only.
+- **`/healthz` fault attribution leftovers** (issue #34). Resolved 2026-09-13 by D102 and its
+  follow-ups; what remains is in the 2026-09-13 section above.
 - **Serena is unusable by concurrent worktree executors** (observed 2026-09-12 during this wave). The
   serena MCP server is one process per session with one active project; three Sidequest executors in
   separate worktrees all edited through it and every edit landed in whichever worktree had activated
@@ -123,9 +159,9 @@ rest of both issues stays open, as does the CI job.
   only — Aion has no equivalent — so the parser stays either way and the two paths would have to agree
   on every shape. Worth measuring against the 20/20 the instruction-plus-parser approach already gets
   before adopting it.
-- **A zero-argument call without the wrapper is content** (issue #22, D83). Accepted rather than fixed:
-  the safe direction was the one that drops it, and the wrapper form — what the instruction asks for
-  and what the model produced 20 times out of 20 — carries zero-argument calls correctly.
+- **A zero-argument call without the wrapper is content** (issue #22, D83). Resolved 2026-09-12 by
+  D101: a bare `{"name":…}` naming an offered tool, with no other key, is a call; everything else
+  stays content.
 - **Compliance on the hard case was measured on 2026-09-12** (issue #21, D93 to D96). PLAN's pessimism
   did not survive: 40/40 across 1 to 25 tools, 32/32 at up to 85 % window occupancy under deterministic
   sampling, and no argument hallucination. The hard case fails for a different reason — a real agent's
